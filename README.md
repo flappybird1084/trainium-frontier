@@ -1,4 +1,4 @@
-# The NKI Frontier
+# The AWS Trainium Frontier
 
 ### AI-Assisted Model and Kernel Co-Design on AWS Trainium
 
@@ -352,17 +352,12 @@ human-driven, fully agent-driven, or anywhere in between.
 
 | Date | Milestone |
 | --- | --- |
-| June 15, 2026 | Competition announcement |
-| June 30, 2026 | Starter kit published (baseline + autoresearch + CORE harness + NKI docs); registration opens |
-| July 1, 2026 | Native PyTorch for Neuron available; Trn2 capacity secured |
-| July 15, 2026 | Registration closes (first 100 teams) |
-| August 1, 2026 | All registered teams landed on Trn2 development capacity |
-| August 15, 2026 | Phase 1 opens; Trn2 leaderboard goes live |
-| September 15, 2026 | Phase 1 closes; top 10 teams announced |
-| September 22, 2026 | Phase 2 opens; top 10 teams receive `trn2.48xlarge` access; CORE bundle pinned (SHA published) |
-| October 22, 2026 | Phase 2 closes |
-| November 1, 2026 | Winners selected |
-| December 6–12, 2026 | Winner presentations at the competition workshop |
+| August 31, 2026 | Phase 1 opens; Trn2 leaderboard goes live |
+| September 30, 2026 | Phase 1 closes; top 10 teams announced |
+| October 7, 2026 | Phase 2 opens; top 10 teams receive `trn2.48xlarge` access; CORE bundle pinned (SHA published) |
+| November 4, 2026 | Phase 2 closes |
+| November 11, 2026 | Finalists selected |
+| December 6–12, 2026 | Finalist presentations at the competition workshop |
 
 ---
 
@@ -373,8 +368,7 @@ human-driven, fully agent-driven, or anywhere in between.
 - **Second Place:** $10,000 USD
 
 - **Third Place:** $5,000 USD
-- **Top 10 Phase 2 finalists:** guaranteed interviews for AWS Trainium team internships
-  (eligible members only).
+- **Top 10 Phase 2 finalists:** receive exclusive Neuron team jackets and finalist swag packs.
 - **Top 3 Phase 2 finalists:** one month of dedicated single-chip **Trn3** access for
   research use — explore your winning approach on next-generation silicon (MXFP8/FP4 data
   types, larger SBUF, higher HBM bandwidth).
