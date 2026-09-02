@@ -16,7 +16,7 @@ the [**Neuron Kernel Interface (NKI)**](https://awsdocs-neuron.readthedocs-hoste
 The starter kit ships a strong, readable baseline and a development loop tuned for
 rapid iteration — by hand, with AI agents, or any mix of the two.
 
-FOR GENERAL QUESTIONS, PLEASE REFER TO THIS (LINK)[https://trainium-frontier.devpost.com/forum_topics]
+FOR GENERAL QUESTIONS, PLEASE REFER TO THIS [LINK](https://trainium-frontier.devpost.com/forum_topics)
 ---
 
 ## Table of Contents
