@@ -70,8 +70,7 @@ directly to NKI.
 
 ### 1. Environment
 
-Start from an AWS Trainium training DLAMI (which already provides `torch`,
-`torch_neuronx`, and `neuronx-cc`), then install the few extra packages this kit needs:
+Start from the provided AWS Trainium training DLAMI (id: ami-0d5703e99c1589f8d venv: neurips-torchneuronx-native-beta-2.11.3-20260824):
 
 ```bash
 pip install -r requirements.txt
