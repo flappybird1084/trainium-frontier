@@ -16,6 +16,10 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+# Proxy for process launch, captured before the heavy imports below. Used to
+# align the self-managed budget clock with the runner's startup allowance.
+_PROCESS_STARTED = time.monotonic()
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -24,6 +28,8 @@ import torch.nn.functional as F
 from prepare import (
     EVAL_TIMEOUT_SECONDS,
     TOKENIZER_VOCAB_SIZE,
+    TRAIN_STARTUP_ALLOWANCE_CAP_SECONDS,
+    TRAIN_STARTUP_STEPS_EXCLUDED,
     TRAIN_TIME_BUDGET_SECONDS,
     Tokenizer,
     causality_check,
@@ -32,6 +38,7 @@ from prepare import (
     get_dist_info,
     make_dataloader,
     print0,
+    record_step_boundary,
 )
 
 
@@ -46,7 +53,15 @@ HEAD_DIM = 128
 DEVICE_BATCH_SIZE = 1
 TOTAL_BATCH_SIZE = 65536
 NUM_STEPS = 1000
-MAX_TRAIN_SECONDS = TRAIN_TIME_BUDGET_SECONDS - 60
+# The official runner charges wall time only after the first five completed
+# optimizer steps (the startup/compilation allowance, capped). The baseline
+# restarts its budget clock at that boundary so it can use the full charged
+# budget even when compilation makes the first steps slow.
+MAX_TRAIN_SECONDS = TRAIN_TIME_BUDGET_SECONDS
+CHECKPOINT_RESERVE_SECONDS = 5.0
+# Covers the launch -> module-import gap this process cannot observe when
+# checking its startup time against the allowance cap.
+STARTUP_LAUNCH_MARGIN_SECONDS = 30.0
 
 LOGIT_SOFTCAP = 15.0
 
@@ -218,7 +233,7 @@ try:
             return _relu_sq_bwd(flat_x, flat_g).reshape(x.shape)
 
     _HAS_NKI = True
-except Exception:  # nki unavailable (e.g. CPU/GPU dev box) — eager path still works
+except Exception:  # nki unavailable (e.g. CPU/GPU dev box) -- eager path still works
     _HAS_NKI = False
 
 # Toggled by the --nki-relu2 flag in main(). Default OFF: the shipped baseline is
@@ -592,6 +607,8 @@ def main() -> None:
     parser.add_argument("--eval-tokens", type=int, default=int(os.environ.get("NEURON_COMPETITION_R1_EVAL_TOKENS", str(4 * 524288))))
     parser.add_argument("--compile", action="store_true", default=os.environ.get("NEURON_COMPETITION_R1_COMPILE", "0") != "0",
                         help="enable torch.compile on the full model")
+    parser.add_argument("--compile-only", action="store_true",
+                        help="run one synthetic optimizer step to warm the compile cache, then exit")
     parser.add_argument("--nki-relu2", action="store_true", default=os.environ.get("NEURON_COMPETITION_R1_NKI_RELU2", "0") != "0",
                         help="use the example fused NKI relu(x)**2 kernel in the MLP (Neuron only; illustration)")
     args = parser.parse_args()
@@ -599,7 +616,6 @@ def main() -> None:
     global USE_NKI_RELU2
     USE_NKI_RELU2 = args.nki_relu2
 
-    budget_started = time.monotonic()
     device_type = detect_device_type(args.device_type)
     ddp, rank, _local_rank, world_size, device = init_runtime(device_type)
     global COMPUTE_DTYPE
@@ -630,19 +646,36 @@ def main() -> None:
     grad_accum_steps = TOTAL_BATCH_SIZE // world_tokens_per_micro
     print0(f"micro_tokens={world_tokens_per_micro:,} grad_accum_steps={grad_accum_steps}")
 
+    if args.compile_only:
+        synthetic_x = torch.zeros((DEVICE_BATCH_SIZE, SEQ_LEN), dtype=torch.int32).to(device)
+        synthetic_y = torch.zeros((DEVICE_BATCH_SIZE, SEQ_LEN), dtype=torch.long).to(device)
+        optimizer = model.setup_optimizer()
+        model.zero_grad(set_to_none=True)
+        for _ in range(grad_accum_steps):
+            loss = model(synthetic_x, synthetic_y)
+            (loss / grad_accum_steps).backward()
+        if GRAD_CLIP > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        sync_gradients(model)
+        optimizer.step()
+        synchronize(device)
+        print0("compile-only synthetic training step completed")
+        cleanup_runtime()
+        return
+
     train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, SEQ_LEN, "train", device)
     x, y, loader_state = next(train_loader)
     optimizer = model.setup_optimizer()
+    loop_started = time.monotonic()
+    budget_started = loop_started
 
     smooth_loss = 0.0
     total_train_tokens = 0
     step = 0
+    recent_step_times: list[float] = []
+    startup_allowance_est = 0.0
 
     while step < args.num_steps:
-        elapsed = time.monotonic() - budget_started
-        if elapsed >= args.max_train_seconds:
-            break
-
         synchronize(device)
         t0 = time.monotonic()
         optimizer.zero_grad(set_to_none=True)
@@ -666,12 +699,59 @@ def main() -> None:
         optimizer.step()
 
         synchronize(device)
+        record_step_boundary(step)
         dt = time.monotonic() - t0
+        recent_step_times.append(dt)
         train_loss = float(last_loss.item())
-        bad = torch.tensor(1 if (math.isnan(train_loss) or train_loss > 100) else 0, device=device)
+        if step + 1 == TRAIN_STARTUP_STEPS_EXCLUDED:
+            # The runner excludes launch through this boundary (capped), so
+            # restart the budget clock here to use the full charged budget.
+            # If startup exceeded the cap, the excess is already charged:
+            # back-date the clock by that excess, with a margin for the
+            # launch -> import gap this process cannot observe.
+            now = time.monotonic()
+            observed_startup = now - _PROCESS_STARTED
+            startup_allowance_est = min(observed_startup, TRAIN_STARTUP_ALLOWANCE_CAP_SECONDS)
+            excess = max(
+                0.0,
+                observed_startup + STARTUP_LAUNCH_MARGIN_SECONDS - TRAIN_STARTUP_ALLOWANCE_CAP_SECONDS,
+            )
+            budget_started = now - excess
+        elapsed_after_step = time.monotonic() - budget_started
+        # Fold the deadline decision into the existing health collective. A
+        # local wall-clock check can otherwise make one rank begin another
+        # optimizer step while its peers head for the checkpoint barrier.
+        # The budget clock is only meaningful once it has been reset at the
+        # excluded-startup boundary; before that, elapsed_after_step is measured
+        # from loop start and a slow first-step compile could trip the predictive
+        # stop and break before five steps complete -- leaving the run unscorable.
+        # Gate the time-based stop behind reaching the excluded-step count so the
+        # run is always scorable; an explicit num_steps budget still stops early.
+        reached_min_steps = step + 1 >= TRAIN_STARTUP_STEPS_EXCLUDED
+        stop_after_step = (
+            step + 1 >= args.num_steps
+            or (
+                reached_min_steps
+                and (
+                    elapsed_after_step >= args.max_train_seconds
+                    or elapsed_after_step
+                    + max(recent_step_times[-20:])
+                    + CHECKPOINT_RESERVE_SECONDS
+                    >= args.max_train_seconds
+                )
+            )
+        )
+        control = torch.tensor(
+            [
+                1 if (math.isnan(train_loss) or train_loss > 100) else 0,
+                1 if stop_after_step else 0,
+            ],
+            device=device,
+            dtype=torch.int32,
+        )
         if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(bad, op=dist.ReduceOp.MAX)
-        if int(bad.item()) != 0:
+            dist.all_reduce(control, op=dist.ReduceOp.MAX)
+        if int(control[0].item()) != 0:
             raise RuntimeError(f"bad loss detected: {train_loss}")
 
         total_train_tokens += TOTAL_BATCH_SIZE
@@ -695,6 +775,8 @@ def main() -> None:
             gc.freeze()
             gc.disable()
         step += 1
+        if int(control[1].item()) != 0:
+            break
 
     checkpoint_path = Path(args.out_dir) / "final.pt"
     budget_elapsed_before_save = time.monotonic() - budget_started
@@ -728,12 +810,17 @@ def main() -> None:
     if rank == 0:
         print("---")
         print(f"checkpoint_path:    {checkpoint_path}")
+        # The budget clock restarts at the fifth completed step to mirror the
+        # runner's charged window, so post-restart elapsed time IS the charged
+        # estimate (conservative: the runner also excludes pre-loop startup).
         print(f"training_seconds:  {budget_elapsed_before_save:.1f}")
         print(f"budget_seconds:    {TRAIN_TIME_BUDGET_SECONDS}")
         print(f"target_steps:      {args.num_steps}")
         print(f"max_train_seconds: {args.max_train_seconds}")
+        print(f"startup_allowance_est: {startup_allowance_est:.1f}")
+        print(f"charged_seconds_est:   {budget_elapsed_after_save:.1f}")
         print(f"over_budget:       {budget_elapsed_after_save > TRAIN_TIME_BUDGET_SECONDS}")
-        print(f"total_seconds:     {budget_elapsed_after_save:.1f}")
+        print(f"total_seconds:     {time.monotonic() - loop_started:.1f}")
         print(f"compiled:          {args.compile}")
         print(f"nki_relu2:         {args.nki_relu2}")
         print(f"num_steps:         {step}")
