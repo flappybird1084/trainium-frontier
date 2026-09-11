@@ -195,6 +195,7 @@ SIDECAR_SYNC = _ENV("NEURON_COMPETITION_R1_SIDECAR_SYNC", "0") != "0"    # synch
 GATHER_BF16 = _ENV("NEURON_COMPETITION_R1_GATHER_BF16", "0") != "0"      # OPT_SHARD=zero: all_gather the updated shards in bf16 (grads stay fp32)
 ADAM_ALT = _ENV("NEURON_COMPETITION_R1_ADAM_ALT", "0") != "0"            # AdamW groups step on odd steps only (record #39: -1.2% wall-clock)
 XSA = _ENV("NEURON_COMPETITION_R1_XSA", "0") != "0"                  # gated exclusive self-attention (record #82): y -= tanh(a[l,h]) * (y.v / v.v) * v, a zero-init
+FLOW_STEPS = int(_ENV("NEURON_COMPETITION_R1_FLOW_STEPS", "0"))          # iterative refinement of the attention output: k Euler steps of a learned time-conditioned velocity field (0 = off; inference uses max steps, training samples 1..k)
 DELTANET_LAYERS = tuple(int(i) for i in _ENV("NEURON_COMPETITION_R1_DELTANET", "").split(",") if i.strip())   # layers whose attention is replaced by a gated delta rule mixer (torch ops, chunked)
 DELTANET_CHUNK = int(_ENV("NEURON_COMPETITION_R1_DELTANET_CHUNK", "64"))
 GDN_LR = float(_ENV("NEURON_COMPETITION_R1_GDN_LR", "0.01"))            # GatedDeltaNet param LR (GPU line used 0.01; the boosted scalar LR destabilized the gates by step 5)
@@ -3324,6 +3325,23 @@ class CausalSelfAttention(nn.Module):
             self.c_k = StackedLinear(registry, self.n_head * self.qk_dim, config.n_embd)
             self.c_v = StackedLinear(registry, config.n_embd, config.n_embd)
         self.c_proj = StackedLinear(registry, config.n_embd, config.n_embd)
+        if FLOW_STEPS > 0:   # in-attention rectified-flow-style refinement: v(y, t) = W2 gelu(W1 y + T t); y <- y + dt v
+            C = config.n_embd
+            self.flow_w1 = nn.Linear(C, C)
+            self.flow_t = nn.Linear(1, C, bias=False)
+            self.flow_w2 = nn.Linear(C, C, bias=False)
+            with torch.no_grad():
+                self.flow_w2.weight.zero_()   # zero velocity at init -> refinement is identity -> training starts unperturbed
+
+    def _flow_refine(self, y):
+        S = FLOW_STEPS if not self.training else int(torch.randint(1, FLOW_STEPS + 1, (1,)).item())   # inference: max steps; training: random 1..max (large->small steps)
+        dt = 1.0 / S
+        yf = y.float()
+        for kstep in range(S):
+            tk = torch.full((1, 1), kstep / S, device=y.device, dtype=torch.float32)
+            v = self.flow_w2(F.gelu(self.flow_w1(yf) + self.flow_t(tk)))
+            yf = yf + dt * v
+        return yf.to(y.dtype)
 
     def forward(self, x, ve, cos, sin, block_mask=None, dense_mask=None, k_sink=None, v_sink=None,
                 sink=None, bounds=None, v0=None, vr_lambda=None, doc_dims=None, rope_tabs=None, doc_start=None, phase=None):
@@ -4141,6 +4159,8 @@ class Block(nn.Module):
         x = resid_lambda * x + x0_lambda * x0
         a, v0 = self.attn(norm(x), ve_lambda * ve, cos, sin, block_mask, dense_mask, k_sink, v_sink, sink, bounds, v0, vr_lambda,
                           doc_dims, rope_tabs, doc_start=doc_start, phase=phase)
+        if FLOW_STEPS > 0:   # in-attention iterative refinement of the attention contribution (b, t, c)
+            a = self.attn._flow_refine(a)
         x = x + a
         if skip_mlp:
             return x, v0
@@ -4346,6 +4366,10 @@ class GPT(nn.Module):
         for blk in self.transformer["h"]:
             if blk.gdn is not None:
                 gdn_params.extend(blk.gdn.small_params())
+        flow_params = []
+        if FLOW_STEPS > 0:
+            for blk in self.transformer["h"]:
+                flow_params += list(blk.attn.flow_w1.parameters()) + list(blk.attn.flow_t.parameters()) + list(blk.attn.flow_w2.parameters())
         embedding_params = (list(self.transformer.wte.parameters())
                             + list(self.transformer.vte.parameters())
                             + list(self.transformer.vte_mid.parameters())
@@ -4365,6 +4389,8 @@ class GPT(nn.Module):
         ]
         if gdn_params:
             param_groups.append(dict(kind="adamw", params=gdn_params, lr=GDN_LR, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0))
+        if flow_params:
+            param_groups.append(dict(kind="adamw", params=flow_params, lr=SCALAR_LR, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0))
         for key in sorted(self.stacks.keys()):   # one permanently stacked (n, out, in) Parameter per shape
             param_groups.append(dict(kind="muon", params=[self.stacks[key]], lr=MATRIX_LR, momentum=0.95, beta2=0.90, ns_steps=5, weight_decay=WEIGHT_DECAY))
         opt = MuonAdamW(param_groups)
