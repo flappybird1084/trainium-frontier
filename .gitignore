@@ -5,6 +5,9 @@
 out/
 out_*/
 
+# Local dev virtualenv
+.venv/
+
 # Python caches
 __pycache__/
 *.py[cod]
@@ -26,3 +29,12 @@ infra/node_modules/
 # Editor / OS cruft
 .DS_Store
 *.swp
+trn2.pem
+trn2-access.md
+
+# Experiment logs pulled from the Trn2 box (evidence, not source)
+runs/
+submit/
+
+# Local NKI simulator venv
+.venv-nki/

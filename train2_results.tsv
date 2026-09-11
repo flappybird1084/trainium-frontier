@@ -1,0 +1,73 @@
+exp	val_bpb	steps	train_s	total_s	params_M	status	description
+R0	1.398840	420	597.6	621.1	59.6	keep	reference: depth10/640, warmup+warmdown, rope 2M, softcap 11
+E1	1.344765	420	723.0	747.2	64.9	keep	+value embeddings (vte, per-layer ve_lambda 0.5)
+E2	1.328116	420	724.2	748.8	64.9	keep	+U-net skips (encoder half pushes, decoder pops, lambdas init 1.0)
+E3	1.342945	404	830.2	859.1	74.7	discard	depth 12: truncated at cap (jepa respawned mid-run, 2.05s/step); projects ~1.336 full -> worse than E2
+E4	1.326249	420	722.8	747.5	70.1	keep	split ve: separate vte tables for encoder/decoder halves
+E5	1.316991	420	624.0	674.4	70.1	keep	+doc-masked attention via flex_attention (faster AND better: block-sparse)
+E6	1.402859	420	577.6	628.1	81.8	discard	depth 8 x width 768: wide-shallow badly worse; depth optimum ~10
+E7	1.315364	420	690.5	742.2	78.3	keep	MLP ratio 4->5; marginal (~noise), +11% step time
+E8	1.335500	420	691.3	743.1	78.3	discard	per-channel gates (resid/x0/ve/skip): worse, gate noise at 420 steps
+E9	1.312464	420	535.1	561.4	83.6	keep	third vte table (thirds split 3/4/3)
+E10	1.307278	420	812.2	877.3	114.0	keep	width 640->768 @ depth 10 (near cap: contention mid-run)
+E11	-	~200	-	-	102.2	abort	MLP4@768: stopped at user request (moving training to RunPod)
+E11	1.309733	420	633.7	666.6	102.2	discard	MLP4@768 on 3090: MLP5 (E10) better by 0.0025 - ratio 5 real at 768
+E12	1.298897	420	719.9	755.4	214.7	keep	+hashed bigram table 2^17 into input embedding: GOAL 1.30 REACHED
+E13	1.301666	420	730.6	766.1	315.4	discard	bigram 2^18: worse (+0.0028) - entries undertrained at 27.5M tokens; 2^17 sweet spot
+E14	1.294453	420	751.2	788.7	214.7	keep	+AsymLogit softcap (learned pos/neg caps, init 11/11)
+E15	1.294705	420	737.1	773.3	214.7	discard	BOS-fixed SmearGate: wash (+0.0003) - redundant with bigram table
+E17	1.290633	420	715.2	751.2	214.7	keep	rope base 2M->500k (-0.0038); autoresearch value was mistuned here
+E17b	1.289821	420	714.2	~750	214.7	keep	rope 200k: edges 500k by 0.0008; curve flat, stop knob here
+E21	1.528124	420	708.8	743.3	214.7	discard	full NoPE: catastrophic (+0.238); positions essential at this scale
+E31	1.302555	420	750.6	787.8	251.7	discard	Engram port: gated machinery bootstraps too slowly at 420 steps; simple additive tables win here
+E31c	1.300912	420	721.7	758.3	315.4	discard	additive trigram: worse (+0.0111); table axis saturated at bigram for 27.5M tokens
+E16	1.291479	420	308.0	327.6	266.5	discard	width 896 (5090 pod): worse (+0.0017); width optimum is 768 at this budget
+E20	1.391052	420	718.0	754.3	214.7	discard	learnable per-head QK gain @ scalar LR 0.2: catastrophic (+0.101); sensitive scalars can't take high LR
+E23	1.268515	420	784.3	822.0	214.7	keep	+attention sinks (zero-init per-head k_sink, zero v): biggest win since E1 (-0.0213)
+E30	1.286914	420	794.9	832.9	277.6	discard	per-layer embeddings: worse (+0.0184); table axis closed in ALL forms
+E22	1.268385	420	788.7	827.4	214.7	discard	per-head windows (3x256+3xglobal): exact wash -> FREE SPARSITY for Trn2 fixed-time runs
+E28a	1.295494	420	793.4	832.4	214.7	discard	dense cross-layer gates @ scalar LR 0.2: worse (+0.027); gate-count x high LR = chaos
+E28b	1.270818	420	833.1	873.6	214.7	discard	dense gates @ lr 0.02: recovered 0.025 vs E28a (pure LR effect!) but still +0.0023 vs champion
+E19	1.273752	420	783.3	820.9	221.0	discard	key-embedding table: worse (+0.0052); tables help values not addressing (ve/ke asymmetry)
+E23b	1.265658	420	777.7	814.2	214.8	keep	sinks->4 registers (learnable zero-init values): -0.0029
+E27	NaN	~5	-	-	193.5	crash	CCA full (with QK-mean coupling): NaN at warmup ramp; coupling amplifies c_q/c_k grads
+E27b	NaN	-	-	-	193.5	crash	CCA sans coupling: NaN again; retire CCA here (suspect d64 QK-norm x Muon d128-tuned LR, no clip; try GRAD_CLIP if revisited)
+E18	1.266227	420	781.4	818.1	214.8	discard	in-context bigram boost: wash (+0.0006); induction already learned internally
+E33	1.265467	420	780.7	818.1	214.8	discard	int8 weight QAT: exact wash -> fp8 on Trn2 is FREE (major submission asset); champion stays clean
+E25	1.240526	420	892.9	923.7	217.8	keep	GatedDeltaNet hybrid (5 fla chunked layers + 5 attn): -0.0251, GOAL 1.25 CLEARED
+E25b	1.259784	420	912.0	940.4	219.0	discard	7:3 linear/full: worse (+0.019); ratio optimum near 5:5
+E25c	CRASH	~65	-	-	217.8	crash	doc-reset varlen: CUDA illegal access, data-dependent (tiny segments suspected)
+E25c	1.247329	420	898.4	928.8	217.8	discard	doc-reset in deltanet layers: worse (+0.0068) - recurrence WANTS cross-doc state (opposite of attention)
+E25d	1.227459	420	888.6	918.9	215.8	keep	KDA (vector-gated delta, hd64x12) replaces GDN: -0.0131; champion 1.2275
+E25e	1.240571	419	941.1	970.2	216.3	discard	KDA 7:3: worse (+0.0131, mild truncation); 5:5 optimum sharp for both delta variants
+E25f	-	-	-	-	223.8	abort	GatedDeltaProduct: fla dtype clash both directions (fp32 assert vs bf16 mat1); integration cost > probe value
+E26	1.247885	410	940.8	974.2	219.3	discard	AdaLN token-conditioned modulation: worse (+0.020, truncated 410) - regime rule holds
+E32	1.231951	414	1001.9	1031.4	215.8	discard	MoBA top-3/8 routing: +0.002 adj, 26% slower (dense-mask impl); attention restriction stays ~neutral
+T1	1.259040	342	721.7	752.0	215.8	ref	FIXED-TIME 720s: champion arch (KDA 5:5, 768/MLP5) -> new protocol reference
+T2	1.214258	485	720.3	743.3	160.2	keep	FIXED-TIME: 640/MLP4 @485 steps beats champion-arch by -0.045 -> frontier is smaller/faster; NEW BEST
+T3	1.191900	615	720.6	738.9	120.3	keep	FIXED-TIME: 512/MLP4 -> GOAL 1.20 CLEARED (full ladder done); frontier still descending
+T4	1.176716	828	720.5	734.8	84.3	keep	FIXED-TIME: 384/MLP4 -> new best; descent decelerating
+T5	1.174754	1203	720.0	730.4	52.3	keep	FIXED-TIME: 256/MLP4 edges 384 by -0.002; size curve plateaued, adopt 256 (fewest params)
+T6	1.179256	2427	720.1	729.8	52.3	discard	half batch (32768): worse (+0.0045) at same LRs; T6b tests sqrt-scaled LRs
+T6b	1.170139	2427	720.2	-	52.3	keep	half batch + sqrt-LR: NEW BEST (-0.0046); batch axis pays with LR compensation
+T6c	1.178121	4446	720.1	-	52.3	discard	quarter batch: worse (+0.008); batch optimum = 32768 w/ sqrt-LR
+T7	1.179519	2384	720.2	-	52.3	discard	parallel residuals: worse (+0.0094), no speed gain; leaderboard claim didn't replicate
+T8	1.176720	2391	720.3	-	52.4	discard	SwiGLU @ param parity: worse (+0.0066); relu^2 stays
+T9	1.144089	3798	720.0	-	51.9	keep	ALL-ATTENTION beats KDA hybrid by -0.026 under fixed time (56% more steps); NEW BEST + fully submittable
+T10	1.142748	3821	720.1	-	51.9	keep	organizer packing trick (8x reshape): -0.0013, free; NEW BEST
+T11	1.144269	2323	720.3	-	83.8	discard	width-384 recheck sans KDA: still worse (+0.0015); 256 confirmed
+T12	1.144161	3818	720.2	-	51.9	discard	LR scale 0.85: worse (+0.0014); 0.71 confirmed
+SUB2	1.141807	3895	720.2	-	51.9	gate	train2_best_submission.py v2 EXACT-FILE confidence run: matches T10; TF32 line was the 20x trap
+SUB2F	1.100465	9393	1740.2	-	51.9	gate	FULL official budget (29min) on 3090: complete schedule, exact submission file
+V3T	1.181778	2648	720.0	-	51.9	gate	train3_submission.py timed gate on contended 4080: throughput sane, all gates green
+L0	1.126001	5138	720.0	733.2	51.9	ref	FIXED-TIME re-baseline on idle 4080S (T10 config): local reference for L-series
+L1	1.121817	5626	720.1	732.8	85.5	keep	+hashed trigram table 2^17 (own gate 0.2): -0.0042 vs L0; E31c verdict FLIPS under fixed-time
+L2	1.118476	6517	720.0	731.4	51.3	keep	narrow QK (qk_dim 64, v 128): -0.0075 vs L0; +27% steps, quality holds; NEW BEST
+L3	1.131388	5168	720.0	-	51.9	discard	dual fast/slow Muon momentum lanes (0.95/0.98 mean): +0.0054 - slow lane too stale at ~5k steps
+L4	1.133513	4553	720.0	-	84.8	contended	trigram+narrowQK combo UNDER JEPA CONTENTION (~25% steps lost): uninformative, rerun needed
+L4r	OOM	0	-	-	84.8	crash	combo rerun killed at startup: foreign 14.5GB process (not jepa) held GPU; gate broadened to any-process
+L4r2	killed	3180	-	-	84.8	crash	clean combo run killed at step 3180: monitor-task teardown reaps its process tree - NEVER launch runs from inside a Monitor
+L4r3	1.118255	6369	720.1	731.6	84.8	discard	trigram+narrowQK combo CLEAN: wash vs L2 (-0.0002, noise); trigram gain does not stack - champion stays L2
+V4T	1.193718	1910	235.0	-	51.9	gate	train3_submission.py v4 timed gate (240s, idle 4080S): step-boundary contract verified (1910 log lines, reset@5, predictive stop -5s, causality OK)
+L5_BASE	1.117662	~6700	720	-	51.3	ref	L2 champion config rerun (idle 4080S), reference for L5_MOD
+L5_MOD	1.144366	~7900	720	-	51.3	discard	causal static-capacity MoD on layers 1,3,5,7,9 at cap 0.5 (router r=w.x, first-k positive in position order, fillers masked+gated): +0.0267 vs L5_BASE despite ~18% more steps; causality check exact. Routing closed.
