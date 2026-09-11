@@ -1457,3 +1457,13 @@ what not to build). Box stack: nki 0.5.0, neuronx-cc 2.26, nkilib 0.5 (NOT the 0
   a9594ed53945831f), -0.0014 vs v39, 0.52 s/step, causality passed, 0 errors. The head-major pre/post kernels remove the
   permute/reshape compiler copies between the layer kernels and the vendor attention (fwd_bwd 0.451 -> 0.444). Numerics
   unchanged (score in band; the small gain is the faster step buying a few more steps at fixed time).
+- 08:48 UTC (2026-09-11), **overnight sweep launched** (queue_overnight.txt, 82 lines ~20 h, runs unattended via
+  trn2_queue.sh): a broad scalar re-sweep at the v40/depth-12 config (base = the v40 gate config with ATTN_LAYOUT=heads),
+  because the LR/schedule optima were last tuned at depth 10 and may have shifted. Axes: ATTN_SCALE, MATRIX/EMBED/HEAD/
+  SCALAR_LR_SCALE, WD, WARMDOWN, WARMUP, FINAL_LR, EMA/EMA_START/EMA_BLEND, ROPE_FRAC, SINKS, MLP_RATIO, DEPTH 11/13,
+  BIGRAM 17, KEY_OFFSET off, TRIGRAM, BIGRAM_SIGN, TOTAL_BATCH, plus LRxATTN combos; S_REF lines every 8 for the noise
+  band. Each is a 600 s screen (~1150 steps at 16-row micro-steps). Read with `bash read_sweep.sh` (ranks by val_bpb).
+  Any knob that clears the REF band (~0.005 at 600 s) by a real margin -> full-length gate as v41. Dropped from the sweep:
+  QK_DIM (breaks the 128-wide kernels), VALUE_RESID/MTP (disable the fast op path), BIGRAM=19 (OOMs). Rationale: user asked
+  to fill ~24 h of device time and stop to save cost; env-knob sweeps are zero-code-risk and a failed line never stalls the
+  queue (the OOB flake or an OOM just logs an error and the runner continues).
