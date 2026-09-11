@@ -1467,3 +1467,13 @@ what not to build). Box stack: nki 0.5.0, neuronx-cc 2.26, nkilib 0.5 (NOT the 0
   QK_DIM (breaks the 128-wide kernels), VALUE_RESID/MTP (disable the fast op path), BIGRAM=19 (OOMs). Rationale: user asked
   to fill ~24 h of device time and stop to save cost; env-knob sweeps are zero-code-risk and a failed line never stalls the
   queue (the OOB flake or an OOM just logs an error and the runner continues).
+- 08:48-14:55 UTC (2026-09-11), overnight LR/schedule sweep (queue_overnight.txt): completed 23 of 82 lines before the
+  disk guard stopped the runner (out_*/ checkpoints filled / to 93%, guard refuses < 15 GB; cleaned 94 dirs -> 87 GB).
+  REF ~1.062 at 600 s (two refs agree to 0.0002, so noise is ~0.001 here). **Clear signal: at depth 12 the matrix LR wants
+  to be HIGHER and the embedding LR LOWER than the depth-10-tuned defaults (matrix 0.7, embed 6):** MATRIX_LR_SCALE=1.25
+  1.05867 / 1.0 1.05937 / 0.9 1.05994 / 0.8 1.06031 (all beat REF); EMBED_LR_SCALE=4.0 1.05868 / 3.0 1.05911 (beat REF),
+  6-10 at/above REF; ATTN_SCALE=0.11 1.06031 (0.1 is fine). ~0.003 better = ~3x noise. LR closers (matrix 1.0-1.25 x embed
+  3-4, +/- attn 0.11) queued in queue_weird.txt as fixed-time gate candidates for v41.
+- LESSON: the queue runner dies (gate-refused) when out_*/ checkpoints fill the disk. Every screen writes out_<ID>/final.pt
+  (~228 MB); ~90 screens = ~20 GB + NEFF cache. For long unattended queues, pre-clean and/or the runner should rm out_<ID>
+  after each screen. Manual fix: `rm -rf out_S_* out_W_*` between batches.
