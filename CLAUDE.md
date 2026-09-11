@@ -45,8 +45,13 @@ cd autoresearch && bash run.sh
   kernel bodies by text, so it does not import these files.
 - `train.py` at the root is the organizers' baseline and stays where it is.
 - Box tools at the root (master copies, rsynced to the box's `~/tf`): `trn2_run.sh` (gated launcher), `trn2_queue.sh` (gated
-  queue runner), `trn2_status.sh`, `nm_monitor.py`, `neuron_profile_step.py`; probe scripts
-  `neuron_probes.py` / `dist_probe.py` / `run_probes.sh` are the fresh-box health gates from the deadlock investigation.
+  queue runner), `trn2_job.sh` (gated single-core job), `trn2_status.sh`, `trn2_profile_one.sh` + `neff_instr_agg.py` (NEFF
+  engine/instruction profiles), `trn2_profile_neff.sh` / `trn2_profile_ops.sh` (older profile drivers).
+- `experimental/` (2026-09-11) — parked or legacy material kept for reference: `gdn/` (chunked gated delta rule in torch and
+  its device tests; DeltaNet stage 1, not viable on this stack), `neff/neff_ops_agg.py` (per-op aggregation, needs pandas),
+  `neuron/` (fresh-box health probes `neuron_probes.py` / `dist_probe.py` / `run_probes.sh` from the deadlock
+  investigation, `neuron_profile_step.py`), `monitor/nm_monitor.py` (neuron-monitor line formatter). `gpu_gdn.sh` at the
+  root runs the vehicle on the local CUDA GPU at fixed steps for architecture questions.
 
 ## Trn2 dev instance
 

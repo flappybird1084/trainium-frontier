@@ -1429,3 +1429,9 @@ what not to build). Box stack: nki 0.5.0, neuronx-cc 2.26, nkilib 0.5 (NOT the 0
   (no `__init__.py`, so the installed `nki` package is not shadowed); the box mirror `~/tf/nki/` moved the same way.
   Queue JOB lines now use `python nki/<test>.py`. Generators that extract kernel bodies read the vehicle, not these files;
   `make_v41.py`-style extractions from `nki_attn_*.py` would need the new path.
+- 07:00 UTC (2026-09-11), cleanup: `freeze_submission.sh` deleted (versions come from the make_v## generators + gates);
+  `experimental/gdn/` (gdn_torch.py, gdn_dev_test.py, gdn_compile_test.py), `experimental/neff/neff_ops_agg.py` (legacy,
+  pandas), `experimental/neuron/` (neuron_probes.py, dist_probe.py, run_probes.sh, neuron_profile_step.py: fresh-box
+  probes and the old step profiler), `experimental/monitor/nm_monitor.py`. Still in use at the root: neff_instr_agg.py
+  (called by trn2_profile_one.sh), gpu_gdn.sh (local-GPU fixed-step runs), the trn2_* box tools (untouched).
+  Box copies of the moved files stay in ~/tf (the legacy trn2_profile_ops.sh still expects neff_ops_agg.py there).

@@ -197,6 +197,11 @@ ADAM_ALT = _ENV("NEURON_COMPETITION_R1_ADAM_ALT", "0") != "0"            # AdamW
 XSA = _ENV("NEURON_COMPETITION_R1_XSA", "0") != "0"                  # gated exclusive self-attention (record #82): y -= tanh(a[l,h]) * (y.v / v.v) * v, a zero-init
 DELTANET_LAYERS = tuple(int(i) for i in _ENV("NEURON_COMPETITION_R1_DELTANET", "").split(",") if i.strip())   # layers whose attention is replaced by a gated delta rule mixer (torch ops, chunked)
 DELTANET_CHUNK = int(_ENV("NEURON_COMPETITION_R1_DELTANET_CHUNK", "64"))
+GLUE_PROF = _ENV("NEURON_COMPETITION_R1_GLUE_PROF", "0") != "0"          # time the eager glue vs kernel calls inside the layer op bodies (syncs; dev only)
+_GLUE = {"f_pre": 0.0, "f_glue": 0.0, "f_attn": 0.0, "f_y2": 0.0, "f_post": 0.0, "b_post": 0.0, "b_glue1": 0.0, "b_attn": 0.0, "b_glue2": 0.0, "b_pre": 0.0, "b_finish": 0.0, "n": 0}
+ASYNC_COMM = _ENV("NEURON_COMPETITION_R1_ASYNC_COMM", "0") != "0"        # OPT_SHARD=zero: async reduce_scatter handles, waited per optimizer group (overlap comm with Muon/AdamW math)
+def _gt(dev):
+    synchronize(dev); return time.monotonic()
 _NAN_CHECKS = [int(_ENV("NEURON_COMPETITION_R1_ATTN_NAN_CHECKS", "12"))]   # how many layer-forward calls to check
 DOC_BOUNDS_IMPL = _ENV("NEURON_COMPETITION_R1_DOC_BOUNDS", "graph")      # graph | host | scan: document bounds computed in the compiled graph (scatter/gather = the only indirect DMAs) or on the host in sidecar.prepare
 PRE_BWD_IMPL = _ENV("NEURON_COMPETITION_R1_PRE_BWD", "chain")            # chain | fused (nki_pre_bwd.pre_attn_bwd: QK-norm/rope bwd + QKV dgrad/wgrad + norm bwd in one kernel)
@@ -3381,7 +3386,9 @@ def build_layer_ops(n_head: int):
 
     def _fwd_impl(x2, x02, ve2, cos_full, sin_full, cos2d, sin2d, scal, sink, start, end, dstart, wq, wk, wv, wo, w1, w2, xsa=None):
         NH = _LAYER_NH; T, D = x2.shape; HD = D // NH; b = start.shape[0]; t = T // b
+        if GLUE_PROF: _t0 = _gt(x2.device)
         q, k, v, xm, rq, rk = pre_k[grid](x2, x02, ve2, wq, wk, wv, cos_full, sin_full, scal, n_head=NH, eps=eps, fq=FAKE_FP8)
+        if GLUE_PROF: _t1 = _gt(x2.device); _GLUE["f_pre"] += _t1 - _t0
         scale = ATTN_SCALE if ATTN_SCALE > 0 else 1.0 / math.sqrt(HD)
         q4 = (q.view(NH, b, t, HD).permute(1, 0, 2, 3) * scale).to(bf).contiguous()
         k4 = k.view(NH, b, t, HD).permute(1, 0, 2, 3).to(bf)
@@ -3392,7 +3399,9 @@ def build_layer_ops(n_head: int):
             k4 = torch.cat([k4[..., :HQ], prev, k4[..., 2 * HQ:]], dim=-1)
         k4 = k4.contiguous()
         v4 = v.view(NH, b, t, HD).permute(1, 0, 2, 3).to(bf).contiguous()
+        if GLUE_PROF: _t2 = _gt(x2.device); _GLUE["f_glue"] += _t2 - _t1
         out, neg_max, recip = attn_fwd(q4, k4, v4, sink, start, end)
+        if GLUE_PROF: _t3 = _gt(x2.device); _GLUE["f_attn"] += _t3 - _t2
         out_x = out
         if XSA and xsa is not None:   # gated exclusive self-attention: remove the component of the output along the token's own value
             g = torch.tanh(xsa.float()).view(1, NH, 1, 1)
@@ -3408,13 +3417,16 @@ def build_layer_ops(n_head: int):
                                                                    neg_max=neg_max, x2=x2, xm=xm).items()}, _p)
                 print(f"[rank {_r}] ATTN_NAN_DUMP: non-finite attention output saved to {_p}", flush=True)
         y2 = out_x.permute(0, 2, 1, 3).reshape(T, D).contiguous()
+        if GLUE_PROF: _t4 = _gt(x2.device); _GLUE["f_y2"] += _t4 - _t3
         o, x1, preT = post_k[grid](y2, wo, xm, w1, w2, eps=eps, fq=FAKE_FP8)
+        if GLUE_PROF: _GLUE["f_post"] += _gt(x2.device) - _t4; _GLUE["n"] += 1
         return o, xm, rq, rk, q4, k4, v4, out, neg_max, recip, y2, x1, preT
 
     def _bwd_impl(dout2, x2, x02, ve2, xm, rq, rk, q4, k4, v4, out, neg_max, recip, y2, x1, preT, cos2d, sin2d, sink, start, end,
                   dstart, wq, wk, wv, wo, w1, w2, xsa=None):
         NH = _LAYER_NH; T, D = x2.shape; HD = D // NH; b = start.shape[0]; t = T // b
         scale = ATTN_SCALE if ATTN_SCALE > 0 else 1.0 / math.sqrt(HD)
+        if GLUE_PROF: _t0 = _gt(x2.device)
         d2 = dout2.to(bf).contiguous()
         if post_bwd_k is not None:   # fused kernel: norm recompute + mlp_bwd + norm bwd (+ residual) + out-proj dgrad per head + dWo
             dyh, dx1, dW1s, dW2s, dWo = post_bwd_k[grid](d2, x1.contiguous(), preT.contiguous(), y2.contiguous(), w1, w2, wo,
@@ -3428,6 +3440,7 @@ def build_layer_ops(n_head: int):
             dy2 = F.linear(dx1, wo.t())
             dWo = dx1.t() @ y2
             dy4 = dy2.view(b, t, NH, HD).permute(0, 2, 1, 3).contiguous()
+        if GLUE_PROF: _t1 = _gt(x2.device); _GLUE["b_post"] += _t1 - _t0
         dxsa = None
         dv_extra = None
         if XSA and xsa is not None:   # backward of y = out - g*(out.v/v.v)*v (verified against autograd): dy4 is the grad of y
@@ -3439,7 +3452,9 @@ def build_layer_ops(n_head: int):
             dv_extra = -g * (c * dyf + dyv * (of / den - 2.0 * c * vf / den))
             dxsa = ((1.0 - g * g) * (-c * dyv)).sum(dim=(0, 2, 3))
             dy4 = (dyf - g * (dyv / den) * vf).to(dy4.dtype)
+        if GLUE_PROF: _t2 = _gt(x2.device); _GLUE["b_glue1"] += _t2 - _t1
         dq4, dk4, dv4, dsink = attn_bwd(q4, k4, v4, out, dy4, neg_max, recip, sink, start, end)
+        if GLUE_PROF: _t3 = _gt(x2.device); _GLUE["b_attn"] += _t3 - _t2
         if dv_extra is not None:
             dv4 = (dv4.float() + dv_extra).to(dv4.dtype)
         if pre_bwd_k is not None:   # fused kernel: key-offset bwd + QK-norm bwd + rope bwd + Q/K/V dgrad and wgrad + norm bwd
@@ -3448,10 +3463,11 @@ def build_layer_ops(n_head: int):
             HQ = HD // 4   # key-offset backward slice, built here so every kernel DMA is a 128-row-aligned block
             gsh = dk4[:, :, 1:, HQ:2 * HQ] * (1.0 - dstart[:, 1:].to(dk4.dtype)).view(b, 1, t - 1, 1)
             dksh = torch.cat([gsh, torch.zeros_like(gsh[:, :, :1])], dim=2).reshape(B, t, HQ).contiguous()
-            dxm, gv2, dWq, dWk, dWv = pre_bwd_k[grid](dq4.reshape(B, t, HD).contiguous(), dk4.reshape(B, t, HD).contiguous(),
-                                                     dv4.reshape(B, t, HD).contiguous(), rq.contiguous(), rk.contiguous(),
-                                                     xm.contiguous(), dx1.to(bf).contiguous(), cos_full, sin_full, dksh, wq, wk, wv,
-                                                     n_head=NH, eps=eps, scale=scale, hq=HQ)
+            _a = [dq4.reshape(B, t, HD).contiguous(), dk4.reshape(B, t, HD).contiguous(), dv4.reshape(B, t, HD).contiguous(),
+                  rq.contiguous(), rk.contiguous(), xm.contiguous(), dx1.to(bf).contiguous(), cos_full, sin_full, dksh]
+            if GLUE_PROF: _t4 = _gt(x2.device); _GLUE["b_glue2"] += _t4 - _t3
+            dxm, gv2, dWq, dWk, dWv = pre_bwd_k[grid](*_a, wq, wk, wv, n_head=NH, eps=eps, scale=scale, hq=HQ)
+            if GLUE_PROF: _GLUE["b_pre"] += _gt(x2.device) - _t4
             return dxm, gv2, dWq, dWk, dWv, dWo, dW1s, dW2s, dsink, (dxsa if dxsa is not None else torch.zeros_like(xsa) if xsa is not None else None)
         if KEY_OFFSET:   # offset backward: position p-1's shifted dims receive position p's grad unless p starts a document
             HQ = HD // 4
@@ -3473,14 +3489,17 @@ def build_layer_ops(n_head: int):
         return dxm, gv2, dWq, dWk, dWv, dWo, dW1s, dW2s, dsink, (dxsa if dxsa is not None else torch.zeros_like(xsa) if xsa is not None else None)
 
     def _finish_backward(dxm, gv2, dWq, dWk, dWv, dWo, dW1, dW2, dsink, x2, x02, ve2, scal, sink, wq, wk, wv, wo, w1, w2):
+        if GLUE_PROF: _t0 = _gt(x2.device)
         resid = scal[0:1, 0:1]; x0l = scal[0:1, 1:2]; vel = scal[0:1, 2:3]
         dxf = dxm.float()
         dx2 = (dxf * resid).to(x2.dtype); dx02 = (dxf * x0l).to(x02.dtype); dve2 = (gv2.float() * vel).to(ve2.dtype)
         d_resid = (dxf * x2.float()).sum(); d_x0 = (dxf * x02.float()).sum(); d_ve = (gv2.float() * ve2.float()).sum()
         row0 = torch.stack([d_resid, d_x0, d_ve, torch.zeros((), device=scal.device, dtype=torch.float32)]).view(1, 4)
         dscal = torch.cat([row0, torch.zeros((127, 4), device=scal.device, dtype=torch.float32)], dim=0)
-        return (dx2, dx02, dve2, None, None, None, None, dscal, dsink.to(sink.dtype), None, None, None,
-                dWq.to(wq.dtype), dWk.to(wk.dtype), dWv.to(wv.dtype), dWo.to(wo.dtype), dW1.to(w1.dtype), dW2.to(w2.dtype))
+        res = (dx2, dx02, dve2, None, None, None, None, dscal, dsink.to(sink.dtype), None, None, None,
+               dWq.to(wq.dtype), dWk.to(wk.dtype), dWv.to(wv.dtype), dWo.to(wo.dtype), dW1.to(w1.dtype), dW2.to(w2.dtype))
+        if GLUE_PROF: _GLUE["b_finish"] += _gt(x2.device) - _t0
+        return res
 
     if LAYER_SAVE == "pack":
         # launch-overhead probe: the 13 saved tensors packed into 5 (stack copies; if this wins, the kernels emit packed outputs natively)
@@ -4635,6 +4654,8 @@ class MuonAdamW(torch.optim.Optimizer):
                             g16 = plan["g16"] = torch.empty_like(plan["gshard"], dtype=torch.bfloat16)
                         dist.reduce_scatter_tensor(g16, p.grad.to(torch.bfloat16), op=dist.ReduceOp.AVG)
                         plan["gshard"].copy_(g16)
+                    elif ASYNC_COMM:
+                        plan["work"] = dist.reduce_scatter_tensor(plan["gshard"], p.grad, op=dist.ReduceOp.AVG, async_op=True)
                     else:
                         dist.reduce_scatter_tensor(plan["gshard"], p.grad, op=dist.ReduceOp.AVG)
                     plan["active"] = True
@@ -4923,6 +4944,11 @@ class MuonAdamW(torch.optim.Optimizer):
             if self.plan:
                 # sharded params: run the same per-param math on the (pshard, gshard) pair instead of (p, p.grad)
                 planned = [p for p in group["params"] if p in self.plan and self.plan[p].get("active", True)]
+                if planned and ASYNC_COMM:
+                    for p in planned:                       # wait only for this group's collectives (others stay in flight)
+                        w = self.plan[p].pop("work", None)
+                        if w is not None:
+                            w.wait()
                 if planned:
                     g2 = dict(group)
                     g2["params"] = [self.plan[p]["pshard"] for p in planned]
@@ -5319,6 +5345,9 @@ def main() -> None:
                 n = prof["n"]
                 print0("PROFILE (avg s/step over 30 steps): " + " ".join(f"{k}={v/n:.3f}" for k, v in prof.items() if k not in ("n", "rank_fb"))
                        + f" other={(prof['total']-prof['fwd_bwd']-prof['grad_sync']-prof['optimizer'])/n:.3f}")
+                if GLUE_PROF and _GLUE["n"]:
+                    _nl = _GLUE["n"]   # layer calls so far (all steps): per-layer-call averages in ms
+                    print0("GLUEPROF ms per layer call: " + " ".join(f"{k}={v / _nl * 1000:.2f}" for k, v in _GLUE.items() if k != "n") + f"  (n={_nl})")
                 if OPT_PROF:
                     print0("OPTPROF (avg s/step over steps 10-39): " + " ".join(f"{k}={v/n:.4f}" for k, v in _OPTPROF.items()))
                 if PROFILE_SKEW and "rank_fb" in prof:
