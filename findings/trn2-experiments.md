@@ -1446,3 +1446,10 @@ what not to build). Box stack: nki 0.5.0, neuronx-cc 2.26, nkilib 0.5 (NOT the 0
   (2) AdamW/collective fusion: ASYNC_COMM=1 (async reduce_scatter, waits per optimizer group) - no gain (grad_sync 0.043,
   total 0.580). Both of today's profiled screens show optimizer ~0.086 s vs 0.057 yesterday on unchanged optimizer code;
   OPTPROF4 splits it.
+- 07:30 UTC (2026-09-11), **GPU verdict on DeltaNet: inconclusive - my port is the blocker, not Trainium.** Local RTX 4080S,
+  v39 architecture, 600 fixed steps: baseline 1.174158; the GDN hybrid (6 of 12 layers) NaNs at step 5 with the params in
+  the boosted scalar group, and at step 20 with a dedicated GDN group at lr 0.01 (the GPU-line value). The chunked rule
+  equals the token recurrence to 1e-15 on random inputs but the state diverges under training on CUDA as well, so the
+  instability is in the implementation's training numerics, not the hardware. Fixing it to fla-quality (state handling,
+  gating) is the days-of-work kernel task; the usefulness question stays unanswered. Two side wins found while doing this:
+  the k_sink/v_sink scalar-group flat-path fix, and a dedicated GDN_LR group (both stay in the vehicle, off by default).

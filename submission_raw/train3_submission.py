@@ -197,6 +197,7 @@ ADAM_ALT = _ENV("NEURON_COMPETITION_R1_ADAM_ALT", "0") != "0"            # AdamW
 XSA = _ENV("NEURON_COMPETITION_R1_XSA", "0") != "0"                  # gated exclusive self-attention (record #82): y -= tanh(a[l,h]) * (y.v / v.v) * v, a zero-init
 DELTANET_LAYERS = tuple(int(i) for i in _ENV("NEURON_COMPETITION_R1_DELTANET", "").split(",") if i.strip())   # layers whose attention is replaced by a gated delta rule mixer (torch ops, chunked)
 DELTANET_CHUNK = int(_ENV("NEURON_COMPETITION_R1_DELTANET_CHUNK", "64"))
+GDN_LR = float(_ENV("NEURON_COMPETITION_R1_GDN_LR", "0.01"))            # GatedDeltaNet param LR (GPU line used 0.01; the boosted scalar LR destabilized the gates by step 5)
 GLUE_PROF = _ENV("NEURON_COMPETITION_R1_GLUE_PROF", "0") != "0"          # time the eager glue vs kernel calls inside the layer op bodies (syncs; dev only)
 _GLUE = {"f_pre": 0.0, "f_glue": 0.0, "f_attn": 0.0, "f_y2": 0.0, "f_post": 0.0, "b_post": 0.0, "b_glue1": 0.0, "b_attn": 0.0, "b_glue2": 0.0, "b_pre": 0.0, "b_finish": 0.0, "n": 0}
 ASYNC_COMM = _ENV("NEURON_COMPETITION_R1_ASYNC_COMM", "0") != "0"        # OPT_SHARD=zero: async reduce_scatter handles, waited per optimizer group (overlap comm with Muon/AdamW math)
@@ -4338,10 +4339,13 @@ class GPT(nn.Module):
             scalar_params.append(self.backout_lambda)
         if self.config.use_trigram:
             scalar_params.append(self.trigram_lambda)
-        scalar_params.extend(self.block_scalars[k] for k in ("resid", "x0", "ve", "k_sink", "v_sink", "sink", "vr", "ple", "xsa") if k in self.block_scalars)
+        _logit_sink = self.config.sink_mode == "logit"
+        _skeys = ("resid", "x0", "ve", "sink", "vr", "ple", "xsa") if _logit_sink else ("resid", "x0", "ve", "k_sink", "v_sink", "vr", "ple", "xsa")
+        scalar_params.extend(self.block_scalars[k] for k in _skeys if k in self.block_scalars)   # k_sink/v_sink are unused under logit sink; keeping them out lets the flat AdamW path fire (all scalars <= 4096)
+        gdn_params = []
         for blk in self.transformer["h"]:
             if blk.gdn is not None:
-                scalar_params.extend(blk.gdn.small_params())
+                gdn_params.extend(blk.gdn.small_params())
         embedding_params = (list(self.transformer.wte.parameters())
                             + list(self.transformer.vte.parameters())
                             + list(self.transformer.vte_mid.parameters())
@@ -4359,6 +4363,8 @@ class GPT(nn.Module):
             dict(kind="adamw", params=lm_head_params, lr=UNEMBEDDING_LR * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
             dict(kind="adamw", params=scalar_params, lr=SCALAR_LR, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if gdn_params:
+            param_groups.append(dict(kind="adamw", params=gdn_params, lr=GDN_LR, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0))
         for key in sorted(self.stacks.keys()):   # one permanently stacked (n, out, in) Parameter per shape
             param_groups.append(dict(kind="muon", params=[self.stacks[key]], lr=MATRIX_LR, momentum=0.95, beta2=0.90, ns_steps=5, weight_decay=WEIGHT_DECAY))
         opt = MuonAdamW(param_groups)
