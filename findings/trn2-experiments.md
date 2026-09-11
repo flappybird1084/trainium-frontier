@@ -1437,3 +1437,12 @@ what not to build). Box stack: nki 0.5.0, neuronx-cc 2.26, nkilib 0.5 (NOT the 0
   Box copies of the moved files stay in ~/tf (the legacy trn2_profile_ops.sh still expects neff_ops_agg.py there).
 - 07:10 UTC (2026-09-11): legacy profile drivers `trn2_profile_neff.sh`, `trn2_profile_ops.sh/.py`, `trn2_profile_sum.py` moved to
   `experimental/trn2_legacy/` (`trn2_profile_one.sh` covers them).
+- 06:30-07:00 UTC (2026-09-11), fusion targets requested by the user: (1) reshapes/arithmetic glue - the layer op's Python
+  bodies run only during tracing (GLUE_PROF counters advanced 36 times in 40 steps), so the glue is compiler copies in the
+  NEFF; the fix is layout: `pre_attn_fwd_h` emits q/k/v as (b*NH, t, HD) with the attention scale folded into q and
+  `post_attn_fwd_h` reads the attention output per head and writes the token-major y2 for the backward from SBUF -> four
+  16 MB compiler copies per layer per step removed (the key-offset cat stays). Simulator: identical to the originals
+  (`nki/nki_layout_test.py`; q differs by bf16 rounding of the folded scale). Knob ATTN_LAYOUT=heads; screen S_V39_LAYOUT.
+  (2) AdamW/collective fusion: ASYNC_COMM=1 (async reduce_scatter, waits per optimizer group) - no gain (grad_sync 0.043,
+  total 0.580). Both of today's profiled screens show optimizer ~0.086 s vs 0.057 yesterday on unchanged optimizer code;
+  OPTPROF4 splits it.
