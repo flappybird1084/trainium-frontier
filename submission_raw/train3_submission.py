@@ -196,6 +196,7 @@ GATHER_BF16 = _ENV("NEURON_COMPETITION_R1_GATHER_BF16", "0") != "0"      # OPT_S
 ADAM_ALT = _ENV("NEURON_COMPETITION_R1_ADAM_ALT", "0") != "0"            # AdamW groups step on odd steps only (record #39: -1.2% wall-clock)
 XSA = _ENV("NEURON_COMPETITION_R1_XSA", "0") != "0"                  # gated exclusive self-attention (record #82): y -= tanh(a[l,h]) * (y.v / v.v) * v, a zero-init
 FLOW_STEPS = int(_ENV("NEURON_COMPETITION_R1_FLOW_STEPS", "0"))          # iterative refinement of the attention output: k Euler steps of a learned time-conditioned velocity field (0 = off; inference uses max steps, training samples 1..k)
+FLOW_SITE = _ENV("NEURON_COMPETITION_R1_FLOW_SITE", "attn")               # where the iterative refinement runs: attn | mlp | block | prehead
 DELTANET_LAYERS = tuple(int(i) for i in _ENV("NEURON_COMPETITION_R1_DELTANET", "").split(",") if i.strip())   # layers whose attention is replaced by a gated delta rule mixer (torch ops, chunked)
 DELTANET_CHUNK = int(_ENV("NEURON_COMPETITION_R1_DELTANET_CHUNK", "64"))
 GDN_LR = float(_ENV("NEURON_COMPETITION_R1_GDN_LR", "0.01"))            # GatedDeltaNet param LR (GPU line used 0.01; the boosted scalar LR destabilized the gates by step 5)
@@ -4159,16 +4160,17 @@ class Block(nn.Module):
         x = resid_lambda * x + x0_lambda * x0
         a, v0 = self.attn(norm(x), ve_lambda * ve, cos, sin, block_mask, dense_mask, k_sink, v_sink, sink, bounds, v0, vr_lambda,
                           doc_dims, rope_tabs, doc_start=doc_start, phase=phase)
-        if FLOW_STEPS > 0:   # in-attention iterative refinement of the attention contribution (b, t, c)
+        if FLOW_STEPS > 0 and FLOW_SITE == "attn":   # refine the attention contribution
             a = self.attn._flow_refine(a)
         x = x + a
         if skip_mlp:
             return x, v0
-        if CKPT == "mlp":
-            import torch.utils.checkpoint as _ckpt
-            x = x + _ckpt.checkpoint(self._mlp_normed, x, use_reentrant=False)
-        else:
-            x = x + self.mlp(norm(x))
+        mout = self._mlp_normed(x) if CKPT != "mlp" else __import__("torch").utils.checkpoint.checkpoint(self._mlp_normed, x, use_reentrant=False)
+        if FLOW_STEPS > 0 and FLOW_SITE == "mlp":    # refine the MLP contribution
+            mout = self.attn._flow_refine(mout)
+        x = x + mout
+        if FLOW_STEPS > 0 and FLOW_SITE == "block":  # refine the whole block output (between residual connections)
+            x = self.attn._flow_refine(x)
         return x, v0
 
     def _mlp_normed(self, x):
@@ -4191,6 +4193,10 @@ class GPT(nn.Module):
             self.transformer["bte2"] = nn.Embedding(BIGRAM_SIZE, config.n_embd // 2)   # second half-width table, own hash
         registry = StackRegistry()
         self.transformer["h"] = nn.ModuleList([Block(config, registry) for _ in range(config.n_layer)])
+        if FLOW_STEPS > 0 and FLOW_SITE == "prehead":   # one refinement of the final representation before the LM head
+            C = config.n_embd
+            self.flow_head_w1 = nn.Linear(C, C); self.flow_head_t = nn.Linear(1, C, bias=False); self.flow_head_w2 = nn.Linear(C, C, bias=False)
+            with torch.no_grad(): self.flow_head_w2.weight.zero_()
         for i in DELTANET_LAYERS:
             if i < config.n_layer:
                 self.transformer["h"][i].gdn = GatedDeltaMixer(self.transformer["h"][i].attn, config)
@@ -4367,9 +4373,11 @@ class GPT(nn.Module):
             if blk.gdn is not None:
                 gdn_params.extend(blk.gdn.small_params())
         flow_params = []
-        if FLOW_STEPS > 0:
+        if FLOW_STEPS > 0 and FLOW_SITE != "prehead":
             for blk in self.transformer["h"]:
                 flow_params += list(blk.attn.flow_w1.parameters()) + list(blk.attn.flow_t.parameters()) + list(blk.attn.flow_w2.parameters())
+        if FLOW_STEPS > 0 and FLOW_SITE == "prehead":
+            flow_params += list(self.flow_head_w1.parameters()) + list(self.flow_head_t.parameters()) + list(self.flow_head_w2.parameters())
         embedding_params = (list(self.transformer.wte.parameters())
                             + list(self.transformer.vte.parameters())
                             + list(self.transformer.vte_mid.parameters())
@@ -4397,6 +4405,14 @@ class GPT(nn.Module):
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
         return opt
+
+    def _flow_refine_head(self, x):
+        S = FLOW_STEPS if not self.training else int(torch.randint(1, FLOW_STEPS + 1, (1,)).item())
+        dt = 1.0 / S; xf = x.float()
+        for kstep in range(S):
+            tk = torch.full((1, 1), kstep / S, device=x.device, dtype=torch.float32)
+            xf = xf + dt * self.flow_head_w2(F.gelu(self.flow_head_w1(xf) + self.flow_head_t(tk)))
+        return xf.to(x.dtype)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None, loss_reduction: str = "mean", emb=None,
                 bigram_grad: bool = True, bounds_in=None):
@@ -4547,6 +4563,8 @@ class GPT(nn.Module):
                 x_mid = x
         if self.config.backout:
             x = x - self.backout_lambda * x_mid
+        if FLOW_STEPS > 0 and FLOW_SITE == "prehead":
+            x = self._flow_refine_head(x)
         x_pre = x
         if (HEAD_IMPL == "nki" and targets is not None and loss_reduction == "mean" and x.device.type == "neuron"
                 and not (self.config.mtp and MTP_WEIGHT > 0 and self.training)):

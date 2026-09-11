@@ -1490,3 +1490,11 @@ what not to build). Box stack: nki 0.5.0, neuronx-cc 2.26, nkilib 0.5 (NOT the 0
   the zero init. GPU screens FLOW4 (max 4 steps) / FLOW1 (max 2) chained after the register screens. Read both with
   `bash read_gpu.sh`. LESSON: never run GPU smokes while a GPU screen is running -- they share the one GPU and starve it
   (REG_BASE crawled to step 15 during my flow debugging).
+- 19:20 UTC (2026-09-11), flow refinement made multi-site (user idea "rectified flow at multiple stages"): knob
+  FLOW_SITE = attn | mlp | block | prehead, reusing the same time-conditioned velocity field (zero-init, S sampled in
+  training, max at inference). attn/mlp/block use each block's flow module (on self.attn); prehead uses a GPT-level module
+  applied to the final representation before the head (one refinement, extra inference compute at the end, as the user
+  suggested). All four CPU/GPU-smoked (grads flow, bootstraps from zero init). GPU fixed-step screens: FLOW4/FLOW1 (attn),
+  then FLOW_MLP / FLOW_BLOCK / FLOW_PREHEAD (FLOW_STEPS=3) chained on the free GPU. "In the attention weights" (refining the
+  b,h,s,s score/prob matrix) NOT implemented -- different shape, s x s per head is expensive; noted as a heavier follow-up.
+  Read all with `bash read_gpu.sh`.
