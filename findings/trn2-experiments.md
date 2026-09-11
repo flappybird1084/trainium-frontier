@@ -1453,3 +1453,7 @@ what not to build). Box stack: nki 0.5.0, neuronx-cc 2.26, nkilib 0.5 (NOT the 0
   instability is in the implementation's training numerics, not the hardware. Fixing it to fla-quality (state handling,
   gating) is the days-of-work kernel task; the usefulness question stays unanswered. Two side wins found while doing this:
   the k_sink/v_sink scalar-group flat-path fix, and a dedicated GDN_LR group (both stay in the vehicle, off by default).
+- 08:25 UTC (2026-09-11): **T56_gate (v40 = v39 + attention-layout kernels) = 0.985161 -> `submit/train.py` = v40** (sha
+  a9594ed53945831f), -0.0014 vs v39, 0.52 s/step, causality passed, 0 errors. The head-major pre/post kernels remove the
+  permute/reshape compiler copies between the layer kernels and the vendor attention (fwd_bwd 0.451 -> 0.444). Numerics
+  unchanged (score in band; the small gain is the faster step buying a few more steps at fixed time).
