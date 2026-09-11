@@ -1477,3 +1477,16 @@ what not to build). Box stack: nki 0.5.0, neuronx-cc 2.26, nkilib 0.5 (NOT the 0
 - LESSON: the queue runner dies (gate-refused) when out_*/ checkpoints fill the disk. Every screen writes out_<ID>/final.pt
   (~228 MB); ~90 screens = ~20 GB + NEFF cache. For long unattended queues, pre-clean and/or the runner should rm out_<ID>
   after each screen. Manual fix: `rm -rf out_S_* out_W_*` between batches.
+- 19:00 UTC (2026-09-11), attention tricks (user request; tested on the local GPU at fixed steps so the Trainium weird-queue
+  is not disturbed): (1) BigBird dedicated attention registers / global tokens = the EXISTING `SINK=kv` + `NUM_SINKS`
+  machinery (learnable global KV slots every query attends to); v40 uses the logit-sink variant for NKI. GPU screens
+  REG_BASE vs REG_KV16 / REG_KV64 (500 fixed steps) test whether more/dedicated registers beat the single logit sink.
+  (2) Mutable prepended context tokens: NOT implemented - collides with the U-net skips and every real-position-indexed
+  tensor (doc masks, ve, bigram, key-offset); high bug risk. Gated on the register screen showing registers help.
+  (3) Rectified-flow / iterative refinement inside the attention layer (FLOW_STEPS knob): implemented as a self-contained
+  time-conditioned velocity field on the attention contribution a (b,t,c) in Block.forward -- for k in range(S): a += (1/S)
+  * W2 gelu(W1 a + T (k/S)); W2 zero-init (identity at start); training samples S in 1..FLOW_STEPS (large->small steps),
+  inference uses FLOW_STEPS. Flow params in their own AdamW group (SCALAR_LR). CPU/GPU-smoked: grads flow, bootstraps from
+  the zero init. GPU screens FLOW4 (max 4 steps) / FLOW1 (max 2) chained after the register screens. Read both with
+  `bash read_gpu.sh`. LESSON: never run GPU smokes while a GPU screen is running -- they share the one GPU and starve it
+  (REG_BASE crawled to step 15 during my flow debugging).
