@@ -1435,3 +1435,5 @@ what not to build). Box stack: nki 0.5.0, neuronx-cc 2.26, nkilib 0.5 (NOT the 0
   probes and the old step profiler), `experimental/monitor/nm_monitor.py`. Still in use at the root: neff_instr_agg.py
   (called by trn2_profile_one.sh), gpu_gdn.sh (local-GPU fixed-step runs), the trn2_* box tools (untouched).
   Box copies of the moved files stay in ~/tf (the legacy trn2_profile_ops.sh still expects neff_ops_agg.py there).
+- 07:10 UTC (2026-09-11): legacy profile drivers `trn2_profile_neff.sh`, `trn2_profile_ops.sh/.py`, `trn2_profile_sum.py` moved to
+  `experimental/trn2_legacy/` (`trn2_profile_one.sh` covers them).

@@ -46,7 +46,7 @@ cd autoresearch && bash run.sh
 - `train.py` at the root is the organizers' baseline and stays where it is.
 - Box tools at the root (master copies, rsynced to the box's `~/tf`): `trn2_run.sh` (gated launcher), `trn2_queue.sh` (gated
   queue runner), `trn2_job.sh` (gated single-core job), `trn2_status.sh`, `trn2_profile_one.sh` + `neff_instr_agg.py` (NEFF
-  engine/instruction profiles), `trn2_profile_neff.sh` / `trn2_profile_ops.sh` (older profile drivers).
+  engine/instruction profiles). Older profile drivers live in `experimental/trn2_legacy/`.
 - `experimental/` (2026-09-11) — parked or legacy material kept for reference: `gdn/` (chunked gated delta rule in torch and
   its device tests; DeltaNet stage 1, not viable on this stack), `neff/neff_ops_agg.py` (per-op aggregation, needs pandas),
   `neuron/` (fresh-box health probes `neuron_probes.py` / `dist_probe.py` / `run_probes.sh` from the deadlock
