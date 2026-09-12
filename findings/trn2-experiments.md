@@ -1507,3 +1507,10 @@ what not to build). Box stack: nki 0.5.0, neuronx-cc 2.26, nkilib 0.5 (NOT the 0
   `{"input": {...}}` payload to /app/runsync. First real run: baseline / flow-block / flow-prehead / KV-registers at 400
   steps. Gotchas: needs the `{"input":...}` wrapper; training needs ALL of PUBLIC_TRAIN_SHARDS (range 5) not just the
   --num-train-shards count; kill stale uvicorns + rm .flash/ when changing the endpoint (no hot-reload picks up new funcs).
+- 02:10 UTC (2026-09-12), diffusion/flow VERDICT (Blackwell, full v40 config, fixed-step): BASE trained fine (240 steps,
+  loss 3.47, val 1.267 undertrained); FLOWBLOCK (flow refinement on the block output, FLOW_STEPS=3) DIVERGED and crashed
+  at step 4 (loss 8.72, no val) despite zero-init identity start -- same training instability class as DeltaNet. The
+  iterative-refinement / rectified-flow idea is NOT viable as implemented; NOT proceeding to a Trn2 run (user's call:
+  "if it's doing well, make a trn2 run; determine now"). RunPod worker stopped (dev-only, no deployed endpoint). Flow knobs
+  (FLOW_STEPS/FLOW_SITE) stay in the vehicle, off by default. Untested: the prehead site (one refinement at the end) may be
+  more stable than per-layer, but not pursued given the block result and cost.

@@ -37,3 +37,34 @@ successfully
 18:21:04 ✓ tf_train 15.5s  queued 51.6s
 18:21:27 POST /tf_train/runsync
 18:21:30 tf_train │ ready qx3fb2xq
+19:07:02 POST /tf_train/runsync
+19:07:04 tf_train │ pulling image
+19:21:42 tf_train │ stop container 
+bd768c5b29ee872dda4b2a9aaa3171158257a6e14eb4bb172cee8440c5eebaf1
+19:21:46 ✗ tf_train 3609.6s
+         executionTimeout exceeded
+19:22:07 tf_train │ ==========
+19:22:07 tf_train │ == CUDA ==
+19:22:07 tf_train │ ==========
+19:22:07 tf_train │ CUDA Version 12.8.1
+19:22:07 tf_train │ Container image Copyright (c) 2016-2023, NVIDIA CORPORATION 
+& AFFILIATES. All rights reserved.
+19:22:07 tf_train │ This container image and its contents are governed by the 
+NVIDIA Deep Learning Container License.
+19:22:07 tf_train │ By pulling and using the container, you accept the terms and
+conditions of this license:
+19:22:07 tf_train │ 
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+19:22:07 tf_train │ A copy of this license is made available in this container 
+at /NGC-DL-CONTAINER-LICENSE for your convenience.
+19:22:07 tf_train │ GPU binary test passed: 1 GPU(s) healthy (CUDA 13.2)
+19:22:07 tf_train │ CUDA version check passed: 12.8 (minimum: 11.8)
+19:22:13 tf_train │ CUDA initialization passed: 1 device(s) initialized 
+successfully
+19:22:13 tf_train │ GPU compute benchmark passed: Matrix multiply completed in 
+63ms
+19:22:13 tf_train │ pulled image 908s
+19:22:13 tf_train │ ready 8xq29r23
+19:22:21 tf_train │ pulling image
+19:28:49 tf_train │ pulled image 387s
+19:28:49 ✓ tf_train 391.1s  queued 905.2s
