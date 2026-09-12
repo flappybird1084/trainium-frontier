@@ -1498,3 +1498,12 @@ what not to build). Box stack: nki 0.5.0, neuronx-cc 2.26, nkilib 0.5 (NOT the 0
   then FLOW_MLP / FLOW_BLOCK / FLOW_PREHEAD (FLOW_STEPS=3) chained on the free GPU. "In the attention weights" (refining the
   b,h,s,s score/prob matrix) NOT implemented -- different shape, s x s per head is expensive; noted as a heavier follow-up.
   Read all with `bash read_gpu.sh`.
+- 18:20 UTC (2026-09-11), RunPod Flash remote-GPU pipeline working (user provided access; local 30 GB box swap-thrashed on
+  the full vehicle). `flash_app/app.py` defines a `train` @Endpoint on NVIDIA_RTX_PRO_6000_BLACKWELL_SERVER_EDITION
+  (102 GB VRAM, 2 TB RAM, torch 2.9+cu128, ~11 s cold start). It ships the code (train3_submission.py, prepare.py,
+  tokenizer zip) base64 in the request (repo is private, can't clone), runs `prepare.py setup --num-train-shards 5` on the
+  worker (HF download ~4 s), then trains each config as a subprocess (COMPILE=0 CUDA, fixed NUM_STEPS, eval) and returns
+  val_bpb. Run: `flash dev` in flash_app/ (clean subdir so it doesn't scan the neuron-only vehicle), POST the
+  `{"input": {...}}` payload to /app/runsync. First real run: baseline / flow-block / flow-prehead / KV-registers at 400
+  steps. Gotchas: needs the `{"input":...}` wrapper; training needs ALL of PUBLIC_TRAIN_SHARDS (range 5) not just the
+  --num-train-shards count; kill stale uvicorns + rm .flash/ when changing the endpoint (no hot-reload picks up new funcs).

@@ -1,0 +1,104 @@
+
+discovered 1 endpoint(s)
+provisioning 1 endpoint(s)...
+⠙ ✓ provisioned 1 endpoint(s)
+
+✓ provisioned 1 endpoint(s) (1 deployed) 1.0s
+
+port 8888 in use, using 8889
+
+✓ flash dev  localhost:8889
+
+  POST  /app/runsync  probe  QB
+
+  docs  http://localhost:8889/docs
+  stop  ctrl+c
+
+2026-09-11 18:13:43,264 | WARNING | /home/rianbutala/projects/trainium-frontier/flash_app/app.py:17: unresolvable dynamic import (non-literal argument); ensure the module is on the worker image or bundle it explicitly
+18:13:43 POST /tf_probe/runsync
+18:13:46 tf_probe │ pulling image
+18:13:50 tf_probe │ ==========
+18:13:50 tf_probe │ == CUDA ==
+18:13:50 tf_probe │ ==========
+18:13:50 tf_probe │ CUDA Version 12.8.1
+18:13:50 tf_probe │ Container image Copyright (c) 2016-2023, NVIDIA CORPORATION 
+& AFFILIATES. All rights reserved.
+18:13:50 tf_probe │ This container image and its contents are governed by the 
+NVIDIA Deep Learning Container License.
+18:13:50 tf_probe │ By pulling and using the container, you accept the terms and
+conditions of this license:
+18:13:50 tf_probe │ 
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+18:13:50 tf_probe │ A copy of this license is made available in this container 
+at /NGC-DL-CONTAINER-LICENSE for your convenience.
+18:13:52 tf_probe │ GPU binary test passed: 1 GPU(s) healthy (CUDA 13.2)
+18:13:52 tf_probe │ CUDA version check passed: 12.8 (minimum: 11.8)
+18:13:55 tf_probe │ CUDA initialization passed: 1 device(s) initialized 
+successfully
+18:13:55 tf_probe │ GPU compute benchmark passed: Matrix multiply completed in 
+71ms
+18:13:58 tf_probe │ pulled image 12s
+18:13:58 tf_probe │ ready zgg5njp6
+18:14:02 ✓ tf_probe 1.2s  queued 10.8s
+ERROR:    Exception in ASGI application
+Traceback (most recent call last):
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/uvicorn/protocols/http/httptools_impl.py", line 422, in run_asgi
+    result = await app(  # type: ignore[func-returns-value]
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/uvicorn/middleware/proxy_headers.py", line 63, in __call__
+    return await self.app(scope, receive, send)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/fastapi/applications.py", line 1163, in __call__
+    await super().__call__(scope, receive, send)
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/starlette/applications.py", line 96, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/starlette/middleware/errors.py", line 186, in __call__
+    raise exc
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/starlette/middleware/errors.py", line 164, in __call__
+    await self.app(scope, receive, _send)
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/starlette/middleware/exceptions.py", line 63, in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+    await self.app(scope, receive, send)
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/starlette/routing.py", line 670, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 2734, in app
+    await route.handle(scope, receive, send)
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 1281, in handle
+    await super().handle(scope, receive, send)
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/starlette/routing.py", line 280, in handle
+    await self.app(scope, receive, send)
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 158, in app
+    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 144, in app
+    response = await f(request)
+               ^^^^^^^^^^^^^^^^
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 706, in app
+    raw_response = await run_endpoint_function(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 352, in run_endpoint_function
+    return await dependant.call(**values)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/rianbutala/projects/trainium-frontier/flash_app/.flash/server.py", line 33, in app_runsync
+    # ────────────────────────────────────────────────────────────
+          ^^^^
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/runpod_flash/client.py", line 268, in wrapper
+    return await stub(
+           ^^^^^^^^^^^
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/runpod_flash/stubs/registry.py", line 45, in stubbed_resource
+    request = await stub.prepare_request(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/runpod_flash/stubs/live_serverless.py", line 128, in prepare_request
+    source, src_hash = get_function_source(func)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/rianbutala/projects/trainium-frontier/.venv/lib/python3.12/site-packages/runpod_flash/stubs/live_serverless.py", line 55, in get_function_source
+    raise ValueError(f"Could not find function definition for {func.__name__}")
+ValueError: Could not find function definition for probe

@@ -1,0 +1,39 @@
+
+✓ flash dev  localhost:8891
+
+  POST  /app/runsync  train  QB
+
+  docs  http://localhost:8891/docs
+  stop  ctrl+c
+
+18:19:50 POST /tf_train/runsync
+18:19:54 tf_train │ waiting No workers available on endpoint: no gpu 
+availability for gpu type BLACKWELL_96 in selected locations (US-CA-2, US-IL-1, 
+US-KS-2, US-MO-1, US-MO-2, US-NC-2, US-NE-1, US-WA-1, EU-CZ-1, EU-RO-1, 
+EUR-NO-1).
+18:20:43 tf_train │ ==========
+18:20:43 tf_train │ == CUDA ==
+18:20:43 tf_train │ ==========
+18:20:43 tf_train │ CUDA Version 12.8.1
+18:20:43 tf_train │ Container image Copyright (c) 2016-2023, NVIDIA CORPORATION 
+& AFFILIATES. All rights reserved.
+18:20:43 tf_train │ This container image and its contents are governed by the 
+NVIDIA Deep Learning Container License.
+18:20:43 tf_train │ By pulling and using the container, you accept the terms and
+conditions of this license:
+18:20:43 tf_train │ 
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+18:20:43 tf_train │ A copy of this license is made available in this container 
+at /NGC-DL-CONTAINER-LICENSE for your convenience.
+18:20:43 tf_train │ GPU binary test passed: 1 GPU(s) healthy (CUDA 13.2)
+18:20:43 tf_train │ CUDA version check passed: 12.8 (minimum: 11.8)
+18:20:43 tf_train │ CUDA initialization passed: 1 device(s) initialized 
+successfully
+18:20:43 tf_train │ GPU compute benchmark passed: Matrix multiply completed in 
+72ms
+18:20:49 tf_train │ ready qx3fb2xq
+18:20:58 tf_train │ pulling image
+18:21:04 tf_train │ pulled image 6s
+18:21:04 ✓ tf_train 15.5s  queued 51.6s
+18:21:27 POST /tf_train/runsync
+18:21:30 tf_train │ ready qx3fb2xq
