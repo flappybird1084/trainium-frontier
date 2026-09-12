@@ -197,6 +197,7 @@ ADAM_ALT = _ENV("NEURON_COMPETITION_R1_ADAM_ALT", "0") != "0"            # AdamW
 XSA = _ENV("NEURON_COMPETITION_R1_XSA", "0") != "0"                  # gated exclusive self-attention (record #82): y -= tanh(a[l,h]) * (y.v / v.v) * v, a zero-init
 FLOW_STEPS = int(_ENV("NEURON_COMPETITION_R1_FLOW_STEPS", "0"))          # iterative refinement of the attention output: k Euler steps of a learned time-conditioned velocity field (0 = off; inference uses max steps, training samples 1..k)
 FLOW_SITE = _ENV("NEURON_COMPETITION_R1_FLOW_SITE", "attn")               # where the iterative refinement runs: attn | mlp | block | prehead
+FLOW_LR = float(_ENV("NEURON_COMPETITION_R1_FLOW_LR", "0.01"))            # dedicated LR for the flow velocity field (the scalar LR diverged it at step 4, like DeltaNet)
 DELTANET_LAYERS = tuple(int(i) for i in _ENV("NEURON_COMPETITION_R1_DELTANET", "").split(",") if i.strip())   # layers whose attention is replaced by a gated delta rule mixer (torch ops, chunked)
 DELTANET_CHUNK = int(_ENV("NEURON_COMPETITION_R1_DELTANET_CHUNK", "64"))
 GDN_LR = float(_ENV("NEURON_COMPETITION_R1_GDN_LR", "0.01"))            # GatedDeltaNet param LR (GPU line used 0.01; the boosted scalar LR destabilized the gates by step 5)
@@ -4398,7 +4399,7 @@ class GPT(nn.Module):
         if gdn_params:
             param_groups.append(dict(kind="adamw", params=gdn_params, lr=GDN_LR, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0))
         if flow_params:
-            param_groups.append(dict(kind="adamw", params=flow_params, lr=SCALAR_LR, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0))
+            param_groups.append(dict(kind="adamw", params=flow_params, lr=FLOW_LR, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0))
         for key in sorted(self.stacks.keys()):   # one permanently stacked (n, out, in) Parameter per shape
             param_groups.append(dict(kind="muon", params=[self.stacks[key]], lr=MATRIX_LR, momentum=0.95, beta2=0.90, ns_steps=5, weight_decay=WEIGHT_DECAY))
         opt = MuonAdamW(param_groups)

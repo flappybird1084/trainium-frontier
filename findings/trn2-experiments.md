@@ -1514,3 +1514,8 @@ what not to build). Box stack: nki 0.5.0, neuronx-cc 2.26, nkilib 0.5 (NOT the 0
   "if it's doing well, make a trn2 run; determine now"). RunPod worker stopped (dev-only, no deployed endpoint). Flow knobs
   (FLOW_STEPS/FLOW_SITE) stay in the vehicle, off by default. Untested: the prehead site (one refinement at the end) may be
   more stable than per-layer, but not pursued given the block result and cost.
+- 02:20 UTC (2026-09-12), diffusion FAIR SHOT (user: RunPod showed only 11 GB VRAM -> runs locally; give it a fair shot):
+  root cause of the step-4 divergence was the flow velocity field inheriting the boosted SCALAR_LR (same bug as DeltaNet,
+  which needed lr 0.01). Added FLOW_LR knob (default 0.01, own AdamW group). Local GPU screens (depth 8, capped no-swap):
+  FF_BASE vs FF_BLOCK_lr01 / lr003 / FF_PREHEAD_lr01, 500 fixed steps. If flow now survives and matches/beats baseline ->
+  reconsider a Trn2 run. read with `bash read_gpu.sh` (FF_* rows).
