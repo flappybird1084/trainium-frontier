@@ -124,6 +124,8 @@ HEAD_DIM = N_EMBD // N_HEAD
 MLP_RATIO = int(_ENV("NEURON_COMPETITION_R1_MLP_RATIO", "4"))
 
 PACK = int(_ENV("NEURON_COMPETITION_R1_PACK", "1"))   # v7: 1 = the baseline loader shape (rows of SEQ_LEN).
+PACK_MODE = _ENV("NEURON_COMPETITION_R1_PACK_MODE", "bestfit")   # bestfit = the provided best-fit packer (PACK-long rows reshaped) | stream = eval-style stream-cut rows (2026-09-14)
+STREAM_RESHUFFLE = _ENV("NEURON_COMPETITION_R1_STREAM_RESHUFFLE", "1") != "0"   # stream mode: seeded row-group permutation on epoch >= 2
                                 # 4 (T10 packing trick, worth only -0.0013) is a post-v1 novelty; dropped for
                                 # the portal until a run of ours scores there.
 DEVICE_BATCH_SIZE = int(os.environ.get("NEURON_COMPETITION_R1_DEVICE_BATCH", "0")) or None
@@ -5788,7 +5790,55 @@ def main() -> None:
 
     # organizer-sanctioned packing: fetch PACK-times-long rows, reshape to SEQ_LEN chunks
     loader_dev = torch.device("cpu") if (LOADER_DEV == "cpu" and device.type == "neuron") else device
-    _raw_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE // PACK, SEQ_LEN * PACK, "train", loader_dev)
+
+    def _stream_loader(batch_size, seq_len, split, dev, shard_ids=None):
+        # PACK_MODE=stream (2026-09-14): train rows built EXACTLY like prepare.make_eval_dataloader builds eval rows -
+        # every document (BOS-prepended) appended to one stream, a row = the next 1025 tokens, advance by 1024 - so the
+        # training distribution matches the scored one (99.9% of eval rows start mid-document; 50% of eval targets have
+        # no document start in context; the provided best-fit packer never produces either and drops ~28% of the corpus:
+        # findings/flow-inference-compute.md "DATA PIPELINE"). Same rank-strided row-group split as the provided loader.
+        # Epoch >= 2 walks the row groups in a seeded permutation so the second pass re-cuts the stream at new offsets
+        # (different rows, same tokens) instead of replaying identical rows. Custom packing is organizer-sanctioned.
+        import prepare as _prep
+        import pyarrow.parquet as _pq
+        _ddp, _rank, _lr, _ws = _prep.get_dist_info()
+        groups = _prep._row_groups_for_split(split, _rank, _ws, shard_ids=shard_ids)
+        bos = tokenizer.get_bos_token_id()
+        cap = seq_len + 1
+        d = torch.device(dev)
+        xb = torch.empty((batch_size, seq_len), dtype=torch.int32, device=d)
+        yb = torch.empty((batch_size, seq_len), dtype=torch.long, device=d)
+        stream: list[int] = []
+        rows: list[list[int]] = []
+        epoch = 0
+        while True:
+            epoch += 1
+            order = list(range(len(groups)))
+            if epoch >= 2 and STREAM_RESHUFFLE:
+                g = torch.Generator().manual_seed(1234 + epoch)
+                order = torch.randperm(len(groups), generator=g).tolist()
+            for gi in order:
+                path, rg_idx = groups[gi]
+                texts = _pq.ParquetFile(path).read_row_group(rg_idx).column("text").to_pylist()
+                for i in range(0, len(texts), 128):
+                    for toks in tokenizer.encode(texts[i:i + 128], prepend=bos, num_threads=4):
+                        stream.extend(toks)
+                    while len(stream) >= cap:
+                        rows.append(stream[:cap])
+                        del stream[:seq_len]
+                    while len(rows) >= batch_size:
+                        chunk = rows[:batch_size]
+                        del rows[:batch_size]
+                        t = torch.tensor(chunk, dtype=torch.long)
+                        xb.copy_(t[:, :-1].to(torch.int32))
+                        yb.copy_(t[:, 1:])
+                        yield xb, yb, {"epoch": epoch}
+
+    if PACK_MODE == "stream":
+        _raw_loader = _stream_loader(DEVICE_BATCH_SIZE, SEQ_LEN, "train", loader_dev)
+        print0(f"PACK_MODE=stream: eval-style stream-cut training rows (reshuffle epoch>=2: {STREAM_RESHUFFLE})")
+    else:
+        _raw_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE // PACK, SEQ_LEN * PACK, "train", loader_dev)
 
     def _packed():
         src = iter(_raw_loader)

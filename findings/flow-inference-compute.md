@@ -204,3 +204,97 @@ without the cross-op fusion the hand kernels win on; its BEAM autotuner searches
   NEURON_CC_FLAGS, now a graph-produced per-step input pack read by kernels). Common thread is unknown; the harness
   cannot catch it (causality is deterministic). Not pursued further: lever B's ceiling is ~0.0005 and even the working
   combo is only at parity. **Keep the vendor attention.** The hoist code stays default-off (ATTN_FWD=vendor).
+
+## DATA PIPELINE (2026-09-14) - measured on the real shards/tokenizer (local, scripts data_m123.py / data_m4.py)
+- **Corpus:** ~63M tokens/shard x 5 public shards = **~315M tokens**; the v40 gate consumed 446.7M tokens = **1.42 epochs**
+  (the gate log shows epoch 2 from ~step 1720). train.py cannot download more (requests/urllib are forbidden imports), so
+  every team has the same 315M tokens.
+- **Doc lengths:** mean 733, median 617, p90 1117, max 39k. Docs > 1025 tokens = 11.4% of docs but **38.1% of all tokens**
+  (docs > 2050 = 24.2% of tokens).
+- **The provided packer (prepare.make_dataloader, best-fit, row = 1025) never fits a doc > 1025:** long docs pile up in the
+  buffer (2500-row sim: 522 long docs = 1.55M tokens of residue vs 2.56M placed) until the buffer is all long docs, then
+  each is TRUNCATED to its first 1025 tokens and the rest discarded. Plus ~1 short-doc truncation per row discarding
+  6.9% of consumed tokens. Net: roughly a quarter of the corpus (the tails of long docs) is never trained on, and the
+  effective unique set is ~220-240M tokens -> the run is ~2 passes over the short docs and ~0 over long-doc tails.
+- **Eval rows are a different distribution:** make_eval_dataloader concatenates all docs and cuts every 1024 tokens ->
+  **99.9% of eval rows start mid-document** (no BOS at position 0); the BOS-less prefix averages 513 tokens, so **50.0% of
+  eval targets are predicted with no document start in context**, a situation the training rows (always BOS at pos 0)
+  never contain. Only 15.9% of eval targets are within 128 tokens after a BOS.
+- **Lever:** the organizer-sanctioned PACK trick (make_dataloader with seq_len = PACK*1024, reshape to 1024 rows; vehicle
+  knob PACK, never tested on the compiled line) fixes both at once: rows 2..PACK start mid-doc like eval, and docs up to
+  PACK*1024+1 fit, recovering most of the discarded long-doc tokens. Gates A_PACK8 / A_PACK4 queued first in queue_A2;
+  local fixed-step B13_d12_pack4 running. M4 (per-position eval loss of the depth-12 checkpoint) quantifies the BOS-less
+  penalty directly.
+- **M5, full-shard steady state (shard 1, 63.2M tokens), exact copy of the provided packer:**
+  | PACK | row capacity | corpus placed | truncation-discarded | never placed (long docs) | 1024-rows starting mid-doc | targets in BOS-less prefix |
+  |---|---|---|---|---|---|---|
+  | 1 (v40) | 1025 | **72.3%** | 18.1% | 9.6% | 0.0% | 0.0% |
+  | 4 | 4097 | 87.1% | 3.3% | 9.6% | 74.9% | 36.5% |
+  | 8 | 8193 | **92.1%** | 0.7% | 7.2% | 87.4% | 42.5% |
+  | eval | stream | - | - | - | 99.9% | 50.0% |
+  So v40 trains on ~228M unique tokens (~2 passes in 446.7M) with zero exposure to the eval's dominant condition; PACK=8
+  trains on ~290M unique tokens (+27%, ~1.5 passes) with 42.5% of targets in the eval-like BOS-less condition. Both
+  effects are in the same direction and cost no step time (the packer runs on the host; per-step token count unchanged).
+- **M4, per-position eval loss of the depth-12 checkpoint (B7_d12_base, 1.1888 bpb) on the full public val shard**
+  (61,888 rows, 99.9% start mid-doc, 63.4M targets, mean 3.304 nats):
+  | context length | after-BOS nll (n) | BOS-less prefix nll (n) | delta |
+  |---|---|---|---|
+  | [0,8) | 4.321 (0.68M) | 4.836 (0.49M) | **+0.515** |
+  | [8,32) | 3.711 (2.0M) | 3.903 (1.45M) | **+0.192** |
+  | [32,128) | 3.447 (7.3M) | 3.495 (5.3M) | +0.047 |
+  | [128,512) | 3.254 (16.7M) | 3.235 (15.0M) | -0.019 |
+  | [512,1024) | 2.974 (4.6M) | 3.126 (10.0M) | **+0.151** |
+  Excess nll of the BOS-less condition summed over buckets = 2.0M nats = **0.032 nats/token = ~1.0% of the loss (~0.010
+  bpb at our level)**. Decomposition: the first ~128 tokens carry ~0.78M nats (0.4%) = the pure "no document start in
+  context" effect (position 0 alone: 6.62 nats vs ~4.3 after a BOS - the model never saw a non-BOS token at position 0);
+  the [512,1024) bucket carries 1.5M nats (0.7%) = rows lying entirely inside LONG documents, i.e. the long-doc content
+  the v40 packer never trains on (M5: 9.6% never placed + 18% truncated). PACK=8 addresses both. Expected: -0.005..-0.010
+  if the mismatch is fully removed, at zero step cost. Gates A_PACK8 / A_PACK4 pending; local fixed-step B13 pending.
+- **Stream packer implemented** (vehicle `PACK_MODE=stream`, `STREAM_RESHUFFLE`): training rows built exactly like the eval
+  loader (one BOS-prepended stream, row = next 1025 tokens, advance 1024), rank-strided row groups, seeded row-group
+  permutation on epoch >= 2. Smoke on rank 0/8: 0 alignment violations, **99.8% mid-doc starts, 50.4% BOS-less targets**
+  (eval: 99.9% / 50.0%), 100% corpus coverage, 6.9M tok/s per rank (200x the box's need). Tiny CPU end-to-end run: trains,
+  causality passes, evals. Gate A_STREAM queued after A_PACK8 (queue_A3).
+- **A_PACK8 died at its FIRST `sidecar.prepare(x)`** (before any step) with the "scatter/gather (indirect memory copy via
+  vector DGE) out-of-bound access" error, deterministically; A_STREAM (my stream loader, same mid-doc rows) passed the same
+  point and went on to compile. M6 refutes the plan-length theory: every packing mode (PACK=1 included) produces ~78k-slot
+  scatter plans (max repetition ~530 in a 16k-token micro-batch), so the chunked >32768 path is ALWAYS used and is not
+  what distinguishes PACK=8. Cause unknown (something in the provided loader's PACK>1 rows as consumed by the eager
+  sidecar gather; the old ledger also has PACK>1 dying at start on an eager line). PACK=8/4 superseded by stream mode.
+- **B13 (local, depth 12, 500 fixed steps): PACK=4 = 1.188717 vs 1.188775 base -> a wash.** Training on eval-like rows did
+  NOT reduce eval loss at fixed steps, so most of M4's BOS-less excess is inherent to the eval rows (first tokens of a
+  mid-doc fragment are unpredictable with or without a BOS; long-doc content is harder), not a trainable train/eval
+  mismatch. Revised expectation for lever 0: the coverage gain (72% -> 100% of the corpus) only pays where the v40 run
+  repeats data (epoch 2 starts at ~step 1720 of ~3400) -> the A_STREAM full gate is the decisive number; local
+  fixed-step screens cannot see it.
+- **Coverage confirmed on the box:** A_STREAM entered its second data pass at step 2410 vs A_REF at step 1720 (ratio 1.40 =
+  the predicted 1/0.72): the stream loader delivers 40% more unique tokens per pass at the same 0.52 s/step. The 1800 s run
+  becomes ~1.4 passes instead of ~2.0. Final score pending.
+
+## DATA LEVER VERDICT (2026-09-14 19:31 UTC): A_STREAM 0.987395 vs A_REF 0.985741 = +0.0017. CLOSED.
+Full-length gate of the eval-style stream packer (100% coverage, 99.8% mid-doc rows, epoch-2 reshuffle, same 0.52 s/step,
+40% more unique tokens per pass - confirmed by the epoch-2 step 2410 vs 1720) LOSES slightly. Combined with B13 (eval-like
+rows are a wash at fixed steps): (1) the measured BOS-less eval excess is inherent to the eval rows, not a trainable
+mismatch; (2) ~2 passes over 72% of the corpus is not worse than ~1.4 passes over 100% (consistent with data-constrained
+scaling results: <= 4 epochs of repetition is nearly free); (3) best-fit full-document rows are a slightly better training
+signal per token than arbitrary stream cuts. PACK=8/4 via the provided loader crash the eager sidecar at the first batch
+(cause unknown; superseded). Keep the v40 loader. The stream packer stays in the vehicle, default-off (PACK_MODE=bestfit).
+
+## CORRECTION (2026-09-14 20:05 UTC): A_PACK4 = 0.981426 vs A_REF 0.985741 = -0.0043. THE DATA LEVER IS REAL.
+The organizer-sanctioned PACK trick at 4 (best-fit rows of 4097 tokens reshaped to 4 x 1024; 87% corpus coverage, 75% of
+rows start mid-doc; same 0.52 s/step) beats the reference by 0.0043 (band ~0.001) and the v40 gate by 0.0037 - the largest
+single gain since v39 -> v40, from one env var. My stream packer (100% coverage, ALL rows arbitrary cuts) lost by 0.0017,
+so the mechanism is not coverage or eval-likeness per se: **best-fit keeps short docs whole and places long docs (<= 4k)
+whole at the head of a group** (BOS at row start, continued as BOS-less sub-rows) - i.e. long-document content gets trained
+in full without fragmenting the short documents that stream cuts destroy. PACK=8 crashes the eager sidecar at batch 1
+(cause unknown). Repeat gate A_PACK4b and PACK=2 queued first (queue_A5); if confirmed -> clean v42 = v40 + PACK=4.
+The "lever 0 closed" verdict above is retracted.
+
+## v42 = v40 + PACK=4: gated 0.981197 (T59, causality passed) -> submit/train.py (2026-09-14 21:53 UTC)
+Three independent full gates of PACK=4: 0.981426 (vehicle), 0.981073 (vehicle repeat), 0.981197 (clean file) vs the
+same-day reference 0.985741 and the v40 gate 0.985161: **-0.0040 .. -0.0047**, 4x the 1800 s band, zero step cost. Portal
+expectation ~0.9875 (portal = local + ~0.0065; v40 scored 0.9915 from 0.9852). Mechanism (measured): the provided 1025-row
+packer never fits a document longer than a row (28% of the corpus never trained on, 38% of tokens live in such docs);
+4097-token best-fit rows place documents up to 4k whole (long-document content trained in full, short documents kept
+whole, 75% of sub-rows start mid-document like the eval rows). Stream-cut rows (100% coverage but every doc fragmented)
+LOSE +0.0017, so whole-document rows are the ingredient, not coverage per se. PACK=8 crashes the eager sidecar at batch 1.
