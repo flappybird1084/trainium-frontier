@@ -196,8 +196,24 @@ GATHER_BF16 = _ENV("NEURON_COMPETITION_R1_GATHER_BF16", "0") != "0"      # OPT_S
 ADAM_ALT = _ENV("NEURON_COMPETITION_R1_ADAM_ALT", "0") != "0"            # AdamW groups step on odd steps only (record #39: -1.2% wall-clock)
 XSA = _ENV("NEURON_COMPETITION_R1_XSA", "0") != "0"                  # gated exclusive self-attention (record #82): y -= tanh(a[l,h]) * (y.v / v.v) * v, a zero-init
 FLOW_STEPS = int(_ENV("NEURON_COMPETITION_R1_FLOW_STEPS", "0"))          # iterative refinement of the attention output: k Euler steps of a learned time-conditioned velocity field (0 = off; inference uses max steps, training samples 1..k)
-FLOW_SITE = _ENV("NEURON_COMPETITION_R1_FLOW_SITE", "attn")               # where the iterative refinement runs: attn | mlp | block | prehead
+FLOW_SITE = _ENV("NEURON_COMPETITION_R1_FLOW_SITE", "attn")               # where the iterative refinement runs: attn | mlp | block | prehead | logit | latent | stack | mhattn | mlpflow (comma-separate to combine)
+_FLOW_SITES = set(s.strip() for s in FLOW_SITE.split(",") if s.strip())    # multi-site: FLOW_SITE="mhattn,mlpflow,prehead" runs all three
 FLOW_LR = float(_ENV("NEURON_COMPETITION_R1_FLOW_LR", "0.01"))            # dedicated LR for the flow velocity field (the scalar LR diverged it at step 4, like DeltaNet)
+FLOW_MODE = _ENV("NEURON_COMPETITION_R1_FLOW_MODE", "refine")             # refine (deterministic velocity, LM-loss only) | rf (rectified-flow aux) | denoise (noise-injection denoising aux) | draft | bigram | consistency
+FLOW_RANK = int(_ENV("NEURON_COMPETITION_R1_FLOW_RANK", "256"))           # bottleneck rank for logit-space flow (V x r + r x V instead of V x V)
+FLOW_AUX = float(_ENV("NEURON_COMPETITION_R1_FLOW_AUX", "0.0"))           # weight of the auxiliary flow-matching / denoising loss (0 = pure LM loss on the refined output)
+FLOW_NOISE = float(_ENV("NEURON_COMPETITION_R1_FLOW_NOISE", "0.0"))       # denoising modes: std of Gaussian noise injected at the flow start (train); eval integrates from the clean start
+FLOW_BOOST = float(_ENV("NEURON_COMPETITION_R1_FLOW_BOOST", "5.0"))       # rectified-flow target: logit boost added to the true token to define the clean endpoint l1
+FLOW_STARTS = int(_ENV("NEURON_COMPETITION_R1_FLOW_STARTS", "1"))         # multi-start averaging at eval: integrate this many trajectories and average (1 = single start)
+FLOW_ADAPT = float(_ENV("NEURON_COMPETITION_R1_FLOW_ADAPT", "0.0"))       # >0: eval spends max steps only where draft entropy exceeds this fraction of max; unused in training
+FLOW_TRAIN_HOPS = int(_ENV("NEURON_COMPETITION_R1_FLOW_TRAIN_HOPS", "1")) # Trn2 compiled path: FIXED extra attention hops per block in training (one graph, no .item()); eval uses FLOW_STEPS (max)
+FLOW_HOP_EVERY = int(_ENV("NEURON_COMPETITION_R1_FLOW_HOP_EVERY", "1"))   # multi-hop only on blocks with layer_idx % N == 0 (2 = every other block: halves hop overhead)
+FLOW_TRAIN_FIXED = _ENV("NEURON_COMPETITION_R1_FLOW_TRAIN_FIXED", "0") != "0"   # eager path: train with exactly FLOW_TRAIN_HOPS hops (like the Trn2 op path) instead of sampling 1..FLOW_STEPS
+FLOW_HOP_CHECK = _ENV("NEURON_COMPETITION_R1_FLOW_HOP_CHECK", "0") != "0"       # Trn2 diagnostic (eager, COMPILE=0): print fused hop op vs eager hop max|diff| once the weights have trained
+_HOP_CHECKS = [606]                                                             # countdown of hop calls: skip 600 (~100 steps at 6 hops/step), then check 6 (out-proj is zero-init at step 0)
+FLOW_EVAL_HOPS = int(_ENV("NEURON_COMPETITION_R1_FLOW_EVAL_HOPS", "-1"))         # Trn2 op path: hop count at EVAL (-1 = FLOW_STEPS; 0 = hop skipped at eval -> "weights fine?" discriminator)
+FLOW_HOP_VE = _ENV("NEURON_COMPETITION_R1_FLOW_HOP_VE", "1") != "0"              # Trn2 fused hop: include the value-embedding term (and its grad) in the hop
+FLOW_HOP_WGRAD = _ENV("NEURON_COMPETITION_R1_FLOW_HOP_WGRAD", "1") != "0"        # Trn2 fused hop: return weight grads from the hop (0 = detached weights)
 DELTANET_LAYERS = tuple(int(i) for i in _ENV("NEURON_COMPETITION_R1_DELTANET", "").split(",") if i.strip())   # layers whose attention is replaced by a gated delta rule mixer (torch ops, chunked)
 DELTANET_CHUNK = int(_ENV("NEURON_COMPETITION_R1_DELTANET_CHUNK", "64"))
 GDN_LR = float(_ENV("NEURON_COMPETITION_R1_GDN_LR", "0.01"))            # GatedDeltaNet param LR (GPU line used 0.01; the boosted scalar LR destabilized the gates by step 5)
@@ -484,6 +500,17 @@ class StackedLinear(nn.Module):
 
 
 STACK_GRAD_MODE = "function"   # eager: accumulate weight grads straight into stack.grad[idx]; compile: "view"
+
+
+def _hop_linear(w, x):
+    # Multi-hop attention projection on an explicit per-layer weight tensor `w` (bf16 slice passed in by the caller), DETACHED:
+    # no weight-grad from the hop (the weights are shared with the main attention read, which trains them; the hop trains the
+    # activations only). Passing the tensor in keeps every dict/cache lookup and stack indexing OUT of the traced region:
+    # under torch.compile a plain `stack[idx]` use allocates a full (n, out, in) zero gradient per use (see _StackSliceLinear).
+    w = w.detach()
+    if x.dtype != w.dtype:
+        x = x.to(w.dtype)
+    return x @ w if WEIGHT_T else F.linear(x, w, None)
 
 
 class _StackSliceLinear(torch.autograd.Function):
@@ -2499,7 +2526,7 @@ if NKI_AVAILABLE:
                 nisa.dma_copy(dst=out[t0 + tb * _NKI_P:t0 + (tb + 1) * _NKI_P, :], src=o)
         return out, x1_out, pre_out, y2_out
 
-    _HVC = 512   # vocab chunk width of the fused head kernels (2026-09-08, nki_head.py)
+    _HVC = int(os.environ.get("NEURON_COMPETITION_R1_HVC", "512"))   # vocab chunk width of the fused head kernels (2026-09-08, nki_head.py); tunable: 256|512 (1024 > _FMAX matmul free limit)
 
     @nki.jit
     def head_fwd(x_in: nl.ndarray, wT: nl.ndarray, tgt: nl.ndarray, scal: nl.ndarray, eps: float = 0.0078125, fq: int = 0):
@@ -3346,17 +3373,24 @@ class CausalSelfAttention(nn.Module):
         return yf.to(y.dtype)
 
     def forward(self, x, ve, cos, sin, block_mask=None, dense_mask=None, k_sink=None, v_sink=None,
-                sink=None, bounds=None, v0=None, vr_lambda=None, doc_dims=None, rope_tabs=None, doc_start=None, phase=None):
+                sink=None, bounds=None, v0=None, vr_lambda=None, doc_dims=None, rope_tabs=None, doc_start=None, phase=None,
+                hop=False, hop_w=None):
+        # hop=True: multi-hop read on explicit detached weights hop_w = (Wq, Wk, Wv, Wo) (or (Wqkv, Wo) when merged)
         b, t, c = x.shape
         if self.merged:
-            qkv = self.c_qkv(x)
+            qkv = _hop_linear(hop_w[0], x) if hop else self.c_qkv(x)
             nq = self.n_head * self.qk_dim
             q, k, vv = qkv[..., :nq], qkv[..., nq:2 * nq], qkv[..., 2 * nq:]
         else:
-            q, k, vv = self.c_q(x), self.c_k(x), self.c_v(x)
+            if hop:
+                q, k, vv = _hop_linear(hop_w[0], x), _hop_linear(hop_w[1], x), _hop_linear(hop_w[2], x)
+            else:
+                q, k, vv = self.c_q(x), self.c_k(x), self.c_v(x)
         q = q.view(b, t, self.n_head, self.qk_dim)
         k = k.view(b, t, self.n_head, self.qk_dim)
         v = (vv + ve).view(b, t, self.n_head, self.head_dim)
+        if hop:
+            v = v.to(vv.dtype)   # ve is fp32-scaled -> the sum promotes; the vendor attention kernels reject mixed q/k/v dtypes (NCC_INKI016)
         if vr_lambda is not None:                    # value residual: v += lambda * (v0 - v), v0 = layer-0 value
             if v0 is None:
                 v0 = v
@@ -3431,7 +3465,7 @@ class CausalSelfAttention(nn.Module):
                 p = F.softmax(torch.cat([scores, s_col], dim=-1), dim=-1)[..., :t]
                 y = (p @ v.float()).to(v.dtype)
             y = y.transpose(1, 2).contiguous().view(b, t, c)
-            return self.c_proj(y), v0
+            return (_hop_linear(hop_w[-1], y) if hop else self.c_proj(y)), v0
         # registers: NUM_SINKS always-visible kv slots (learned k, learned v, zero-init)
         sk = k_sink.permute(1, 0, 2).unsqueeze(0).expand(b, -1, -1, -1).to(k.dtype)
         if doc_dims is not None:
@@ -3454,7 +3488,7 @@ class CausalSelfAttention(nn.Module):
             scores = scores.masked_fill(~dense_mask, float("-inf"))
             y = (F.softmax(scores, dim=-1) @ v.float()).to(v.dtype)
         y = y.transpose(1, 2).contiguous().view(b, t, c)
-        return self.c_proj(y), v0
+        return (_hop_linear(hop_w[-1], y) if hop else self.c_proj(y)), v0
 
 
 _NKI_MLP = None
@@ -3655,9 +3689,14 @@ def build_layer_ops(n_head: int):
         if ours_fwd is not None:   # own kernel: sink per query row, doc end per key row, key index column; lse -> neg_max = -lse, recip = 1
             B = b * h
             sk_rows = sink.float().view(1, h).expand(b, h).reshape(B, 1, 1).expand(B, t, 1).contiguous()
-            end_rows = end.float().unsqueeze(1).expand(b, h, t).reshape(B, t, 1).contiguous()
-            kidx = torch.arange(t, dtype=torch.float32, device=start.device).view(t, 1).contiguous()
+            if start.dim() == 4:   # hoisted per-step rows from GPT.forward: [doc end, min(end,q+1), doc start, key index] (4, B, t, 1) -> free views
+                end_rows = end[0]; kidx = end[3, 0]
+            else:
+                end_rows = end.float().unsqueeze(1).expand(b, h, t).reshape(B, t, 1).contiguous()
+                kidx = torch.arange(t, dtype=torch.float32, device=start.device).view(t, 1).contiguous()
             out, lse = ours_fwd[grid](qf, kf, vf, sk_rows, end_rows, kidx)
+            if ours_bwd is not None:   # both ours: the raw lse rides in the neg_max slot (no -lse / ones_like / log round trip per layer)
+                return out.reshape(b, h, t, d), lse, torch.zeros(1, device=lse.device, dtype=torch.float32)
             return out.reshape(b, h, t, d), -lse, torch.ones_like(lse)
         sink_rows = sink.float().view(1, h).expand(b, h).reshape(b * h, 1).contiguous()
         bmin = start.unsqueeze(1).expand(b, h, t).reshape(b * h, t, 1).contiguous()
@@ -3670,11 +3709,17 @@ def build_layer_ops(n_head: int):
         b, h, t, d = q4.shape
         if ours_bwd is not None:   # own kernel: natural (B, T, HD) layouts, per-row lse / sink / bounds, no transposes
             B = b * h
-            lse_rows = (-(neg_max.float() + torch.log(recip.float()))).reshape(B, t, 1).contiguous()
+            if ours_fwd is not None:   # both ours: the neg_max slot carries the raw lse
+                lse_rows = neg_max.reshape(B, t, 1).contiguous()
+            else:
+                lse_rows = (-(neg_max.float() + torch.log(recip.float()))).reshape(B, t, 1).contiguous()
             sk_rows = sink.float().view(1, h).expand(b, h).reshape(B, 1, 1).expand(B, t, 1).contiguous()
-            q1 = torch.arange(1, t + 1, dtype=torch.float32, device=start.device).view(1, t)
-            bmin = start.float().unsqueeze(1).expand(b, h, t).reshape(B, t, 1).contiguous()
-            bmax = torch.minimum(end.float(), q1).unsqueeze(1).expand(b, h, t).reshape(B, t, 1).contiguous()   # min(doc end, q + 1)
+            if start.dim() == 4:   # hoisted per-step rows: [doc end, min(end,q+1), doc start, key index]
+                bmin = start[2]; bmax = start[1]
+            else:
+                q1 = torch.arange(1, t + 1, dtype=torch.float32, device=start.device).view(1, t)
+                bmin = start.float().unsqueeze(1).expand(b, h, t).reshape(B, t, 1).contiguous()
+                bmax = torch.minimum(end.float(), q1).unsqueeze(1).expand(b, h, t).reshape(B, t, 1).contiguous()   # min(doc end, q + 1)
             dq, dk, dv, dsr = ours_bwd[grid](q4.reshape(B, t, d).contiguous(), k4.reshape(B, t, d).contiguous(), v4.reshape(B, t, d).contiguous(),
                                             out.reshape(B, t, d).contiguous(), dy4.to(q4.dtype).reshape(B, t, d).contiguous(), lse_rows, sk_rows, bmin, bmax)
             return dq.view(b, h, t, d), dk.view(b, h, t, d), dv.view(b, h, t, d), dsr.float().view(b, h, t).sum(dim=(0, 2))
@@ -3688,7 +3733,7 @@ def build_layer_ops(n_head: int):
         return dq, dk, dv, res[3].float().sum(dim=0)
 
     def _fwd_impl(x2, x02, ve2, cos_full, sin_full, cos2d, sin2d, scal, sink, start, end, dstart, wq, wk, wv, wo, w1, w2, xsa=None):
-        NH = _LAYER_NH; T, D = x2.shape; HD = D // NH; b = start.shape[0]; t = T // b
+        NH = _LAYER_NH; T, D = x2.shape; HD = D // NH; b = (start.shape[1] // NH) if start.dim() == 4 else start.shape[0]; t = T // b   # (4, B, t, 1) = hoisted per-step rows (ATTN_FWD=ours)
         if GLUE_PROF: _t0 = _gt(x2.device)
         scale = ATTN_SCALE if ATTN_SCALE > 0 else 1.0 / math.sqrt(HD)
         if pre_kh is not None:   # attention-layout kernels: q/k/v arrive as (b*NH, t, HD) with q pre-scaled (no permute copies)
@@ -3741,7 +3786,7 @@ def build_layer_ops(n_head: int):
 
     def _bwd_impl(dout2, x2, x02, ve2, xm, rq, rk, q4, k4, v4, out, neg_max, recip, y2, x1, preT, cos2d, sin2d, sink, start, end,
                   dstart, wq, wk, wv, wo, w1, w2, xsa=None):
-        NH = _LAYER_NH; T, D = x2.shape; HD = D // NH; b = start.shape[0]; t = T // b
+        NH = _LAYER_NH; T, D = x2.shape; HD = D // NH; b = (start.shape[1] // NH) if start.dim() == 4 else start.shape[0]; t = T // b   # (4, B, t, 1) = hoisted per-step rows (ATTN_FWD=ours)
         scale = ATTN_SCALE if ATTN_SCALE > 0 else 1.0 / math.sqrt(HD)
         if GLUE_PROF: _t0 = _gt(x2.device)
         d2 = dout2.to(bf).contiguous()
@@ -3898,6 +3943,78 @@ def build_layer_ops(n_head: int):
             return _finish_backward(dxm, gv2, dWq, dWk, dWv, dWo, dW1, dW2, dsink, x2, x02, ve2, scal, sink, wq, wk, wv, wo, w1, w2) + (dxsa.to(xsa.dtype),)
 
     torch.library.register_autograd("tf_nki::layer_fwd", backward, setup_context=setup_context)
+
+    if "mhattn" in _FLOW_SITES and pre_kh is not None and pre_bwd_k is not None:
+        # Multi-hop attention (#14) as ONE custom op = the attention half of the fused layer (pre-attn kernel -> key offset
+        # -> vendor attention -> out-proj matmul), weights DETACHED (dgrad only). As compiled eager glue a hop cost ~170 ms
+        # (S_FLOW_HOPE2_V4: 1.57 vs 0.57 s/step); as kernels it should cost a fraction of a fused layer (~44 ms).
+        # scal = [1, 0, 0, 0]: the pre kernel norms x2 itself (pass RAW xo, not norm(xo)); x0/ve terms zeroed.
+        @nki_op("tf_nki::hop_fwd", mutates_args={})
+        def hop_fwd(x2: torch.Tensor, ve2: torch.Tensor, cos_full: torch.Tensor, sin_full: torch.Tensor, cos2d: torch.Tensor, sin2d: torch.Tensor,
+                    scal: torch.Tensor, sink: torch.Tensor, start: torch.Tensor, end: torch.Tensor, dstart: torch.Tensor,
+                    wq: torch.Tensor, wk: torch.Tensor, wv: torch.Tensor, wo: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            NH = _LAYER_NH; T, D = x2.shape; HD = D // NH; b = (start.shape[1] // NH) if start.dim() == 4 else start.shape[0]; t = T // b   # (4, B, t, 1) = hoisted per-step rows (ATTN_FWD=ours)
+            scale = ATTN_SCALE if ATTN_SCALE > 0 else 1.0 / math.sqrt(HD)
+            # scal = [1, 0, ve_lambda, 0]: x0 term off, value-embedding term ON (matches the eager hop: v = Wv norm(x) + ve)
+            qh, kh, vh, xm, rq, rk = pre_kh[grid](x2, x2, ve2, wq, wk, wv, cos_full, sin_full, scal, n_head=NH, eps=eps,
+                                                 t_len=t, q_scale=scale)
+            q4 = qh.view(b, NH, t, HD)
+            k4 = kh.view(b, NH, t, HD)
+            if KEY_OFFSET:
+                HQ = HD // 4
+                prev = torch.cat([torch.zeros_like(k4[:, :, :1, HQ:2 * HQ]), k4[:, :, :-1, HQ:2 * HQ]], dim=2)
+                prev = prev * (1.0 - dstart).to(bf).view(b, 1, t, 1)
+                k4 = torch.cat([k4[..., :HQ], prev, k4[..., 2 * HQ:]], dim=-1).contiguous()
+            v4 = vh.view(b, NH, t, HD)
+            out, neg_max, recip = attn_fwd(q4, k4, v4, sink, start, end)
+            y2 = out.permute(0, 2, 1, 3).reshape(T, D).contiguous()
+            o = F.linear(y2, wo)                                  # out-projection only: no MLP in a hop
+            return o, xm, rq, rk, q4, k4, v4, out, neg_max, recip, y2
+
+        @nki_op("tf_nki::hop_bwd", mutates_args={})
+        def hop_bwd(dout2: torch.Tensor, x2: torch.Tensor, xm: torch.Tensor, rq: torch.Tensor, rk: torch.Tensor, q4: torch.Tensor,
+                    k4: torch.Tensor, v4: torch.Tensor, out: torch.Tensor, neg_max: torch.Tensor, recip: torch.Tensor, y2: torch.Tensor,
+                    cos2d: torch.Tensor, sin2d: torch.Tensor, sink: torch.Tensor, start: torch.Tensor, end: torch.Tensor,
+                    dstart: torch.Tensor, wq: torch.Tensor, wk: torch.Tensor, wv: torch.Tensor, wo: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            NH = _LAYER_NH; T, D = x2.shape; HD = D // NH; b = (start.shape[1] // NH) if start.dim() == 4 else start.shape[0]; t = T // b   # (4, B, t, 1) = hoisted per-step rows (ATTN_FWD=ours)
+            scale = ATTN_SCALE if ATTN_SCALE > 0 else 1.0 / math.sqrt(HD)
+            d2 = dout2.to(bf).contiguous()
+            dWo = d2.t() @ y2                                     # out-proj weight grad (hop weights now TRAINED, like the eager winner)
+            dy2 = F.linear(d2, wo.t())
+            dy4 = dy2.view(b, t, NH, HD).permute(0, 2, 1, 3).contiguous()
+            dq4, dk4, dv4, _dsink = attn_bwd(q4, k4, v4, out, dy4, neg_max, recip, sink, start, end)
+            B = b * NH
+            cos_full = cos2d.repeat(b, 1).contiguous(); sin_full = sin2d.repeat(b, 1).contiguous()
+            HQ = HD // 4
+            gsh = dk4[:, :, 1:, HQ:2 * HQ] * (1.0 - dstart[:, 1:].to(dk4.dtype)).view(b, 1, t - 1, 1)
+            dksh = torch.cat([gsh, torch.zeros_like(gsh[:, :, :1])], dim=2).reshape(B, t, HQ).contiguous()
+            zero = torch.zeros_like(d2)                           # no pass-through inside the op: the caller's residual add supplies it
+            _a = [dq4.reshape(B, t, HD).contiguous(), dk4.reshape(B, t, HD).contiguous(), dv4.reshape(B, t, HD).contiguous(),
+                  rq.contiguous(), rk.contiguous(), xm.contiguous(), zero, cos_full, sin_full, dksh]
+            dxm, gv2, dWq, dWk, dWv = pre_bwd_k[grid](*_a, wq, wk, wv, n_head=NH, eps=eps, scale=scale, hq=HQ)
+            return dxm, gv2, dWq, dWk, dWv, dWo
+
+        def hop_setup(ctx, inputs, output):
+            x2, ve2, cos_full, sin_full, cos2d, sin2d, scal, sink, start, end, dstart, wq, wk, wv, wo = inputs
+            o, xm, rq, rk, q4, k4, v4, out, neg_max, recip, y2 = output
+            ctx.save_for_backward(x2, ve2, cos2d, sin2d, scal, sink, start, end, dstart, wq, wk, wv, wo,
+                                  xm, rq, rk, q4, k4, v4, out, neg_max, recip, y2)
+
+        def hop_backward(ctx, dout2, *_unused):
+            (x2, ve2, cos2d, sin2d, scal, sink, start, end, dstart, wq, wk, wv, wo,
+             xm, rq, rk, q4, k4, v4, out, neg_max, recip, y2) = ctx.saved_tensors
+            dxm, gv2, dWq, dWk, dWv, dWo = torch.ops.tf_nki.hop_bwd(dout2, x2, xm, rq, rk, q4, k4, v4, out, neg_max, recip, y2,
+                                                                     cos2d, sin2d, sink, start, end, dstart, wq, wk, wv, wo)
+            vel = scal[0:1, 2:3]
+            dve2 = (gv2.float() * vel).to(ve2.dtype)              # value-embedding term grad (ve_lambda scaling)
+            # grads aligned to hop_fwd inputs: x2, ve2, [cos_full, sin_full, cos2d, sin2d, scal, sink, start, end, dstart], wq, wk, wv, wo
+            # weights TRAINED through the hop: the dW's flow into the per-step bf16 cache copies like the fused layer's do.
+            dws = (dWq.to(wq.dtype), dWk.to(wk.dtype), dWv.to(wv.dtype), dWo.to(wo.dtype)) if FLOW_HOP_WGRAD else (None, None, None, None)
+            return (dxm.to(x2.dtype), (dve2 if FLOW_HOP_VE else None)) + (None,) * 9 + dws
+
+        torch.library.register_autograd("tf_nki::hop_fwd", hop_backward, setup_context=hop_setup)
+        print0("FLOW mhattn: tf_nki::hop_fwd/hop_bwd built (multi-hop attention as a fused custom op)")
+
     _LAYER_OPS = (torch.ops.tf_nki.layer_fwd, torch.ops.tf_nki.layer_bwd)
     print0("LAYER=op: tf_nki::layer_fwd/layer_bwd built (the Block op branch fires when sink/bounds/rope tables are present)")
     return _LAYER_OPS
@@ -4141,7 +4258,36 @@ class Block(nn.Module):
             xsa_t = (xsa.float().contiguous() if xsa is not None else torch.zeros(sink.numel(), device=x.device, dtype=torch.float32))
             outs = torch.ops.tf_nki.layer_fwd(x2, x02, ve2, cos_full, sin_full, cos2d, sin2d, scal, sink, bounds[0], bounds[1],
                                               dstart, ws[0], ws[1], ws[2], ws[3], ws[4], ws[5], xsa_t)
-            return outs[0].view(b, t, D).to(x.dtype), v0
+            xo = outs[0].view(b, t, D).to(x.dtype)
+            if FLOW_STEPS > 0 and "mhattn" in _FLOW_SITES and (getattr(self, "layer_idx", 0) % FLOW_HOP_EVERY == 0):
+                # #14 multi-hop attention on Trn2: extra weight-tied attention reads (query rebuilt from the updated x) as
+                # compiled glue AFTER the fused layer op (vendor attention_cte/attention_bwd via nki_doc_attention, autograd-capable).
+                # Placement deviates from the eager path (there: between attention and MLP; here: after the whole layer).
+                # Fixed hop counts -> one train graph + one eval graph, no .item() graph breaks. Eval uses max (FLOW_STEPS).
+                P = (FLOW_EVAL_HOPS if FLOW_EVAL_HOPS >= 0 else FLOW_STEPS) if not self.training else FLOW_TRAIN_HOPS
+                hop_scal = torch.stack([torch.ones((), device=x.device), torch.zeros((), device=x.device),
+                                        (ve_lambda.reshape(()) if FLOW_HOP_VE else torch.zeros((), device=x.device)),
+                                        torch.zeros((), device=x.device)]).float().view(1, 4).expand(128, 4).contiguous()
+                for _ in range(P):
+                    # fused custom op (tf_nki::hop_fwd): pre-attn kernel -> vendor attention -> out-proj; weights + ve term trained
+                    # (faithful to the eager winner). Pass RAW xo (the kernel norms it); residual add + 1/P scaling stay in torch.
+                    xo2 = xo.reshape(T, D).to(bf16).contiguous()
+                    ho = torch.ops.tf_nki.hop_fwd(xo2, ve2, cos_full, sin_full, cos2d, sin2d, hop_scal, sink, bounds[0], bounds[1],
+                                                  dstart, ws[0], ws[1], ws[2], ws[3])[0]
+                    if FLOW_HOP_CHECK and _HOP_CHECKS[0] > 0 and not torch.compiler.is_compiling():
+                        _HOP_CHECKS[0] -= 1
+                    if FLOW_HOP_CHECK and 0 < _HOP_CHECKS[0] <= 6 and not torch.compiler.is_compiling():
+                        # on-device diagnostic after ~100 trained steps: the fused hop op vs the eager hop (the local winner) on identical inputs
+                        with torch.no_grad():
+                            ah_ref, _ = self.attn(norm(xo), ve_lambda * ve, cos, sin, block_mask, dense_mask, k_sink, v_sink, sink,
+                                                  bounds, v0, vr_lambda, doc_dims, rope_tabs, doc_start=doc_start, phase=phase,
+                                                  hop=True, hop_w=(ws[0], ws[1], ws[2], ws[3]))
+                            d = (ho.view(b, t, D).float() - ah_ref.float()).abs()
+                            print(f"[HOP_CHECK layer {getattr(self, 'layer_idx', -1)}] op vs eager: max|diff|={d.max().item():.4e} "
+                                  f"mean|diff|={d.mean().item():.4e} ref max|.|={ah_ref.float().abs().max().item():.4e} "
+                                  f"ref mean|.|={ah_ref.float().abs().mean().item():.4e}", flush=True)
+                    xo = xo + ho.view(b, t, D).to(xo.dtype) / P
+            return xo, v0
         if (LAYER_IMPL == "chain" and x.device.type == "neuron" and not torch.compiler.is_compiling() and sink is not None
                 and bounds is not None and rope_tabs is not None and not skip_mlp and vr_lambda is None and doc_dims is None):
             b, t, _c = x.shape
@@ -4161,16 +4307,28 @@ class Block(nn.Module):
         x = resid_lambda * x + x0_lambda * x0
         a, v0 = self.attn(norm(x), ve_lambda * ve, cos, sin, block_mask, dense_mask, k_sink, v_sink, sink, bounds, v0, vr_lambda,
                           doc_dims, rope_tabs, doc_start=doc_start, phase=phase)
-        if FLOW_STEPS > 0 and FLOW_SITE == "attn":   # refine the attention contribution
+        if FLOW_STEPS > 0 and "attn" in _FLOW_SITES:   # refine the attention contribution
             a = self.attn._flow_refine(a)
         x = x + a
+        if FLOW_STEPS > 0 and "mhattn" in _FLOW_SITES and (getattr(self, "layer_idx", 0) % FLOW_HOP_EVERY == 0):   # #14 multi-hop: extra weight-tied attention reads, query rebuilt from the updated x
+            P = FLOW_STEPS if not self.training else (FLOW_TRAIN_HOPS if FLOW_TRAIN_FIXED else int(torch.randint(1, FLOW_STEPS + 1, (1,)).item()))
+            for _ in range(P):
+                hw = tuple(l._stack[l.idx].to(x.dtype) for l in (self.attn.c_q, self.attn.c_k, self.attn.c_v, self.attn.c_proj))
+                ah, _vh = self.attn(norm(x), ve_lambda * ve, cos, sin, block_mask, dense_mask, k_sink, v_sink, sink, bounds, v0, vr_lambda,
+                                    doc_dims, rope_tabs, doc_start=doc_start, phase=phase, hop=True, hop_w=hw)
+                x = x + ah / P
         if skip_mlp:
             return x, v0
         mout = self._mlp_normed(x) if CKPT != "mlp" else __import__("torch").utils.checkpoint.checkpoint(self._mlp_normed, x, use_reentrant=False)
-        if FLOW_STEPS > 0 and FLOW_SITE == "mlp":    # refine the MLP contribution
+        if FLOW_STEPS > 0 and "mlp" in _FLOW_SITES:    # refine the MLP contribution
             mout = self.attn._flow_refine(mout)
         x = x + mout
-        if FLOW_STEPS > 0 and FLOW_SITE == "block":  # refine the whole block output (between residual connections)
+        if FLOW_STEPS > 0 and "mlpflow" in _FLOW_SITES:   # #19 MLP-as-flow: extra weight-tied MLP integration steps, scaled by 1/P
+            P = FLOW_STEPS if not self.training else int(torch.randint(1, FLOW_STEPS + 1, (1,)).item())
+            for _ in range(P):
+                step = torch.utils.checkpoint.checkpoint(self._mlp_normed, x, use_reentrant=False) if self.training else self._mlp_normed(x)
+                x = x + step / P
+        if FLOW_STEPS > 0 and "block" in _FLOW_SITES:  # refine the whole block output (between residual connections)
             x = self.attn._flow_refine(x)
         return x, v0
 
@@ -4194,10 +4352,27 @@ class GPT(nn.Module):
             self.transformer["bte2"] = nn.Embedding(BIGRAM_SIZE, config.n_embd // 2)   # second half-width table, own hash
         registry = StackRegistry()
         self.transformer["h"] = nn.ModuleList([Block(config, registry) for _ in range(config.n_layer)])
-        if FLOW_STEPS > 0 and FLOW_SITE == "prehead":   # one refinement of the final representation before the LM head
+        for _li, _blk in enumerate(self.transformer["h"]):
+            _blk.layer_idx = _li   # for FLOW_HOP_EVERY gating of multi-hop attention
+        if FLOW_STEPS > 0 and "prehead" in _FLOW_SITES:   # one refinement of the final representation before the LM head
             C = config.n_embd
             self.flow_head_w1 = nn.Linear(C, C); self.flow_head_t = nn.Linear(1, C, bias=False); self.flow_head_w2 = nn.Linear(C, C, bias=False)
             with torch.no_grad(): self.flow_head_w2.weight.zero_()
+        if FLOW_STEPS > 0 and "logit" in _FLOW_SITES:   # output-side: refine the logit vector itself (low-rank velocity field, conditioned on the hidden)
+            C = config.n_embd; V = config.vocab_size; r = FLOW_RANK
+            self.flow_lg_B = nn.Linear(V, r)              # read the current logit -> bottleneck
+            self.flow_lg_H = nn.Linear(C, r, bias=False)  # condition on the final hidden
+            self.flow_lg_T = nn.Linear(1, r, bias=False)  # time embedding
+            self.flow_lg_A = nn.Linear(r, V, bias=False)  # bottleneck -> logit velocity
+            with torch.no_grad(): self.flow_lg_A.weight.zero_()   # zero velocity at init -> refinement is identity -> starts == baseline head
+        if FLOW_STEPS > 0 and "latent" in _FLOW_SITES:   # #10 latent scratchpad: iterate a planning vector z conditioned on the hidden, read back into the hidden
+            C = config.n_embd; Z = FLOW_RANK
+            self._flow_Z = Z
+            self.flow_z_in = nn.Linear(C + Z, Z)
+            self.flow_z_t = nn.Linear(1, Z, bias=False)
+            self.flow_z_w2 = nn.Linear(Z, Z, bias=False)
+            self.flow_z_out = nn.Linear(Z, C, bias=False)
+            with torch.no_grad(): self.flow_z_out.weight.zero_()   # zero readout at init -> scratchpad contributes nothing -> starts == baseline
         for i in DELTANET_LAYERS:
             if i < config.n_layer:
                 self.transformer["h"][i].gdn = GatedDeltaMixer(self.transformer["h"][i].attn, config)
@@ -4374,11 +4549,17 @@ class GPT(nn.Module):
             if blk.gdn is not None:
                 gdn_params.extend(blk.gdn.small_params())
         flow_params = []
-        if FLOW_STEPS > 0 and FLOW_SITE != "prehead":
+        if FLOW_STEPS > 0 and ({"attn","mlp","block"} & _FLOW_SITES):
             for blk in self.transformer["h"]:
                 flow_params += list(blk.attn.flow_w1.parameters()) + list(blk.attn.flow_t.parameters()) + list(blk.attn.flow_w2.parameters())
-        if FLOW_STEPS > 0 and FLOW_SITE == "prehead":
+        if FLOW_STEPS > 0 and "prehead" in _FLOW_SITES:
             flow_params += list(self.flow_head_w1.parameters()) + list(self.flow_head_t.parameters()) + list(self.flow_head_w2.parameters())
+        if FLOW_STEPS > 0 and "logit" in _FLOW_SITES:
+            flow_params += (list(self.flow_lg_B.parameters()) + list(self.flow_lg_H.parameters())
+                            + list(self.flow_lg_T.parameters()) + list(self.flow_lg_A.parameters()))
+        if FLOW_STEPS > 0 and "latent" in _FLOW_SITES:
+            flow_params += (list(self.flow_z_in.parameters()) + list(self.flow_z_t.parameters())
+                            + list(self.flow_z_w2.parameters()) + list(self.flow_z_out.parameters()))
         embedding_params = (list(self.transformer.wte.parameters())
                             + list(self.transformer.vte.parameters())
                             + list(self.transformer.vte_mid.parameters())
@@ -4408,12 +4589,78 @@ class GPT(nn.Module):
         return opt
 
     def _flow_refine_head(self, x):
-        S = FLOW_STEPS if not self.training else int(torch.randint(1, FLOW_STEPS + 1, (1,)).item())
+        # fixed step count in BOTH modes (no torch.randint().item(): that is a graph break / recompile under torch.compile on
+        # Neuron). The prehead MLP is tiny, so max steps in training costs nothing; the denoise aux supplies the randomness.
+        S = FLOW_STEPS
         dt = 1.0 / S; xf = x.float()
         for kstep in range(S):
             tk = torch.full((1, 1), kstep / S, device=x.device, dtype=torch.float32)
             xf = xf + dt * self.flow_head_w2(F.gelu(self.flow_head_w1(xf) + self.flow_head_t(tk)))
         return xf.to(x.dtype)
+
+    def _flow_latent(self, x):
+        # #10 latent scratchpad: z starts at 0, is iterated by a velocity field conditioned on the (fixed) hidden, then read back in
+        S = FLOW_STEPS if not self.training else int(torch.randint(1, FLOW_STEPS + 1, (1,)).item())
+        dt = 1.0 / S; xf = x.float()
+        z = torch.zeros(xf.size(0), xf.size(1), self._flow_Z, device=xf.device, dtype=torch.float32)
+        for kstep in range(S):
+            tk = torch.full((1, 1), kstep / S, device=xf.device, dtype=torch.float32)
+            z = z + dt * self.flow_z_w2(F.gelu(self.flow_z_in(torch.cat([xf, z], dim=-1)) + self.flow_z_t(tk)))
+        return (xf + self.flow_z_out(z)).to(x.dtype)
+
+    def _flow_head_aux(self, x):
+        # #6 denoising aux for the prehead flow: velocity learns to point any noised hidden back toward the clean hidden
+        # (identity at a clean point, so eval refinement is safe and only nudges off-manifold states back).
+        xf = x.float().detach()
+        noise = FLOW_NOISE * torch.randn_like(xf)
+        tt = torch.rand(xf.size(0), xf.size(1), 1, device=xf.device)
+        xt = xf + tt * noise
+        target_v = xf - xt                       # points from the noised point back to clean
+        pred_v = self.flow_head_w2(F.gelu(self.flow_head_w1(xt) + self.flow_head_t(tt)))
+        return ((pred_v - target_v) ** 2).mean()
+
+    def _flow_lg_vel(self, l, hc, tk):   # one velocity evaluation in logit space (hc = precomputed hidden projection)
+        return self.flow_lg_A(F.gelu(self.flow_lg_B(l) + hc + self.flow_lg_T(tk)))
+
+    def _flow_refine_logit(self, logits, h, starts=None):
+        # integrate the logit-space ODE from the base head logits; inference uses max steps, training samples 1..max
+        S = FLOW_STEPS if not self.training else int(torch.randint(1, FLOW_STEPS + 1, (1,)).item())
+        dt = 1.0 / S
+        l0 = logits.float()
+        hc = self.flow_lg_H(h.float())                           # (b,t,r) constant across steps
+        K = 1 if self.training else max(FLOW_STARTS if starts is None else starts, 1)
+        if K == 1:
+            l = l0
+            for kstep in range(S):
+                tk = torch.full((1, 1), kstep / S, device=logits.device, dtype=torch.float32)
+                l = l + dt * self._flow_lg_vel(l, hc, tk)
+            return l
+        prob = None                                              # multi-start: average probs over noised starts, return log-prob
+        for _s in range(K):
+            l = l0 + FLOW_NOISE * torch.randn_like(l0)
+            for kstep in range(S):
+                tk = torch.full((1, 1), kstep / S, device=logits.device, dtype=torch.float32)
+                l = l + dt * self._flow_lg_vel(l, hc, tk)
+            p = F.softmax(l, dim=-1)
+            prob = p if prob is None else prob + p
+        return (prob / K).clamp_min(1e-20).log()                # CE re-softmaxes; softmax(log p) = p
+
+    def _flow_lg_aux(self, base_logits, h, targets):
+        # rectified-flow auxiliary: teach the velocity the straight-line transport from base logits to a clean endpoint
+        # with the true token boosted, so integrating more steps at eval sharpens mass onto the likely token.
+        l0 = base_logits.float().detach()
+        V = l0.size(-1); flat = targets.reshape(-1)
+        oh = torch.zeros(flat.size(0), V, device=l0.device, dtype=torch.float32)
+        valid = flat != -1
+        idx = valid.nonzero(as_tuple=True)[0]
+        oh[idx, flat[idx]] = 1.0
+        oh = oh.view_as(l0)
+        l1 = l0 + FLOW_BOOST * oh                                # clean endpoint
+        tt = torch.rand(l0.size(0), l0.size(1), 1, device=l0.device)
+        lt = (1.0 - tt) * l0 + tt * l1                          # linear interpolation path
+        target_v = l1 - l0                                      # straight-line (constant) velocity
+        pred_v = self._flow_lg_vel(lt, self.flow_lg_H(h.float()), tt)
+        return ((pred_v - target_v) ** 2).mean()
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None, loss_reduction: str = "mean", emb=None,
                 bigram_grad: bool = True, bounds_in=None):
@@ -4501,6 +4748,18 @@ class GPT(nn.Module):
             bounds_g = (torch.maximum(bounds[0], pos_i - self.win_global + 1), bounds[1])
             bounds_l = (torch.maximum(bounds[0], pos_i - self.win_local + 1), bounds[1]) if self.config.window else bounds_g
             bounds = bounds_g
+            if ATTN_FWD_IMPL in ("ours", "plain") and LAYER_IMPL == "op" and not self.config.window:
+                # Own-attention kernels: hoist their per-row inputs to ONE per-step pack (4, B, t, 1) fp32 =
+                # [doc end, min(doc end, q+1), doc start, key index] (B = b * heads). The layer op's wrappers take free
+                # views of it instead of 3-4 expand/arange launches per layer - that glue cost more than the kernels
+                # saved in the clean combo (AFB_B, 2026-09-10). Passed through the op's existing start/end inputs.
+                _H = self.config.n_head; _b, _t = bounds[0].shape; _B = _b * _H
+                _q1 = torch.arange(1, _t + 1, dtype=torch.float32, device=idx.device).view(1, _t)
+                _rows = lambda x: x.unsqueeze(1).expand(_b, _H, _t).reshape(_B, _t, 1)
+                _endf = bounds[1].float(); _startf = bounds[0].float()
+                _pack = torch.stack([_rows(_endf), _rows(torch.minimum(_endf, _q1)), _rows(_startf),
+                                     _rows((_q1 - 1.0).expand(_b, _t))]).contiguous()
+                bounds = (_pack, _pack); bounds_l = bounds
         elif idx.is_cuda and not logit_sink:
             create_block_mask, _ = _get_flex()
             docs_kv = torch.cat([docs[:, :1].expand(-1, NUM_SINKS), docs], dim=1)
@@ -4534,38 +4793,50 @@ class GPT(nn.Module):
 
         n_enc = self.config.n_layer // 2
         n_dec_start = self.config.n_layer - n_enc
-        skips: list[torch.Tensor] = []
         bs = self.block_scalars
-        v0 = None
-        x_mid = None
-        for i, block in enumerate(self.transformer.h):
-            if i >= n_dec_start:
-                x = x + self.skip_lambdas[i - n_dec_start] * skips.pop()
-            if self.config.ple:
-                x = x + bs["ple"][i] * self.transformer.ple[i](idx).to(COMPUTE_DTYPE)
-            ve_i = ve1 if i < t1 else (ve_mid if i < t2 else ve2)
-            local = bool(self.config.window) and (i % 2 == 1)
-            dm = dense_mask_local if (local and dense_mask is not None) else dense_mask
-            bd = (bounds_l if local else bounds) if bounds is not None else None
-            vr = bs["vr"][i] if self.config.value_resid else None
-            extra = dict(doc_start=doc_start, skip_mlp=(DROP_MLP0 and i == 0), phase=(self.phase if self.use_phase else None),
-                         xsa=(bs["xsa"][i] if "xsa" in bs else None))
-            if logit_sink:
-                x, v0 = block(x, x0, ve_i, cos, sin, block_mask, dm,
-                              bs["resid"][i], bs["x0"][i], bs["ve"][i], None, None, bs["sink"][i], bd, v0, vr, doc_dims, rope_tabs,
-                              **extra)
-            else:
-                x, v0 = block(x, x0, ve_i, cos, sin, block_mask, dm,
-                              bs["resid"][i], bs["x0"][i], bs["ve"][i], bs["k_sink"][i], bs["v_sink"][i], None, None, v0, vr,
-                              doc_dims, rope_tabs, **extra)
-            if i < n_enc:
-                skips.append(x)
-            if i == n_enc - 1:
-                x_mid = x
-        if self.config.backout:
-            x = x - self.backout_lambda * x_mid
-        if FLOW_STEPS > 0 and FLOW_SITE == "prehead":
+        _stack_P = 1   # stack-recurrence (#8): run the whole stack P times, feeding the refined state back (0 new params, pure inference compute)
+        if FLOW_STEPS > 0 and "stack" in _FLOW_SITES:
+            _stack_P = FLOW_STEPS if not self.training else int(torch.randint(1, FLOW_STEPS + 1, (1,)).item())
+        _x_in = x
+        for _pass in range(_stack_P):
+            if _pass > 0:
+                x = 0.5 * (x + _x_in)   # blend refined state with the original stack input to keep the fixed-point iteration stable
+            skips: list[torch.Tensor] = []
+            v0 = None
+            x_mid = None
+            for i, block in enumerate(self.transformer.h):
+                if i >= n_dec_start:
+                    x = x + self.skip_lambdas[i - n_dec_start] * skips.pop()
+                if self.config.ple:
+                    x = x + bs["ple"][i] * self.transformer.ple[i](idx).to(COMPUTE_DTYPE)
+                ve_i = ve1 if i < t1 else (ve_mid if i < t2 else ve2)
+                local = bool(self.config.window) and (i % 2 == 1)
+                dm = dense_mask_local if (local and dense_mask is not None) else dense_mask
+                bd = (bounds_l if local else bounds) if bounds is not None else None
+                vr = bs["vr"][i] if self.config.value_resid else None
+                extra = dict(doc_start=doc_start, skip_mlp=(DROP_MLP0 and i == 0), phase=(self.phase if self.use_phase else None),
+                             xsa=(bs["xsa"][i] if "xsa" in bs else None))
+                if logit_sink:
+                    x, v0 = block(x, x0, ve_i, cos, sin, block_mask, dm,
+                                  bs["resid"][i], bs["x0"][i], bs["ve"][i], None, None, bs["sink"][i], bd, v0, vr, doc_dims, rope_tabs,
+                                  **extra)
+                else:
+                    x, v0 = block(x, x0, ve_i, cos, sin, block_mask, dm,
+                                  bs["resid"][i], bs["x0"][i], bs["ve"][i], bs["k_sink"][i], bs["v_sink"][i], None, None, v0, vr,
+                                  doc_dims, rope_tabs, **extra)
+                if i < n_enc:
+                    skips.append(x)
+                if i == n_enc - 1:
+                    x_mid = x
+            if self.config.backout:
+                x = x - self.backout_lambda * x_mid
+        flow_aux = None
+        if FLOW_STEPS > 0 and "prehead" in _FLOW_SITES:
+            if self.training and FLOW_MODE == "denoise" and targets is not None and FLOW_AUX > 0:
+                flow_aux = self._flow_head_aux(x)
             x = self._flow_refine_head(x)
+        if FLOW_STEPS > 0 and "latent" in _FLOW_SITES:
+            x = self._flow_latent(x)
         x_pre = x
         if (HEAD_IMPL == "nki" and targets is not None and loss_reduction == "mean" and x.device.type == "neuron"
                 and not (self.config.mtp and MTP_WEIGHT > 0 and self.training)):
@@ -4593,6 +4864,13 @@ class GPT(nn.Module):
             sp = self.softcap_pos.clamp_min(1.0).float()
             sn = self.softcap_neg.clamp_min(1.0).float()
             logits = torch.where(logits >= 0, sp * torch.tanh(logits / sp), sn * torch.tanh(logits / sn))
+        if FLOW_STEPS > 0 and "logit" in _FLOW_SITES:
+            if self.training and targets is not None and FLOW_AUX > 0:
+                if FLOW_MODE == "draft":          # supervise the one-shot base logits too (a quality floor under the refiner)
+                    flow_aux = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
+                elif FLOW_MODE in ("rf", "denoise"):
+                    flow_aux = self._flow_lg_aux(logits, x, targets)
+            logits = self._flow_refine_logit(logits, x)
         if targets is None:
             return logits
         if CE_IMPL == "manual":
@@ -4615,6 +4893,8 @@ class GPT(nn.Module):
                 logp2 = F.log_softmax(logits2.reshape(-1, logits2.size(-1)), dim=-1)
                 nll2 = -logp2.gather(1, t2.clamp_min(0).unsqueeze(1)).squeeze(1) * valid2.to(logp2.dtype)
                 loss = loss + MTP_WEIGHT * (nll2.sum() / valid2.sum().clamp_min(1).to(nll2.dtype))
+            if flow_aux is not None:
+                loss = loss + FLOW_AUX * flow_aux
             return loss
         loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
@@ -4624,6 +4904,8 @@ class GPT(nn.Module):
         )
         if loss_reduction == "none":
             return loss.view_as(targets)
+        if flow_aux is not None:
+            loss = loss + FLOW_AUX * flow_aux
         return loss
 
 

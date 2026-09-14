@@ -2,7 +2,7 @@
 # Dev tool (local CUDA GPU): run the Trn2 vehicle on the local GPU with the v39 architecture config minus the Trainium-only
 # kernel knobs, at fixed steps, single process. usage: bash gpu_gdn.sh <tag> <num_steps> [ENV=VALUE ...]
 set -u
-ulimit -v 24000000   # cap host virtual memory at 24 GB (< 30 GB RAM) so a GPU run can never swap-thrash the machine; it OOM-fails instead
+ulimit -v ${R1_VMEM_KB:-24000000}   # cap host virtual memory (default 24 GB < 30 GB RAM) so a GPU run can't swap-thrash; raise via R1_VMEM_KB for mhattn eval (CUDA virtual mappings, not real RAM)
 TAG=$1; STEPS=$2; shift 2
 cd ~/projects/trainium-frontier
 env PYTHONPATH=. NEURON_COMPETITION_R1_COMPILE=0 NEURON_COMPETITION_R1_N_EMBD=512 NEURON_COMPETITION_R1_N_HEAD=4 \
