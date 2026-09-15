@@ -298,3 +298,59 @@ packer never fits a document longer than a row (28% of the corpus never trained 
 4097-token best-fit rows place documents up to 4k whole (long-document content trained in full, short documents kept
 whole, 75% of sub-rows start mid-document like the eval rows). Stream-cut rows (100% coverage but every doc fragmented)
 LOSE +0.0017, so whole-document rows are the ingredient, not coverage per se. PACK=8 crashes the eager sidecar at batch 1.
+- Tooling lesson (Sep 14): a queue line must be `<ID> <secs|full> ENV=..`; a generated line with the env before `full`
+  makes trn2_run.sh exec `env ... full ...` ("env: 'full': No such file") and the runner logs a 35 s "finished: 0 errors".
+  Always `awk '{print $2}' queue | sort -u` == full/secs before launching. Re-launched as queue_A7b (7 PACK=4 scalar gates).
+- **A_PACK2 = 0.981913 (-0.0038):** PACK=2 already captures ~80% of the PACK=4 gain; PACK=4 stays the choice.
+- **ROOT CAUSE of the "transient" tracer crashes (RUN_NOEMA, P4_ELR8):** NKI's tracer reads kernel source from DISK
+  (inspect.getsource) at trace time. Overwriting the vehicle while a run is IN PROGRESS shifts the line offsets, and any
+  kernel traced afterwards in that process (the end-of-run eval graph is compiled at the end!) fails with "argument 'x_in'
+  not supplied". P4_ELR8 trained all 3400 steps and lost its score this way. **Rule: never overwrite the vehicle while any
+  run of it is in progress - not only while a queue has unlaunched lines.** Ship only between runs (or use a versioned
+  filename per run).
+
+## Parallel residuals on Trainium (repeat-regime idea 3) - the actual constraint and the experiment (2026-09-15)
+On a NeuronCore separate kernel launches execute back-to-back; the compiler cannot co-schedule two opaque kernels. So
+parallel residuals buy step time ONLY if the MLP's matmuls sit in the SAME instruction stream as the attention, where the
+NKI scheduler can fill the attention's non-PE phases (softmax on Vector/Scalar/GpSimd) with the MLP's PE work. Options:
+(a) our own attention in a layer megakernel (parked: strided-DMA corruption, parity at best), or (b) nest the VENDOR
+attention: `nkilib...attention_cte` is a thin @nki.jit entrypoint over an undecorated `_attention_cte(...)` that exposes
+`out_o_hbm/out_neg_max_hbm/out_sum_hbm` and `init_sbuf_addr` - i.e. it is built to be called from inside another kernel.
+Upper bound: attention fwd+bwd ~3.8 ms/layer and MLP fwd+bwd ~3.6 ms/layer of a ~37 ms layer -> perfect overlap saves up
+to ~10% of the step (~0.003 bpb); realistic maybe half (both need the PE during attention's matmuls).
+**Experiment queued (JOB PARRES_T after the gates, `nki/nki_parres_test.py`):** time (a) attention_cte alone, (b) mlp_fwd
+alone, (c) one kernel = nested `_attention_cte` + the MLP body inline, at production shapes. time(c) ~ max(a,b) -> build
+the parallel-residual layer kernel (fwd: pre kernel also emits the MLP branch from norm(xm); bwd: mlp_bwd on norm(xm) ->
+nbwd -> fold into pre_bwd_k's pass-through dx1 - no pre_bwd_k change needed); time(c) ~ a+b -> the branch closes.
+Quality precondition: local fixed-step B14_d12_parresid (eager PAR_RESID) vs 1.188775 - a loss there makes the kernel moot.
+- **B14 (parallel residuals, eager, depth 12, 500 fixed steps): 1.306967 vs 1.188775 (+0.118).** Training loss matched
+  the baseline through step 300 (3.42 vs 3.37) then ROSE to 3.84 by step 490 - a late-run instability with the current
+  optimizer scalars (Muon LR, per-layer lambdas tuned for sequential blocks), not an eval bug. Idea 3's quality
+  precondition fails as-is; the intra-kernel overlap experiment (PARRES_T) stays queued because it is 5 minutes of device
+  time and answers a general question (can vendor-attention + MLP co-schedule in one kernel), but the parallel-residual
+  layer kernel is not worth building unless that overlap is large AND a retune makes the block stable.
+- **Local fixed-step noise band measured:** same-config, same-seed depth-12 repeat = 1.188077 vs 1.188775 -> **~0.0007** (vs
+  the box's ~0.0004 same-config spread). Local screen verdicts below ~0.0015 are not signals.
+- **B17 (parallel residuals at matrix LR 0.45): stable, 1.193635 vs 1.188775 (+0.0049).** The instability was LR-driven; a
+  stable parallel block costs ~0.005 at equal steps, i.e. it would need >~16% step-time savings to break even, above the
+  ~10% intra-kernel overlap upper bound. **Idea 3 closed on arithmetic.** The PARRES_T overlap job stays queued as a
+  5-minute general measurement (vendor attention + MLP co-scheduling in one kernel) for future fusion decisions.
+- **WD on the PACK=4 base at full length: 0.1 -> 0.981197, 0.2 -> 0.985687, 0.3 -> 0.992145.** Monotonically worse; the
+  "strong WD is the precondition for MIR" premise of repeat-regime idea 1 does not hold on this line (1.4 epochs, Muon).
+  MIR gates (0.05/0.10/0.15 at WD 0.1) follow; locally MIR 0.10 cost +0.014 at fixed steps.
+- **MIR at full length on PACK=4: 0.05 -> 0.986213 (+0.005), 0.10 -> 0.990758 (+0.010).** Monotonically worse, matching the
+  local fixed-step result. Repeat-regime idea 1 (strong WD + masked-input aux loss) is CLOSED on this line: at 1.4 epochs
+  with Muon there is no under-regularization to fix; every added regularizer costs bpb roughly in proportion to its strength.
+- **PARRES_T (intra-kernel overlap experiment, production shapes):** vendor attention alone 2.19 ms, our MLP alone 1.48 ms,
+  ONE kernel with the nested `_attention_cte` followed by the MLP body 3.77 ms (bit-exact outputs). **No overlap at all**
+  (3.77 >= 3.67 serial sum): the NKI instruction scheduler runs the two bodies serially even in one instruction stream.
+  General conclusion: engine-level co-scheduling of independent work is NOT available by nesting kernels; the idle-engine
+  time in the profile cannot be reclaimed by parallel branches. (Nesting the vendor kernel itself works and is bit-exact -
+  useful for future fusion for DMA/launch reasons, not for overlap.)
+- **Embed-LR curve on PACK=4 complete: x3.5 0.9851 / x4.5 0.9801 / x6 0.9812 / x8 0.9819 -> x4.5 optimum (v43).**
+
+## v43 = v42 + EMBED_LR x4.5: gated 0.979941 (T60, causality passed) -> submit/train.py (2026-09-15 08:00 UTC)
+Three paired gates of embed LR x4.5 on the PACK=4 base: 0.980139, 0.980029, 0.979941 (clean file) vs v42 0.981197 ->
+-0.0013, three bands. Cumulative since v40: 0.985161 -> 0.979941 = -0.0052, both gains from the data/scalar axis at zero
+step cost. Portal expectation ~0.9865. Everything else gated on the PACK=4 base this cycle was flat or worse: WARMDOWN
+0.7/0.8, MATRIX_LR 0.55/0.85, EMA blend 0.5, EMA start 0.75 (flat); WD 0.2/0.3, MIR 0.05/0.10/0.15, embed LR 3.5/8 (worse).

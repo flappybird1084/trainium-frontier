@@ -126,6 +126,9 @@ MLP_RATIO = int(_ENV("NEURON_COMPETITION_R1_MLP_RATIO", "4"))
 PACK = int(_ENV("NEURON_COMPETITION_R1_PACK", "1"))   # v7: 1 = the baseline loader shape (rows of SEQ_LEN).
 PACK_MODE = _ENV("NEURON_COMPETITION_R1_PACK_MODE", "bestfit")   # bestfit = the provided best-fit packer (PACK-long rows reshaped) | stream = eval-style stream-cut rows (2026-09-14)
 STREAM_RESHUFFLE = _ENV("NEURON_COMPETITION_R1_STREAM_RESHUFFLE", "1") != "0"   # stream mode: seeded row-group permutation on epoch >= 2
+MIR_FRAC = float(_ENV("NEURON_COMPETITION_R1_MIR_FRAC", "0"))     # masked-input regularization (repeat-regime.md idea 1): fraction of INPUT positions replaced by a random token (targets untouched, BOS kept); 0 = off
+MIR_ROWS = float(_ENV("NEURON_COMPETITION_R1_MIR_ROWS", "0.5"))   # fraction of rows per micro-batch that get the masking (the rest train clean); training-only, loader-side, eval path untouched
+PAR_RESID = _ENV("NEURON_COMPETITION_R1_PAR_RESID", "0") != "0"   # parallel residuals (repeat-regime.md idea 3): attn and MLP both read the block input; EAGER path only (the Trn2 layer op is sequential by construction)
                                 # 4 (T10 packing trick, worth only -0.0013) is a post-v1 novelty; dropped for
                                 # the portal until a run of ours scores there.
 DEVICE_BATCH_SIZE = int(os.environ.get("NEURON_COMPETITION_R1_DEVICE_BATCH", "0")) or None
@@ -4307,6 +4310,12 @@ class Block(nn.Module):
                                    at.c_proj._stack, at.c_proj.idx, ml.c_fc._stack, ml.c_fc.idx, ml.c_proj._stack, ml.c_proj.idx,
                                    at.n_head), v0
         x = resid_lambda * x + x0_lambda * x0
+        if PAR_RESID and not skip_mlp:
+            # parallel residuals: attention and MLP both read the block INPUT (half the serial chain per block); eager path only
+            xin = x
+            a, v0 = self.attn(norm(xin), ve_lambda * ve, cos, sin, block_mask, dense_mask, k_sink, v_sink, sink, bounds, v0, vr_lambda,
+                              doc_dims, rope_tabs, doc_start=doc_start, phase=phase)
+            return xin + a + self._mlp_normed(xin), v0
         a, v0 = self.attn(norm(x), ve_lambda * ve, cos, sin, block_mask, dense_mask, k_sink, v_sink, sink, bounds, v0, vr_lambda,
                           doc_dims, rope_tabs, doc_start=doc_start, phase=phase)
         if FLOW_STEPS > 0 and "attn" in _FLOW_SITES:   # refine the attention contribution
@@ -5856,7 +5865,17 @@ def main() -> None:
                 _x, _y, _st = next(src)
             st = dict(_st)
             st["epoch"] = _st.get("epoch", 1) + epoch_offset
-            yield _x.reshape(-1, SEQ_LEN), _y.reshape(-1, SEQ_LEN), st
+            xr = _x.reshape(-1, SEQ_LEN)
+            if MIR_FRAC > 0:
+                # masked-input regularization: in MIR_ROWS of the rows, replace MIR_FRAC of the input positions by a random
+                # non-BOS token. Targets are untouched (the model must still predict the true next token from a corrupted
+                # context); BOS positions are kept so the document mask is unchanged. One forward pass, no extra cost.
+                rows = torch.rand(xr.size(0), 1, device=xr.device) < MIR_ROWS
+                hit = (torch.rand(xr.shape, device=xr.device) < MIR_FRAC) & rows & (xr != BOS_ID)
+                rnd = torch.randint(0, TOKENIZER_VOCAB_SIZE, xr.shape, device=xr.device, dtype=xr.dtype)
+                rnd = torch.where(rnd == BOS_ID, rnd + 1, rnd)
+                xr = torch.where(hit, rnd, xr)
+            yield xr, _y.reshape(-1, SEQ_LEN), st
 
     train_loader = _packed()
     x, y, loader_state = next(train_loader)
