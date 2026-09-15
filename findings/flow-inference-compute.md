@@ -368,3 +368,71 @@ step cost. Portal expectation ~0.9865. Everything else gated on the PACK=4 base 
 - **PACK=8 (2026-09-15):** the A_PACK8 step-0 crash was the intermittent OOB flake, not PACK=8 (host plans valid; torch-sidecar
   and NKI-sidecar 300 s runs both clean; full gate clean). Full gate on the v43 base: **0.980043 vs 0.979941 = wash**. The
   packing curve is flat from PACK=4 on; v43 (PACK=4) stays. Smear alone: +0.0022 locally.
+
+## The four untried free items (2026-09-15 evening)
+- **#2 canonical token masking:** built the 8192x8192 reachability table (allowed[a,b] iff encode(bytes(a)+bytes(b)) == [a,b];
+  uncertain -> allowed), verified against all 315M train tokens, and measured EVAL-ONLY on the depth-12 checkpoint with a
+  finite penalty (10 / 30 nats) instead of -inf (a single masked true target would otherwise be infinite bpb). Pipeline
+  `canon_build.py` / `canon_eval.py`; result pending. If it pays, it is a pure inference-time gain: eval renormalizes over
+  reachable tokens, training untouched (the fused head never materializes logits).
+- **#9 EMA-Nesterov outer loop:** implemented (`NES_LOOK`, `NES_GAMMA`, `NES_PREFILL`, `NES_OFF`): EMA (0.99) of the realized
+  per-step displacement of every non-embedding parameter; after each optimizer step, jump p += NES_LOOK*lrm*ema (prefill 300
+  steps, off after 2/3 of the budget). Host-side only, ~4 elementwise passes over 63M params per step. CPU smoke ok. Local
+  fixed-step screen B23 + full gates G_NES03 / G_NES015 on the v43 base pending.
+- **#8 cautious weight decay:** ALREADY in both Muon paths (`mask = (g*w >= 0)` in nki_muon.py and the torch fallback). The
+  only extension left is the AdamW groups, whose decay is 0.001 (embeddings) / 0.01 (head): negligible. Not pursued.
+- **#1 prefix-token aux loss:** with the fused head it needs a second target gather inside head_fwd/head_bwd (a kernel edit)
+  to be free; the speedrun claim is -15 steps of ~1500 (~1%) = ~0.0003 bpb here, below the 0.0004 band. Not pursued.
+
+## wild-ideas-2026-09-15.md - Tier 0 checks (no training run)
+- **0.1 batched Muon: already done.** The Muon kernel takes the whole (n, out, in) stack in one launch (LNC-sharded over
+  the stack index) since the v9 "stacked params" change. Rationale (b), JOINT orthogonalization of the concatenated
+  (12*d, d) matrix, is a different optimizer (changes update semantics) and would need a gate; not free.
+- **0.3 pre-transposed backward:** from the kernel structure the ~182k transposes are dominated by per-step ACTIVATION
+  tile transposes (x^T / dy^T per 512-token chunk: hundreds per layer per kernel), not weight transposes (~64 per
+  layer per kernel, reused across chunks). Weight pre-transposition would save well under 1% of the step. Not pursued.
+- **0.4 mixture-of-softmaxes numerics:** fp32 log_softmax(log p) - log p = 9.5e-7 (exact enough); bf16 3e-3 (sum p off by
+  2e-3) -> the returned log-probabilities must be fp32. Plumbing is viable; the head itself (K=2: +3-8% step) is not built.
+- **0.5 canonical-mask density: 2.2% of (prev, next) pairs forbidden** (the note's kill threshold was 5%), and the isolated-
+  pair test mislabels 68 ppm of true training continuations, so only a finite penalty is safe. Eval-only measurement
+  (penalties 10/30 on the depth-12 checkpoint) running.
+- **1.1 exact-bpb loss reweighting: killed on arithmetic.** val_bpb = (sum of per-token nats) / (ln2 * total bytes): every
+  token's nats count ONCE and the byte total is a constant. Uniform token CE already IS the metric's objective; byte-
+  weighting the loss optimizes a different one. The premise ("7-byte token counts 7:1 in the score") is false. The same
+  applies to the metric argument for 4.2 / 4.3 (they may still matter as modeling changes, not as metric alignment).
+- **2.1 Local-SGD:** the optimizer is ZeRO-sharded (each rank owns 1/8 of the states; the per-step all-gather IS the
+  sharding), so syncing every N steps requires an unsharded optimizer. Feasibility = the step-time cost of OPT_SHARD=0
+  vs the ~105 ms/step of comm it could skip; screen S_NOSHARD (300 s) queued.
+- **0.2 Stiefel retraction on W_O: premise false.** In the depth-12 checkpoint every 512x512 stack matrix (q/k/v/o) sits at
+  a relative Frobenius distance of ~0.55 from the nearest scaled-orthogonal matrix (singular-value spread ~1000x). Muon
+  orthogonalizes UPDATES, not weights; the weights were never near the manifold, so a retraction is not a "snap back" but a
+  large change of parameterization that would need a gate. Not pursued.
+- **Canonical masking, eval-only on the depth-12 checkpoint (63.4M val targets):** penalty 0 -> 1.198428, 10 -> 1.197720
+  (-0.0007), 30 -> 1.198209 (-0.0002). 4267 true val targets (67 ppm, matching the train-shard rate) are mislabeled
+  forbidden by the isolated-pair test, so -inf is impossible and the penalty has an interior optimum. The gain at 10 nats
+  is one local noise band: the trained model already puts little mass on the 2.2% of non-canonical pairs. Marginal, and it
+  changes the scored forward (a review surface the campaign has been burned on twice). Parked; not gating on the box
+  unless nothing better remains.
+- **EMA-Nesterov: local equal-step -0.0049 (1.183881 vs 1.188775, 7 bands); box full gate +0.0015 on 4% fewer steps.**
+  Unlike re-injection (which inverted at length), this one is consistent with a genuine per-step gain wiped out by its
+  implementation cost: the host-side snapshot/lerp/jump over 63M params costs ~4% of the step on Trainium (torch elementwise
+  ops outside the graph launch as many small kernels). The jump is a per-element op on tensors the optimizer kernels already
+  read and write, so it can be folded into nki_muon / nki_adamw for ~zero cost (kernel edit: keep a displacement-EMA buffer,
+  add lookahead*lrm*ema after the update). That is the next kernel item if a v44 is wanted.
+  **Correction (same hour):** correcting G_NES03 for its 4% fewer steps (~+0.0013 at the exchange rate) leaves an
+  equal-step effect of ~+0.0002 at full length - a WASH, not -0.0049. So the local fixed-step gain does not hold at 1800 s
+  either (same inversion pattern as re-injection). Folding the jump into the kernels would recover only a wash. Not pursued
+  unless G_NES015 says otherwise.
+- **2.1 Local-SGD: closed on arithmetic.** The optimizer is ZeRO-sharded, so syncing every N steps requires an unsharded
+  optimizer; S_NOSHARD measured OPT_SHARD=0 at 0.56 s/step vs 0.52 sharded (+8%). Skipping the ~105 ms/step of comm on 3
+  of every 4 steps saves ~5% on average, so the net is ~+3% step time before any staleness penalty. Not viable here.
+- **1.3 FiLM combine, local equal-step: 1.198595 vs 1.188775 (+0.0098).** The note's own falsifier fired: additive
+  superposition was load-bearing. Box gate G_FILM queued will confirm.
+- **3.1 HDC binding: closed.** Replacing the 2^18 x 512 learned bigram table by wte(prev) * frozen sign[cur]: 600 s screen
+  1.150833 vs ~1.053 (+0.098) at 0.54 s/step (+4%: the per-token code rows shipped host->device cost more than the table's
+  gather+scatter saved). The learned table is worth ~0.1 bpb at this horizon; a frozen composite is not a substitute.
+  (Local B26 vs the no-bigram floor B27 pending as a footnote on whether the binding carries ANY bigram signal.)
+- **1.2 positional keys: closed** (local +0.0182, 26 bands; box gate killed). **1.3 FiLM: closed** (local +0.0098; gate killed).
+- Tooling lesson (bis): the Bash tool's shell is zsh, where an unquoted `$s` does not word-split, so `set -- $s` leaves the
+  whole string in $1 and the generated queue line becomes "<ID> <ENV> full ..." (the malformed-line failure again).
+  Generate queue lines with explicit printf per line, and ALWAYS verify `awk '{print $2}'` == full/secs before launching.

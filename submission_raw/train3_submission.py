@@ -129,6 +129,15 @@ STREAM_RESHUFFLE = _ENV("NEURON_COMPETITION_R1_STREAM_RESHUFFLE", "1") != "0"   
 MIR_FRAC = float(_ENV("NEURON_COMPETITION_R1_MIR_FRAC", "0"))     # masked-input regularization (repeat-regime.md idea 1): fraction of INPUT positions replaced by a random token (targets untouched, BOS kept); 0 = off
 MIR_ROWS = float(_ENV("NEURON_COMPETITION_R1_MIR_ROWS", "0.5"))   # fraction of rows per micro-batch that get the masking (the rest train clean); training-only, loader-side, eval path untouched
 PAR_RESID = _ENV("NEURON_COMPETITION_R1_PAR_RESID", "0") != "0"   # parallel residuals (repeat-regime.md idea 3): attn and MLP both read the block input; EAGER path only (the Trn2 layer op is sequential by construction)
+BIGRAM_COMBINE = _ENV("NEURON_COMPETITION_R1_BIGRAM_COMBINE", "add")   # add | film (wild-ideas 1.3: x = wte*(1+s*bt) + t*bt, s zero-init)
+BIGRAM_POS = int(_ENV("NEURON_COMPETITION_R1_BIGRAM_POS", "0"))         # wild-ideas 1.2: fold (pos % BIGRAM_POS) into the bigram hash (0 = off)
+BIGRAM_HDC = _ENV("NEURON_COMPETITION_R1_BIGRAM_HDC", "0") != "0"        # wild-ideas 3.1: hyperdimensional binding instead of a hashed table: bt = wte(prev) * sign[cur] (frozen +-1 codebook, seed 4242); use with BIGRAM=0
+
+
+def hdc_codebook(d: int = 512) -> torch.Tensor:
+    """Frozen +-1 codebook (vocab 8192 x d) for HDC binding; identical on host (sidecar) and in the model (a pure function of the seed)."""
+    g = torch.Generator().manual_seed(4242)
+    return (torch.randint(0, 2, (8192, d), generator=g) * 2 - 1).to(torch.int8)
 BIGRAM_REINJ = tuple(int(i) for i in _ENV("NEURON_COMPETITION_R1_BIGRAM_REINJ", "").split(",") if i.strip())   # re-add the (already gathered) bigram row into the residual at these block inputs, zero-init per-site scalars; no extra gathers/scatters
 SMEAR = _ENV("NEURON_COMPETITION_R1_SMEAR", "0") != "0"           # smear gate at the input: x_t += sigmoid(w . x_t) * x_{t-1} (zero-init w; document-safe: no smear across a BOS)
 DROP_ATTN0 = _ENV("NEURON_COMPETITION_R1_DROP_ATTN0", "0") != "0" # block 0 without attention (MLP only); pair with SMEAR to replace layer-0's local mixing
@@ -266,6 +275,10 @@ EPOCH2 = _ENV("NEURON_COMPETITION_R1_EPOCH2", "0")                     # dev kno
 EMA_DECAY = float(os.environ.get("NEURON_COMPETITION_R1_EMA", "0.0"))                    # dev knob: >0 = keep an EMA of the weights from EMA_START of
 EMA_START = float(os.environ.get("NEURON_COMPETITION_R1_EMA_START", "0.5"))              # the budget on, and evaluate / save the EMA weights
 EMA_BLEND = float(os.environ.get("NEURON_COMPETITION_R1_EMA_BLEND", "1.0"))     # final = (1-b)*w + b*ema (speedrun tail-EMA: 0.35)
+NES_LOOK = float(os.environ.get("NEURON_COMPETITION_R1_NES_LOOK", "0"))       # EMA-Nesterov outer loop (strange-wins #9): lookahead = NES_LOOK * lrm along an EMA of the realized per-step displacement; 0 = off
+NES_GAMMA = float(os.environ.get("NEURON_COMPETITION_R1_NES_GAMMA", "0.99"))  # displacement-EMA decay
+NES_PREFILL = int(os.environ.get("NEURON_COMPETITION_R1_NES_PREFILL", "300")) # steps of EMA accumulation before the first jump
+NES_OFF = float(os.environ.get("NEURON_COMPETITION_R1_NES_OFF", "0.667"))     # no jumps once elapsed_frac >= this (off for the last third)
 EMA_SKIP_EMBED = os.environ.get("NEURON_COMPETITION_R1_EMA_SKIP_EMBED", "0") != "0"   # EMA everything except the token tables
 ROPE_FRAC = float(os.environ.get("NEURON_COMPETITION_R1_ROPE_FRAC", "1.0"))     # fraction of rotary frequencies kept (0.5 = half-truncate)
 KEY_OFFSET = os.environ.get("NEURON_COMPETITION_R1_KEY_OFFSET", "0") != "0"     # shift the stationary key dims one position forward
@@ -4415,6 +4428,10 @@ class GPT(nn.Module):
             self.backout_lambda = nn.Parameter(torch.zeros(1))
         if BIGRAM_REINJ:
             self.bigram_reinj = nn.Parameter(torch.zeros(len(BIGRAM_REINJ), 1))   # zero-init: identity at step 0
+        if BIGRAM_COMBINE == "film":
+            self.bigram_film = nn.Parameter(torch.zeros(1))                        # multiplicative gate, zero-init -> additive at step 0
+        if BIGRAM_HDC:
+            self.register_buffer("hdc_codebook", hdc_codebook(config.n_embd), persistent=False)   # frozen +-1 codes; regenerated from the seed at load
         if SMEAR:
             self.smear_w = nn.Parameter(torch.zeros(config.n_embd))              # gate = sigmoid(w.x) * smear_scale, smear_scale zero-init -> identity at step 0
             self.smear_scale = nn.Parameter(torch.zeros(1))
@@ -4560,6 +4577,8 @@ class GPT(nn.Module):
         scalar_params = [self.skip_lambdas, self.bigram_lambda, self.softcap_pos, self.softcap_neg]
         if BIGRAM_REINJ:
             scalar_params.append(self.bigram_reinj)
+        if BIGRAM_COMBINE == "film":
+            scalar_params.append(self.bigram_film)
         if SMEAR:
             scalar_params += [self.smear_w, self.smear_scale]
         if self.config.backout:
@@ -4704,25 +4723,40 @@ class GPT(nn.Module):
         # hashed bigram table: int32 multiplicative hash (Neuron-friendly; wraps mod 2^32)
         prev = torch.cat([torch.full_like(idx[:, :1], BOS_ID), idx[:, :-1]], dim=1)
         pair = prev.to(torch.int32) * 8192 + idx.to(torch.int32)
-        bh = bigram_bucket((pair * -1640531527) >> 13).long()
+        _h = (pair * -1640531527) >> 13
+        if BIGRAM_POS > 0:   # wild-ideas 1.2: positional bigram keys - fold (pos % BIGRAM_POS) into the hash (must match the sidecar's numpy hash exactly)
+            _pos = (torch.arange(t, device=idx.device, dtype=torch.int32) % BIGRAM_POS).unsqueeze(0)
+            _h = _h ^ ((_pos + 1) * 623171941)
+        bh = bigram_bucket(_h).long()
         bh2 = bigram_bucket((pair * 668265261) >> 13).long() if BIGRAM_SPLIT == 2 else None   # independent hash for table 2
 
         bt_reinj = None
         if emb is not None:                       # EMBED=sidecar: dense rows gathered outside the graph
             emb = {k: v.clone() for k, v in emb.items()}   # (clone: inputs saved for backward must not alias outputs)
             x = emb["wte"]
+            if BIGRAM_HDC:   # HDC binding: bigram feature = wte(prev) (Hadamard) sign[cur]; prev at a row start = the BOS row
+                bos_row = self.transformer.wte.weight[BOS_ID].to(x.dtype).view(1, 1, -1).expand(x.size(0), 1, -1)
+                prev_rows = torch.cat([bos_row, x[:, :-1]], dim=1)
+                x = x + self.bigram_lambda * (prev_rows * emb["hdc_sign"])
             if USE_BIGRAM:
                 bt = emb["bte"]
                 if "bte2" in emb:
                     bt = torch.cat([bt, emb["bte2"]], dim=-1)
                 if "bte_sign" in emb:
                     bt = bt * emb["bte_sign"]      # sign trick: the gradient reaching the table row carries the same sign
-                x = x + self.bigram_lambda * bt
+                if BIGRAM_COMBINE == "film":   # wild-ideas 1.3: modulate instead of add: x = wte*(1 + s*bt) + t*bt (s zero-init, t = the usual gate)
+                    x = x * (1.0 + self.bigram_film * bt) + self.bigram_lambda * bt
+                else:
+                    x = x + self.bigram_lambda * bt
                 bt_reinj = bt if BIGRAM_REINJ else None
             if self.config.use_trigram:
                 x = x + self.trigram_lambda * emb["tte"]
         else:
             x = self.transformer.wte(idx).to(COMPUTE_DTYPE)
+            if BIGRAM_HDC:   # same binding on the in-graph (eval) path: wte(prev) * sign[cur], BOS row at a row start
+                prev_idx = torch.cat([torch.full_like(idx[:, :1], BOS_ID), idx[:, :-1]], dim=1)
+                prev_rows = self.transformer.wte(prev_idx).to(COMPUTE_DTYPE)
+                x = x + self.bigram_lambda * (prev_rows * self.hdc_codebook[idx.long()].to(COMPUTE_DTYPE))
             if USE_BIGRAM:
                 bt = self.transformer.bte(bh).to(COMPUTE_DTYPE)
                 if BIGRAM_SPLIT == 2:
@@ -4731,7 +4765,10 @@ class GPT(nn.Module):
                     bt = bt * ((((pair * -1640531535) >> 17) & 1).to(COMPUTE_DTYPE) * 2 - 1).unsqueeze(-1)
                 if not bigram_grad:
                     bt = bt.detach()
-                x = x + self.bigram_lambda * bt
+                if BIGRAM_COMBINE == "film":   # wild-ideas 1.3: modulate instead of add: x = wte*(1 + s*bt) + t*bt (s zero-init, t = the usual gate)
+                    x = x * (1.0 + self.bigram_film * bt) + self.bigram_lambda * bt
+                else:
+                    x = x + self.bigram_lambda * bt
                 bt_reinj = bt if BIGRAM_REINJ else None
         if SMEAR:
             # smear gate: x_t += s * sigmoid(w . x_t) * x_{t-1}; s zero-init (identity at step 0); never smears across a
@@ -5116,7 +5153,11 @@ class EmbedSidecar:
             ids2 = ids_np.reshape(b, t)
             prev = np.concatenate([np.full((b, 1), BOS_ID, dtype=np.int64), ids2[:, :-1]], axis=1).reshape(-1)
             pair = (prev.astype(np.int32) * np.int32(8192)) + ids_np.astype(np.int32)
-            bh = bigram_bucket(((pair * np.int32(-1640531527)) >> 13).astype(np.int64))
+            _h = (pair * np.int32(-1640531527)) >> 13
+            if BIGRAM_POS > 0:   # positional bigram keys: identical mixing to the in-graph torch path (eval must match training)
+                _pos = np.tile((np.arange(t, dtype=np.int32) % np.int32(BIGRAM_POS)), b)
+                _h = _h ^ ((_pos + np.int32(1)) * np.int32(623171941))
+            bh = bigram_bucket(_h.astype(np.int64))
             keys["bg"] = bh
             if BIGRAM_SPLIT == 2:
                 keys["bg2"] = bigram_bucket(((pair * np.int32(668265261)) >> 13).astype(np.int64))
@@ -5143,6 +5184,10 @@ class EmbedSidecar:
                 S = perm.shape[0]
                 views.append((dbuf[off:off + S], dbuf[off + S:off + 2 * S])); off += 2 * S
             plans[kind] = (ind, dbuf[:n], views, bg_sign.to(dev) if (kind == "bg" and USE_BIGRAM and bg_sign is not None) else None)
+        if BIGRAM_HDC:   # HDC binding: the frozen +-1 code of each CURRENT token, gathered on the host (no table, no scatter)
+            if not hasattr(self, "_hdc_np"):
+                self._hdc_np = hdc_codebook(self.model.config.n_embd).numpy()
+            plans["_hdc"] = torch.from_numpy(self._hdc_np[ids_np]).to(dev, non_blocking=True)
         return plans
 
     @torch.no_grad()
@@ -5152,7 +5197,12 @@ class EmbedSidecar:
         dev = x.device
         b, t = x.shape
         emb = {}
-        for kind, (ind, ind_t, views, sign_t) in plans.items():
+        if "_hdc" in plans:
+            emb["hdc_sign"] = plans["_hdc"].view(b, t, -1).to(COMPUTE_DTYPE)
+        for kind, plan in plans.items():
+            if kind.startswith("_"):
+                continue
+            ind, ind_t, views, sign_t = plan
             for name in self.kinds[kind]:
                 w = self.tables[name]
                 if self.impl == "sidecar":
@@ -5166,7 +5216,10 @@ class EmbedSidecar:
 
     @torch.no_grad()
     def scatter(self, emb, plans):
-        for kind, (ind, ind_t, views, _unused) in plans.items():
+        for kind, plan in plans.items():
+            if kind.startswith("_"):
+                continue
+            ind, ind_t, views, _unused = plan
             for name in self.kinds[kind]:
                 g = emb[name].grad
                 if g is None:
@@ -5913,6 +5966,7 @@ def main() -> None:
     plan_ring = (None, None)                   # (older, newer): references that outlive the device queue
     next_plans = None
     ema_params = None
+    nes_state = None; nes_pairs = None; nes_snap = None
     ema_pairs = None
     if EMBED_IMPL in ("sidecar", "sidecar_torch") and not (EMBED_IMPL == "sidecar" and device.type != "neuron"):
         sidecar = EmbedSidecar(orig_model, EMBED_IMPL)
@@ -6039,7 +6093,25 @@ def main() -> None:
         if OPT_PROF and step == 10:
             for k in _OPTPROF:
                 _OPTPROF[k] = 0.0          # drop the step-0 kernel compiles from the average
+        if NES_LOOK > 0:
+            if nes_state is None:
+                _skip = {id(m.weight) for n, m in orig_model.transformer.items() if isinstance(m, nn.Embedding)}
+                nes_pairs = [p for p in orig_model.parameters() if id(p) not in _skip]
+                nes_state = [torch.zeros_like(p, dtype=torch.float32) for p in nes_pairs]
+                nes_snap = [torch.empty_like(p) for p in nes_pairs]
+                print0(f"EMA-Nesterov: {len(nes_pairs)} tensors, gamma {NES_GAMMA}, lookahead {NES_LOOK}*lrm, prefill {NES_PREFILL} steps, off at {NES_OFF:.2f}")
+            with torch.no_grad():
+                for s, p in zip(nes_snap, nes_pairs):
+                    s.copy_(p.detach())                                              # pre-step snapshot
         opt_step()
+        if NES_LOOK > 0:
+            with torch.no_grad():
+                for p, s, e in zip(nes_pairs, nes_snap, nes_state):
+                    e.lerp_((p.detach() - s).float(), 1.0 - NES_GAMMA)              # EMA of the realized displacement
+                if step >= NES_PREFILL and elapsed_frac < NES_OFF:
+                    _a = NES_LOOK * lrm
+                    for p, e in zip(nes_pairs, nes_state):
+                        p.add_((_a * e).to(p.dtype))                                 # jump forward before the next forward pass
         orig_model.refresh_weight_cache()
         if EMA_DECAY > 0 and elapsed_frac >= EMA_START:
             with torch.no_grad():

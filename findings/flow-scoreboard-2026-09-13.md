@@ -146,3 +146,56 @@ NEURON_CC_FLAGS setting corrupt the eval-mode graph (~1.12 vs 1.053) while train
 | P4_ELR8b | PACK=4 + EMBED_LR_SCALE 8.0 | 0.981913 | +0.0007 vs T59 | slightly worse: embed-LR curve on PACK=4 = 3.5: 0.9851 / 4.5: 0.9801 / 6: 0.9812 / 8: 0.9819 -> 4.5 is the optimum |
 | PARRES_T (device job) | nested vendor _attention_cte + MLP body in ONE kernel | (a) attn 2.19 ms, (b) MLP 1.48 ms, (c) fused 3.77 ms | - | bit-exact fusion works, but NO overlap (3.77 >= 3.67 serial): the NKI scheduler executes nested kernel bodies serially. Intra-kernel co-scheduling is not a lever on this stack |
 | T60_gate | CLEAN v43 = v42 + EMBED_LR x4.5 (sha d1b78be9a0285c8d) | **0.979941** | -0.0013 vs T59 | **NEW BEST -> submit/train.py**; causality passed |
+
+## PACK=8 (2026-09-15)
+| run | config | result | note |
+|---|---|---|---|
+| host plan check | scatter plans for PACK 1/4/8 first batches | all invariants hold | indices < R, padding slots < R+128, chunks <= 32768 -> the sidecar plan is NOT the crash cause |
+| B18 (local) | PACK=8 fixed-step, CUDA | training clean (step-10 loss = PACK=4's) | eager path fine |
+| P8_SIDETORCH | PACK=8, torch sidecar, 300 s | clean, 534 steps, causality ok | NKI scatter bypassed |
+| P8_SYNC | PACK=8, NKI sidecar + SIDECAR_SYNC, 300 s | clean past step 50 (0.51 s) | the original A_PACK8 step-0 crash was the INTERMITTENT OOB flake, not PACK=8 |
+| G_PACK8 | PACK=8 full gate on the v43 base (embed LR 4.5) | queued | vs T60 0.979941; PACK curve 1: 0.9857 / 2: 0.9819 / 4: 0.9812 (v42 base) |
+
+## USER IDEAS (2026-09-15): bigram re-injection, smear + drop layer-0 attention (v43 base; ref T60 0.979941 @0.52 s)
+| run | config | step dt | val_bpb | note |
+|---|---|---|---|---|
+| S_SMEARDROP (600 s) | SMEAR=1 DROP_ATTN0=1 | 0.53 s | 1.053269 (1124 steps) | NO step-time gain (1 of 12 attentions < 1% of the step; the smear gate's elementwise work cancels it) |
+| B18_d12_pack8 (local, 500 fixed steps) | PACK=8 vs 1.188775 | 1.189619 | +0.0008 | wash at fixed steps (band 0.0007), as PACK=4 was; the packing gain only shows at full length -> G_PACK8 decides |
+| B19_d12_reinj2 (local, 500 fixed steps) | BIGRAM_REINJ=4,8 vs 1.188775 | 1.186915 | -0.0019 | ~2.7 local bands: a real fixed-step gain at zero cost; the full gate G_REINJ2 (running) decides at length |
+| G_REINJ2 (full gate) | BIGRAM_REINJ=4,8 on v43 base | 0.53 s | 0.980789 | +0.0008 vs T60 0.979941: the local fixed-step gain (-0.0019) does NOT transfer to full length (2 bands worse). G_REINJ4 next |
+| B20_d12_reinj4 (local, 500 fixed steps) | BIGRAM_REINJ=2,5,8,11 vs 1.188775 | 1.186498 | -0.0023 | fixed-step gain again (3 bands); G_REINJ4 (running) tests transfer after x2 failed to |
+| G_REINJ4 (full gate) | BIGRAM_REINJ=2,5,8,11 on v43 base | 0.53 s | 0.981184 | +0.0012 vs T60: worse than x2 (+0.0008). Bigram re-injection CLOSED: helps at fixed steps (-0.002), hurts at full length, monotone in sites |
+| B21_d12_smeardrop (local, 500 fixed steps) | SMEAR=1 DROP_ATTN0=1 vs 1.188775 | 1.198306 | +0.0095 | losing layer-0 attention costs ~0.01 at equal steps and the smear gate does not replace it; with zero step-time gain (0.53 s) the full gate can only confirm |
+| G_SMEARDROP (full gate) | SMEAR=1 DROP_ATTN0=1 on v43 base | 0.52 s | 0.983132 | +0.0032 vs T60 0.979941: worse, no step-time gain. CLOSED |
+| B22_d12_smear (local, 500 fixed steps) | SMEAR=1 alone vs 1.188775 | 1.190939 | +0.0022 | the smear gate itself is slightly negative (3 bands); no reason to gate it |
+| G_PACK8 (full gate) | PACK=8 on the v43 base | 0.52 s | 0.980043 | +0.0001 vs T60 0.979941: a wash. PACK curve (v42/v43 bases): 1: 0.9857 / 2: 0.9819 / 4: 0.9812 -> 0.9799 (v43) / 8: 0.9800. Optimum is flat from 4; v43 stays |
+
+## wild-ideas-2026-09-15 queue (v43 base; ref T60 0.979941 @0.52 s; local ref 1.188775)
+| run | idea | result | note |
+|---|---|---|---|
+| G_NES03 (box) | #9 EMA-Nesterov, lookahead 0.3 | 0.981413 (3261 steps) | +0.0015 vs T60, and 4% FEWER steps (3261 vs ~3400): the host-side displacement EMA + jump costs ~4% of the step at full length. G_NES015 running |
+| S_NOSHARD (box, 300 s) | 2.1 feasibility: OPT_SHARD=0 step time | queued | Local-SGD needs an unsharded optimizer; skips ~105 ms/step of comm at N=4 |
+| G_FILM (box), B24 (local) | 1.3 FiLM bigram combine | queued | x = wte*(1+s*bt) + t*bt, s zero-init |
+| G_BPOS64 (box), B25 (local) | 1.2 positional bigram keys (pos % 64 folded into the hash) | queued | torch/numpy hashes verified bit-identical |
+| canon_eval (local) | 0.5 canonical mask, eval-only, penalties 10/30 | running | 2.2% of pairs forbidden; 68 ppm true-continuation mislabels |
+| killed without a run | 0.1 (already batched), 0.2 (weights never orthogonal), 0.3 (activation transposes dominate), 1.1 (metric arithmetic) | - | see findings |
+| canon_eval (local, eval-only, depth-12 ckpt, penalty 0/10/30) | 0.5 canonical token masking | 1.198428 / 1.197720 / 1.198209 | -0.0007 best (penalty 10) | 4267 of 63.4M true val targets (67 ppm) are mislabeled forbidden -> a hard mask is impossible; the finite-penalty optimum is ~1 local band. Marginal; a box gate is the only way to know if it is real, and it is an eval-path change (review surface) |
+| B23_d12_nes (local, 500 fixed steps) | EMA-Nesterov 0.3 (prefill 50) vs 1.188775 | 1.183881 | -0.0049 | 7 local bands: a REAL equal-step gain, the largest local optimizer win so far; on the box it lost +0.0015 because the host-side passes cost ~4% of steps. The lever is the implementation cost, not the idea: fold the displacement EMA + jump into the optimizer kernels (Muon/AdamW already touch every weight) and the 4% goes to ~0 |
+| S_HDC (600 s) + G_HDC (full), B26 (local) + B27 (local, no bigram at all) | 3.1 HDC binding: bt = wte(prev) * sign[cur], frozen codebook, NO bigram table (BIGRAM=0; -134M params, drops the bte gather+scatter) | queued | smokes: in-graph and sidecar paths train to identical bpb; S_HDC gives the step-time saving, G_HDC the quality vs T60; B27 is the floor (no bigram signal) |
+| G_NES015 (box) | #9 EMA-Nesterov, lookahead 0.15 | 0.981308 (3279 steps) | +0.0014 vs T60 | same as 0.3 (+0.0015): the loss is the ~4% step cost; equal-step effect ~wash at length. EMA-Nesterov CLOSED |
+| B24_d12_film (local, 500 fixed steps) | 1.3 FiLM bigram combine vs 1.188775 | 1.198595 | +0.0098 | clearly worse at equal steps: the multiplicative gate hurts (the note's own falsifier: additive superposition was load-bearing). G_FILM on the box will confirm; expected worse |
+| S_NOSHARD (box, 300 s) | 2.1 feasibility: OPT_SHARD=0 (unsharded optimizer) step time | 0.56 s/step (vs 0.52 sharded) | - | unsharding costs ~+8%. Local-SGD at N=4 would skip ~105 ms of comm per 4 steps = ~-5% average -> net ~+3% step: NOT viable on this stack even before the staleness cost. 2.1 CLOSED |
+| G_FILM (box) | 1.3 FiLM full gate | KILLED at launch | - | local +0.0098 at equal steps made the gate pointless; box time given to G_BPOS64 / HDC |
+| B25_d12_bpos64 (local, 500 fixed steps) | 1.2 positional bigram keys (pos % 64) vs 1.188775 | 1.207019 | +0.0182 | badly worse at equal steps: 64x bucket dilution at a table already at its capacity ceiling (the note's own risk). G_BPOS64 on the box (running) will confirm |
+| G_BPOS64 (box) | 1.2 positional keys full gate | KILLED | - | local +0.0182 (26 bands); box time given to HDC |
+| S_HDC (box, 600 s) | 3.1 HDC binding step time | 0.54 s/step (vs 0.52) | pending | NOT cost-negative: the per-token sign rows (16 MB/micro-step host->device) + the bind/shift ops cost more than the bte gather+scatter saved; step-50 loss 5.25 vs 4.95 |
+| S_HDC (result) | 3.1 HDC binding, 600 s | 0.54 s | 1.150833 (1103 steps) | +0.098 vs the ~1.053 600 s references: the frozen binding does NOT replace the learned table; G_HDC killed (a 0.1 gap does not reverse at length). HDC CLOSED |
+
+## SCALAR SWEEP ROUND 2 (v43 base, ref T60 0.979941; knobs never gated at full length on this line)
+| run | change | val_bpb | vs T60 |
+|---|---|---|---|
+| S2_HLR07 / S2_HLR14 | HEAD_LR_SCALE 0.7 / 1.4 | | |
+| S2_SLR07 / S2_SLR14 | SCALAR_LR_SCALE 0.7 / 1.4 | | |
+| S2_EMA099 / S2_EMA0997 | EMA decay 0.99 / 0.997 (was 0.9933) | | |
+| S2_WU100 | WARMUP 100 (was 50) | | |
+| S2_AS008 / S2_AS0125 | ATTN_SCALE 0.08 / 0.125 (was 0.1) | | |
