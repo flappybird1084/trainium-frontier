@@ -129,6 +129,9 @@ STREAM_RESHUFFLE = _ENV("NEURON_COMPETITION_R1_STREAM_RESHUFFLE", "1") != "0"   
 MIR_FRAC = float(_ENV("NEURON_COMPETITION_R1_MIR_FRAC", "0"))     # masked-input regularization (repeat-regime.md idea 1): fraction of INPUT positions replaced by a random token (targets untouched, BOS kept); 0 = off
 MIR_ROWS = float(_ENV("NEURON_COMPETITION_R1_MIR_ROWS", "0.5"))   # fraction of rows per micro-batch that get the masking (the rest train clean); training-only, loader-side, eval path untouched
 PAR_RESID = _ENV("NEURON_COMPETITION_R1_PAR_RESID", "0") != "0"   # parallel residuals (repeat-regime.md idea 3): attn and MLP both read the block input; EAGER path only (the Trn2 layer op is sequential by construction)
+BIGRAM_REINJ = tuple(int(i) for i in _ENV("NEURON_COMPETITION_R1_BIGRAM_REINJ", "").split(",") if i.strip())   # re-add the (already gathered) bigram row into the residual at these block inputs, zero-init per-site scalars; no extra gathers/scatters
+SMEAR = _ENV("NEURON_COMPETITION_R1_SMEAR", "0") != "0"           # smear gate at the input: x_t += sigmoid(w . x_t) * x_{t-1} (zero-init w; document-safe: no smear across a BOS)
+DROP_ATTN0 = _ENV("NEURON_COMPETITION_R1_DROP_ATTN0", "0") != "0" # block 0 without attention (MLP only); pair with SMEAR to replace layer-0's local mixing
                                 # 4 (T10 packing trick, worth only -0.0013) is a post-v1 novelty; dropped for
                                 # the portal until a run of ours scores there.
 DEVICE_BATCH_SIZE = int(os.environ.get("NEURON_COMPETITION_R1_DEVICE_BATCH", "0")) or None
@@ -4240,7 +4243,7 @@ class Block(nn.Module):
 
     def forward(self, x, x0, ve, cos, sin, block_mask, dense_mask, resid_lambda, x0_lambda, ve_lambda, k_sink, v_sink,
                 sink=None, bounds=None, v0=None, vr_lambda=None, doc_dims=None, rope_tabs=None, doc_start=None, skip_mlp=False,
-                phase=None, xsa=None):
+                phase=None, xsa=None, skip_attn=False):
         if self.gdn is not None:                     # delta-rule layer: explicit torch path (compiles into the graph)
             x = resid_lambda * x + x0_lambda * x0
             x = x + self.gdn(norm(x))
@@ -4248,7 +4251,7 @@ class Block(nn.Module):
                 x = x + self.mlp(norm(x))
             return x, v0
         if (LAYER_IMPL == "op" and x.device.type == "neuron" and sink is not None and bounds is not None and rope_tabs is not None
-                and not skip_mlp and vr_lambda is None and doc_dims is None):
+                and not skip_mlp and not skip_attn and vr_lambda is None and doc_dims is None):
             b, t, D = x.shape
             T = b * t; bf16 = torch.bfloat16
             cos2d, sin2d = rope_tabs
@@ -4294,7 +4297,7 @@ class Block(nn.Module):
                     xo = xo + ho.view(b, t, D).to(xo.dtype) / P
             return xo, v0
         if (LAYER_IMPL == "chain" and x.device.type == "neuron" and not torch.compiler.is_compiling() and sink is not None
-                and bounds is not None and rope_tabs is not None and not skip_mlp and vr_lambda is None and doc_dims is None):
+                and bounds is not None and rope_tabs is not None and not skip_mlp and not skip_attn and vr_lambda is None and doc_dims is None):
             b, t, _c = x.shape
             cos2d, sin2d = rope_tabs
             cos_full = cos2d.repeat(b, 1).contiguous(); sin_full = sin2d.repeat(b, 1).contiguous()
@@ -4310,6 +4313,8 @@ class Block(nn.Module):
                                    at.c_proj._stack, at.c_proj.idx, ml.c_fc._stack, ml.c_fc.idx, ml.c_proj._stack, ml.c_proj.idx,
                                    at.n_head), v0
         x = resid_lambda * x + x0_lambda * x0
+        if skip_attn:   # DROP_ATTN0: block 0 without attention (MLP only); the input smear gate supplies the local mixing
+            return x + self._mlp_normed(x), v0
         if PAR_RESID and not skip_mlp:
             # parallel residuals: attention and MLP both read the block INPUT (half the serial chain per block); eager path only
             xin = x
@@ -4408,6 +4413,11 @@ class GPT(nn.Module):
             self.transformer["ple"] = nn.ModuleList([nn.Embedding(padded_vocab_size, config.n_embd) for _ in range(L)])
         if config.backout:
             self.backout_lambda = nn.Parameter(torch.zeros(1))
+        if BIGRAM_REINJ:
+            self.bigram_reinj = nn.Parameter(torch.zeros(len(BIGRAM_REINJ), 1))   # zero-init: identity at step 0
+        if SMEAR:
+            self.smear_w = nn.Parameter(torch.zeros(config.n_embd))              # gate = sigmoid(w.x) * smear_scale, smear_scale zero-init -> identity at step 0
+            self.smear_scale = nn.Parameter(torch.zeros(1))
         # per-step attention windows (device tensors so the compiled graph is invariant to their values)
         self.register_buffer("win_local", torch.tensor(config.window if config.window else config.sequence_len, dtype=torch.int32), persistent=False)
         self.register_buffer("win_global", torch.tensor(config.sequence_len, dtype=torch.int32), persistent=False)
@@ -4548,6 +4558,10 @@ class GPT(nn.Module):
 
     def setup_optimizer(self):
         scalar_params = [self.skip_lambdas, self.bigram_lambda, self.softcap_pos, self.softcap_neg]
+        if BIGRAM_REINJ:
+            scalar_params.append(self.bigram_reinj)
+        if SMEAR:
+            scalar_params += [self.smear_w, self.smear_scale]
         if self.config.backout:
             scalar_params.append(self.backout_lambda)
         if self.config.use_trigram:
@@ -4693,6 +4707,7 @@ class GPT(nn.Module):
         bh = bigram_bucket((pair * -1640531527) >> 13).long()
         bh2 = bigram_bucket((pair * 668265261) >> 13).long() if BIGRAM_SPLIT == 2 else None   # independent hash for table 2
 
+        bt_reinj = None
         if emb is not None:                       # EMBED=sidecar: dense rows gathered outside the graph
             emb = {k: v.clone() for k, v in emb.items()}   # (clone: inputs saved for backward must not alias outputs)
             x = emb["wte"]
@@ -4703,6 +4718,7 @@ class GPT(nn.Module):
                 if "bte_sign" in emb:
                     bt = bt * emb["bte_sign"]      # sign trick: the gradient reaching the table row carries the same sign
                 x = x + self.bigram_lambda * bt
+                bt_reinj = bt if BIGRAM_REINJ else None
             if self.config.use_trigram:
                 x = x + self.trigram_lambda * emb["tte"]
         else:
@@ -4716,6 +4732,14 @@ class GPT(nn.Module):
                 if not bigram_grad:
                     bt = bt.detach()
                 x = x + self.bigram_lambda * bt
+                bt_reinj = bt if BIGRAM_REINJ else None
+        if SMEAR:
+            # smear gate: x_t += s * sigmoid(w . x_t) * x_{t-1}; s zero-init (identity at step 0); never smears across a
+            # document start (x_{t-1} zeroed where position t is a BOS) so the doc mask stays exact
+            g = torch.sigmoid((x.float() @ self.smear_w.float()).unsqueeze(-1)) * self.smear_scale.float()
+            prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+            prev = prev.masked_fill((idx == BOS_ID).unsqueeze(-1), 0.0)
+            x = x + (g * prev.float()).to(x.dtype)
         if self.config.use_trigram and emb is None:
             # hashed (prev2, prev, cur) trigram table, own gate; same int32 mixing, different shift
             prev2 = torch.cat([torch.full_like(idx[:, :2], BOS_ID), idx[:, :-2]], dim=1)
@@ -4820,12 +4844,14 @@ class GPT(nn.Module):
                     x = x + self.skip_lambdas[i - n_dec_start] * skips.pop()
                 if self.config.ple:
                     x = x + bs["ple"][i] * self.transformer.ple[i](idx).to(COMPUTE_DTYPE)
+                if BIGRAM_REINJ and i in BIGRAM_REINJ:   # bigram re-injection: the same gathered row, zero-init per-site scalar, no new gather
+                    x = x + self.bigram_reinj[BIGRAM_REINJ.index(i)] * bt_reinj
                 ve_i = ve1 if i < t1 else (ve_mid if i < t2 else ve2)
                 local = bool(self.config.window) and (i % 2 == 1)
                 dm = dense_mask_local if (local and dense_mask is not None) else dense_mask
                 bd = (bounds_l if local else bounds) if bounds is not None else None
                 vr = bs["vr"][i] if self.config.value_resid else None
-                extra = dict(doc_start=doc_start, skip_mlp=(DROP_MLP0 and i == 0), phase=(self.phase if self.use_phase else None),
+                extra = dict(doc_start=doc_start, skip_mlp=(DROP_MLP0 and i == 0), skip_attn=(DROP_ATTN0 and i == 0), phase=(self.phase if self.use_phase else None),
                              xsa=(bs["xsa"][i] if "xsa" in bs else None))
                 if logit_sink:
                     x, v0 = block(x, x0, ve_i, cos, sin, block_mask, dm,

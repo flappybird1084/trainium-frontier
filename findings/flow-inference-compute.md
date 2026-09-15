@@ -354,3 +354,17 @@ Three paired gates of embed LR x4.5 on the PACK=4 base: 0.980139, 0.980029, 0.97
 -0.0013, three bands. Cumulative since v40: 0.985161 -> 0.979941 = -0.0052, both gains from the data/scalar axis at zero
 step cost. Portal expectation ~0.9865. Everything else gated on the PACK=4 base this cycle was flat or worse: WARMDOWN
 0.7/0.8, MATRIX_LR 0.55/0.85, EMA blend 0.5, EMA start 0.75 (flat); WD 0.2/0.3, MIR 0.05/0.10/0.15, embed LR 3.5/8 (worse).
+
+## User ideas (2026-09-15): bigram re-injection, smear + drop layer-0 attention
+- **Bigram re-injection** (`BIGRAM_REINJ`, the gathered bigram row re-added at 2 or 4 block inputs via zero-init scalars;
+  zero extra gathers/scatters): local fixed-step -0.0019 (x2) / -0.0023 (x4) vs 1.188775, but full gates on the v43 base
+  **0.980789 (x2) / 0.981184 (x4) vs T60 0.979941 = +0.0008 / +0.0012**. Another short-horizon gain that inverts at 1800 s
+  (like the 600 s LR wins, MIR-free regularizers). Closed.
+- **Smear + drop layer-0 attention** (`SMEAR`, `DROP_ATTN0`): step time 0.53 s = no gain (one of twelve attentions is < 1% of
+  the step; the smear gate's host elementwise work cancels it). 600 s 1.053269; full gate G_SMEARDROP pending.
+- **Smear + drop layer-0 attention full gate: 0.983132 vs 0.979941 (+0.0032)** at the same step time. Closed: the step-time
+  premise fails (one attention of twelve is < 1% of the step) and layer-0 attention is worth ~0.003-0.01 that the smear gate
+  cannot replace. Smear alone (B22, local) pending as a footnote.
+- **PACK=8 (2026-09-15):** the A_PACK8 step-0 crash was the intermittent OOB flake, not PACK=8 (host plans valid; torch-sidecar
+  and NKI-sidecar 300 s runs both clean; full gate clean). Full gate on the v43 base: **0.980043 vs 0.979941 = wash**. The
+  packing curve is flat from PACK=4 on; v43 (PACK=4) stays. Smear alone: +0.0022 locally.
