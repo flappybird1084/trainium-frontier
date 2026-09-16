@@ -126,11 +126,19 @@ MLP_RATIO = int(_ENV("NEURON_COMPETITION_R1_MLP_RATIO", "4"))
 PACK = int(_ENV("NEURON_COMPETITION_R1_PACK", "1"))   # v7: 1 = the baseline loader shape (rows of SEQ_LEN).
 PACK_MODE = _ENV("NEURON_COMPETITION_R1_PACK_MODE", "bestfit")   # bestfit = the provided best-fit packer (PACK-long rows reshaped) | stream = eval-style stream-cut rows (2026-09-14)
 STREAM_RESHUFFLE = _ENV("NEURON_COMPETITION_R1_STREAM_RESHUFFLE", "1") != "0"
-PACK_ROLL = float(_ENV("NEURON_COMPETITION_R1_PACK_ROLL", "0"))   # compile-window-and-packing B6: fraction of the PACK-long packed rows rolled by a random
+PACK_ROLL = float(_ENV("NEURON_COMPETITION_R1_PACK_ROLL", "0"))
+PACK_ROLL_EP2 = _ENV("NEURON_COMPETITION_R1_PACK_ROLL_EP2", "0") != "0"   # B7: roll only from the second pass on (re-cut rows instead of replaying identical ones)   # compile-window-and-packing B6: fraction of the PACK-long packed rows rolled by a random
                                                                     # offset before the reshape -> every sub-row starts mid-document (PACK=4 default: 75%)
 BFD_BUFFER = int(_ENV("NEURON_COMPETITION_R1_BFD_BUFFER", "4096"))  # PACK_MODE=bfd (B1): documents per packing round (the provided packer scans 512 online)
 BFD_LONG = _ENV("NEURON_COMPETITION_R1_BFD_LONG", "split")          # bfd: documents longer than a row -> split = whole rows + a remainder doc (B5) | drop = provided behaviour
-BFD_MAX_OPEN = int(_ENV("NEURON_COMPETITION_R1_BFD_MAX_OPEN", "512"))  # bfd: open (partially filled) rows carried across rounds before the fullest is closed by truncation   # stream mode: seeded row-group permutation on epoch >= 2
+BFD_MAX_OPEN = int(_ENV("NEURON_COMPETITION_R1_BFD_MAX_OPEN", "512"))
+PACK_MAXDOC = int(_ENV("NEURON_COMPETITION_R1_PACK_MAXDOC", "0"))   # >0: drop training documents longer than this many tokens (incl. BOS) before packing.
+                                                                    # P_BFD (2026-09-16) lost by training on the long-document tails the provided packer drops.  # bfd: open (partially filled) rows carried across rounds before the fullest is closed by truncation   # stream mode: seeded row-group permutation on epoch >= 2
+PLAN_POISON = _ENV("NEURON_COMPETITION_R1_PLAN_POISON", "0") != "0"     # lever E, H1 test: overwrite the host plan buffer right after its upload;
+                                                                          # a lazy H2D copy then reads garbage -> deterministic OOB death at step 0
+PLAN_KEEP_HOST = int(_ENV("NEURON_COMPETITION_R1_PLAN_KEEP_HOST", "0"))  # lever E, H1 fix: keep the last N host plan buffers alive after upload (0 = off)
+EMBED_KERNEL = _ENV("NEURON_COMPETITION_R1_EMBED_KERNEL", "v1")         # lever E: v2 = index tiles clamped through a compute op before the indirect DMA (nki/nki_embed_v2.py)
+OPT_SHARD_PAD = _ENV("NEURON_COMPETITION_R1_OPT_SHARD_PAD", "0") != "0"   # ZeRO: also shard Muon stacks whose n is not a multiple of the world (n=12 over 8 workers -> padded to 16, 2 per worker, ranks 6-7 idle) instead of replicating their Muon on every rank
 MIR_FRAC = float(_ENV("NEURON_COMPETITION_R1_MIR_FRAC", "0"))     # masked-input regularization (repeat-regime.md idea 1): fraction of INPUT positions replaced by a random token (targets untouched, BOS kept); 0 = off
 MIR_ROWS = float(_ENV("NEURON_COMPETITION_R1_MIR_ROWS", "0.5"))   # fraction of rows per micro-batch that get the masking (the rest train clean); training-only, loader-side, eval path untouched
 PAR_RESID = _ENV("NEURON_COMPETITION_R1_PAR_RESID", "0") != "0"   # parallel residuals (repeat-regime.md idea 3): attn and MLP both read the block input; EAGER path only (the Trn2 layer op is sequential by construction)
@@ -230,6 +238,7 @@ FLOW_STARTS = int(_ENV("NEURON_COMPETITION_R1_FLOW_STARTS", "1"))         # mult
 FLOW_ADAPT = float(_ENV("NEURON_COMPETITION_R1_FLOW_ADAPT", "0.0"))       # >0: eval spends max steps only where draft entropy exceeds this fraction of max; unused in training
 FLOW_TRAIN_HOPS = int(_ENV("NEURON_COMPETITION_R1_FLOW_TRAIN_HOPS", "1")) # Trn2 compiled path: FIXED extra attention hops per block in training (one graph, no .item()); eval uses FLOW_STEPS (max)
 FLOW_HOP_EVERY = int(_ENV("NEURON_COMPETITION_R1_FLOW_HOP_EVERY", "1"))   # multi-hop only on blocks with layer_idx % N == 0 (2 = every other block: halves hop overhead)
+FLOW_HOP_KV = _ENV("NEURON_COMPETITION_R1_FLOW_HOP_KV", "0") != "0"   # plan-097 lever D (eager semantics test): the hop reuses the main read's K/V (post rope/norm/offset) and recomputes only Q
 FLOW_TRAIN_FIXED = _ENV("NEURON_COMPETITION_R1_FLOW_TRAIN_FIXED", "0") != "0"   # eager path: train with exactly FLOW_TRAIN_HOPS hops (like the Trn2 op path) instead of sampling 1..FLOW_STEPS
 FLOW_HOP_CHECK = _ENV("NEURON_COMPETITION_R1_FLOW_HOP_CHECK", "0") != "0"       # Trn2 diagnostic (eager, COMPILE=0): print fused hop op vs eager hop max|diff| once the weights have trained
 _HOP_CHECKS = [606]                                                             # countdown of hop calls: skip 600 (~100 steps at 6 hops/step), then check 6 (out-proj is zero-init at step 0)
@@ -335,6 +344,10 @@ FINAL_LR_FRAC = _F("NEURON_COMPETITION_R1_FINAL_LR", "0.02")        # ...to 2% o
 WINDOW = int(_ENV("NEURON_COMPETITION_R1_WINDOW", "0"))                 # long-short attention: odd layers see only the last WINDOW keys (0 = off)
 WINDOW_WARMUP = _F("NEURON_COMPETITION_R1_WINDOW_WARMUP", "0")           # fraction of the time budget over which ALL windows grow from 128 to their target
 MTP_WEIGHT = _F("NEURON_COMPETITION_R1_MTP", "0")                        # multi-token prediction aux loss weight (t+2 head), 0 = off
+TOP_ALPHA = _F("NEURON_COMPETITION_R1_TOP", "0")                          # ideas-2026-09-16 #5: Token-Order-Prediction aux head weight (0 = off; paper: equal weighting)
+TOP_WINDOW = int(_ENV("NEURON_COMPETITION_R1_TOP_WINDOW", "128"))         # TOP: future window W (tokens at distance 1..W get score W-d, softmax = ListNet target)
+TOP_TEMP = _F("NEURON_COMPETITION_R1_TOP_TEMP", "1.0")                    # TOP: target softmax temperature (1 = the paper's exp(-d))
+TOP_CHUNK = int(_ENV("NEURON_COMPETITION_R1_TOP_CHUNK", "2048"))          # TOP: rows per logits chunk (bounds the (rows, V) fp32 transient)
 VALUE_RESID = _ENV("NEURON_COMPETITION_R1_VALUE_RESID", "0") != "0"      # blend layer-0 V into every layer's V (learned per-layer lambda, zero-init)
 BACKOUT = _ENV("NEURON_COMPETITION_R1_BACKOUT", "0") != "0"              # x_final -= lambda * x_mid (learned, zero-init)
 MERGED_QKV = _ENV("NEURON_COMPETITION_R1_MERGED_QKV", "0") != "0"        # one (3*n_embd, n_embd) projection instead of q/k/v
@@ -706,6 +719,49 @@ if NKI_AVAILABLE:
             rows = nl.ndarray((_NKI_P, C), dtype=nl.float32, buffer=nl.sbuf)
             nisa.dma_copy(dst=rows, src=grad.ap(pattern=[[C, _NKI_P], [1, C]], vector_offset=pm, indirect_dim=0))
             tgt = table.ap(pattern=[[C, _NKI_P], [1, C]], vector_offset=ix, indirect_dim=0)
+            nisa.dma_compute(dst=tgt, srcs=[tgt, rows], reduce_op=nl.add)
+        nisa.dma_copy(dst=out, src=table[0:1, :])
+        return out
+
+    @nki.jit
+    def embed_gather_v2(table: nl.ndarray, idx: nl.ndarray):
+        """embed_gather with every index tile clamped to R-1 through a compute op before it drives the indirect DMA
+        (lever E hardening: a stray index reads the last row instead of faulting; the DGE now waits on the index DMA
+        through a real data dependence). Dev copy: nki/nki_embed_v2.py."""
+        N = idx.shape[0]
+        R = table.shape[0]
+        C = table.shape[1]
+        out = nl.ndarray((N, C), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+        for t in nl.affine_range(N // _NKI_P):
+            ix = nl.ndarray((_NKI_P, 1), dtype=nl.uint32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=ix, src=idx[t * _NKI_P:(t + 1) * _NKI_P, :])
+            ixc = nl.ndarray((_NKI_P, 1), dtype=nl.uint32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=ixc, data=ix, op0=nl.minimum, operand0=R - 1)
+            rows = nl.ndarray((_NKI_P, C), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=rows, src=table.ap(pattern=[[C, _NKI_P], [1, C]], vector_offset=ixc, indirect_dim=0))
+            nisa.dma_copy(dst=out[t * _NKI_P:(t + 1) * _NKI_P, :], src=rows)
+        return out
+
+    @nki.jit
+    def embed_scatter_add_v2(table: nl.ndarray, grad: nl.ndarray, perm: nl.ndarray, idx: nl.ndarray):
+        """embed_scatter_add with perm clamped to N-1 and idx clamped to Rp-1 (the padding tail) through compute ops."""
+        S = idx.shape[0]
+        Rp = table.shape[0]
+        N = grad.shape[0]
+        C = table.shape[1]
+        out = nl.ndarray((1, C), dtype=table.dtype, buffer=nl.shared_hbm)
+        for t in nl.sequential_range(S // _NKI_P):
+            pm = nl.ndarray((_NKI_P, 1), dtype=nl.uint32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=pm, src=perm[t * _NKI_P:(t + 1) * _NKI_P, :])
+            pmc = nl.ndarray((_NKI_P, 1), dtype=nl.uint32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=pmc, data=pm, op0=nl.minimum, operand0=N - 1)
+            ix = nl.ndarray((_NKI_P, 1), dtype=nl.uint32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=ix, src=idx[t * _NKI_P:(t + 1) * _NKI_P, :])
+            ixc = nl.ndarray((_NKI_P, 1), dtype=nl.uint32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=ixc, data=ix, op0=nl.minimum, operand0=Rp - 1)
+            rows = nl.ndarray((_NKI_P, C), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=rows, src=grad.ap(pattern=[[C, _NKI_P], [1, C]], vector_offset=pmc, indirect_dim=0))
+            tgt = table.ap(pattern=[[C, _NKI_P], [1, C]], vector_offset=ixc, indirect_dim=0)
             nisa.dma_compute(dst=tgt, srcs=[tgt, rows], reduce_op=nl.add)
         nisa.dma_copy(dst=out, src=table[0:1, :])
         return out
@@ -3451,6 +3507,11 @@ class CausalSelfAttention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+        if FLOW_HOP_KV:
+            if hop:
+                k, v = self._hop_kv          # K/V of the main read (grad flows into its projections); only Q is fresh
+            else:
+                self._hop_kv = (k, v)
         if sink is not None:
             # sink-logit mode: no registers; one learned logit per head in the softmax denominator only
             scale = ATTN_SCALE if ATTN_SCALE > 0 else 1.0 / math.sqrt(self.qk_dim)
@@ -4481,6 +4542,9 @@ class GPT(nn.Module):
             torch.nn.init.normal_(self.transformer.tte.weight, mean=0.0, std=0.8)
             self.trigram_lambda.fill_(0.2)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        if TOP_ALPHA > 0:   # TOP head: a second unembedding trained only by the ranking loss, dropped at eval (not saved)
+            self.top_head = nn.Parameter(torch.empty(self.lm_head.weight.shape[0], self.lm_head.weight.shape[1]))
+            torch.nn.init.normal_(self.top_head, mean=0.0, std=0.001)
         s = math.sqrt(3.0) * self.config.n_embd**-0.5
         for block in self.transformer.h:   # .weight is a slice view of the shared stack; in-place under no_grad
             if self.config.merged_qkv:
@@ -4620,7 +4684,7 @@ class GPT(nn.Module):
             embedding_params += list(self.transformer.tte.parameters())
         if self.config.ple:
             embedding_params += list(self.transformer.ple.parameters())
-        lm_head_params = list(self.lm_head.parameters())
+        lm_head_params = list(self.lm_head.parameters()) + ([self.top_head] if TOP_ALPHA > 0 else [])
         dmodel_lr_scale = (self.config.n_embd / 768) ** -0.5
         param_groups = [
             dict(kind="adamw", params=embedding_params, lr=EMBEDDING_LR * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
@@ -4711,6 +4775,35 @@ class GPT(nn.Module):
         target_v = l1 - l0                                      # straight-line (constant) velocity
         pred_v = self._flow_lg_vel(lt, self.flow_lg_H(h.float()), tt)
         return ((pred_v - target_v) ** 2).mean()
+
+    def _top_loss(self, x_pre, idx, targets):
+        """Token Order Prediction (arXiv 2508.19228): a ListNet loss on a second unembedding: target(t) = softmax over the tokens in
+        the next TOP_WINDOW positions of (W - d)/temp (d = distance; duplicates keep every occurrence), prediction = softmax of the
+        TOP head's logits. Future positions outside the current document (BOS-cumsum ids) or past the row end are masked. Built
+        entirely in-graph from the input ids (no host work); chunked over rows so the (rows, V) fp32 logits stay small."""
+        b, t, D = x_pre.shape
+        W = TOP_WINDOW
+        h = norm(x_pre).reshape(b * t, D).to(torch.bfloat16)
+        wT = self.top_head.to(torch.bfloat16).t()
+        tp = F.pad(targets, (0, W), value=-1)                                   # targets[t + j] = idx[t + 1 + j] -> distance d = j + 1
+        fut = tp.unfold(1, W, 1)[:, :t, :]                                       # (b, t, W)
+        doc = torch.cumsum((idx == BOS_ID).to(torch.int32), dim=1)               # document id per position
+        fdoc = F.pad(doc, (0, W), value=-1)[:, 1:].unfold(1, W, 1)[:, :t, :]     # document id at position t + d
+        mask = (fdoc == doc.unsqueeze(-1)) & (fut != -1)
+        wts = torch.exp(-(torch.arange(1, W + 1, device=x_pre.device, dtype=torch.float32)) / TOP_TEMP).view(1, 1, W)
+        pw = wts * mask.to(torch.float32)
+        valid = mask.any(-1).to(torch.float32)                                   # positions with at least one in-document future token
+        pw = pw / pw.sum(-1, keepdim=True).clamp_min(1e-20)
+        fut = fut.clamp_min(0).reshape(b * t, W)
+        pw = pw.reshape(b * t, W); valid = valid.reshape(b * t)
+        V = self.config.vocab_size
+        total = torch.zeros((), device=x_pre.device, dtype=torch.float32)
+        for r0 in range(0, b * t, TOP_CHUNK):
+            lg = (h[r0:r0 + TOP_CHUNK] @ wT).float()[:, :V]
+            lse = torch.logsumexp(lg, dim=-1)
+            g = lg.gather(1, fut[r0:r0 + TOP_CHUNK])
+            total = total + (valid[r0:r0 + TOP_CHUNK] * lse - (pw[r0:r0 + TOP_CHUNK] * g).sum(-1)).sum()
+        return total / valid.sum().clamp_min(1.0)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None, loss_reduction: str = "mean", emb=None,
                 bigram_grad: bool = True, bounds_in=None):
@@ -4928,7 +5021,10 @@ class GPT(nn.Module):
                                 torch.zeros((), device=x.device), torch.zeros((), device=x.device)]).float().view(1, 4).expand(128, 4).contiguous()
             loss_rows, _lse, _h, _rstd = torch.ops.tf_nki.head_fwd(x2, wT, tgt, scal)
             valid = targets.reshape(-1) != -1
-            return loss_rows.sum() / valid.sum().clamp_min(1).float()
+            loss = loss_rows.sum() / valid.sum().clamp_min(1).float()
+            if TOP_ALPHA > 0 and self.training:
+                loss = loss + TOP_ALPHA * self._top_loss(x_pre, idx, targets)
+            return loss
         if HEAD_IMPL == "nki2" and _HEAD2_OPS is not None and x.device.type == "neuron" and x.shape[1] % 128 == 0:
             # Trainium (training and eval alike): norm + lm_head + softcap as one kernel, logits returned; same math as below
             b, t, D = x.shape
@@ -4975,6 +5071,8 @@ class GPT(nn.Module):
                 loss = loss + MTP_WEIGHT * (nll2.sum() / valid2.sum().clamp_min(1).to(nll2.dtype))
             if flow_aux is not None:
                 loss = loss + FLOW_AUX * flow_aux
+            if TOP_ALPHA > 0 and self.training:
+                loss = loss + TOP_ALPHA * self._top_loss(x_pre, idx, targets)
             return loss
         loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
@@ -5057,7 +5155,10 @@ def build_nki_embed():
         if not NKI_AVAILABLE:
             raise RuntimeError("NKI is not available on this device")
         from torch_neuronx.nki_hop import wrap_nki
-        _NKI_EMBED = (wrap_nki(embed_gather), wrap_nki(embed_scatter_add))
+        if EMBED_KERNEL == "v2":
+            _NKI_EMBED = (wrap_nki(embed_gather_v2), wrap_nki(embed_scatter_add_v2))
+        else:
+            _NKI_EMBED = (wrap_nki(embed_gather), wrap_nki(embed_scatter_add))
     return _NKI_EMBED
 
 
@@ -5185,6 +5286,12 @@ class EmbedSidecar:
                 parts.append(perm.reshape(-1)); parts.append(np.where(sidx < 0, R - 1 - sidx, sidx))   # padding -> R + j
             buf = np.concatenate(parts).astype(np.uint32).reshape(-1, 1)
             dbuf = torch.from_numpy(buf).to(dev)
+            if PLAN_POISON:
+                buf.fill(0xFFFFFFFF)          # the device must already hold the real values; if the copy was lazy this kills the run
+            if PLAN_KEEP_HOST > 0:
+                if not hasattr(self, "_host_keep"):
+                    self._host_keep = []
+                self._host_keep.append(buf); del self._host_keep[:-PLAN_KEEP_HOST]
             n = len(ind); off = n; views = []
             for perm, sidx in chunks:
                 S = perm.shape[0]
@@ -5308,6 +5415,15 @@ class MuonAdamW(torch.optim.Optimizer):
             for p in group["params"]:
                 n = p.shape[0]
                 if n % world_size != 0:
+                    if not (OPT_SHARD_PAD and group["kind"] == "muon" and p.dim() == 3):
+                        continue
+                    per = -(-n // world_size)                      # padded plan: the last ranks may own fewer (or zero) matrices
+                    lo, hi = min(n, rank * per), min(n, (rank + 1) * per)
+                    gpad = torch.zeros((per,) + tuple(p.shape[1:]), dtype=p.dtype, device=p.device)
+                    pshard = p.data[lo:hi].clone()
+                    pshard.grad = gpad[:hi - lo]
+                    self.plan[p] = dict(lo=lo, hi=hi, pshard=pshard, gshard=gpad[:hi - lo], gpad=gpad, per=per, npad=per * world_size,
+                                        n=n, group=group, pad=True, active=hi > lo)
                     continue
                 per = n // world_size
                 if group["kind"] == "adamw" and (p.dim() != 2 or per % 256 != 0):
@@ -5325,7 +5441,7 @@ class MuonAdamW(torch.optim.Optimizer):
             # rank-major flat layout: row r of the (world, S) buffer = the concatenation of every planned param's chunk r,
             # so one reduce_scatter_tensor hands each rank exactly its shards (views into flat_g) and one
             # all_gather_into_tensor of the shards rebuilds every full param with one strided copy each
-            params = list(self.plan.keys())
+            params = [p for p in self.plan if not self.plan[p].get("pad")]
             dev = params[0].device
             sizes = [self.plan[p]["pshard"].numel() for p in params]
             S = sum(sizes)
@@ -5371,6 +5487,13 @@ class MuonAdamW(torch.optim.Optimizer):
                     self.plan[p]["active"] = False      # no gradient this step (BIGRAM_EVERY): no update, no gather
                 continue
             plan = self.plan.get(p)
+            if plan is not None and plan.get("pad"):
+                zpad = plan.get("zpad")
+                if zpad is None:
+                    zpad = plan["zpad"] = torch.zeros((plan["npad"] - plan["n"],) + tuple(p.shape[1:]), dtype=p.grad.dtype, device=p.device)
+                dist.reduce_scatter_tensor(plan["gpad"], torch.cat([p.grad, zpad]), op=dist.ReduceOp.AVG)
+                plan["active"] = plan["hi"] > plan["lo"]          # ranks past the end own nothing this step (and every step)
+                continue
             if plan is not None:
                 try:
                     if GRAD_BF16:
@@ -5401,6 +5524,16 @@ class MuonAdamW(torch.optim.Optimizer):
                 p.data.view(ws, -1).copy_(flat["full"][:, off:off + n])
             return
         for p, plan in self.plan.items():
+            if plan.get("pad"):
+                spad = plan.get("spad")
+                if spad is None:
+                    spad = plan["spad"] = torch.zeros((plan["per"],) + tuple(p.shape[1:]), dtype=torch.bfloat16, device=p.device)
+                    plan["fpad"] = torch.empty((plan["npad"],) + tuple(p.shape[1:]), dtype=torch.bfloat16, device=p.device)
+                if plan["hi"] > plan["lo"]:
+                    spad[:plan["hi"] - plan["lo"]].copy_(plan["pshard"])
+                dist.all_gather_into_tensor(plan["fpad"], spad)   # every rank takes part (ranks with no matrices send zeros)
+                p.data.copy_(plan["fpad"][:plan["n"]])
+                continue
             if plan.get("active", True):
                 if GRAD_BF16 or GATHER_BF16:      # the graph casts weights to bf16 anyway: gathering the bf16 rounding is numerically the same
                     p16 = plan.get("p16")
@@ -5717,7 +5850,7 @@ def sync_gradients(model: nn.Module, optimizer=None) -> None:
 def save_checkpoint(path: Path, model: GPT, meta: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "model_state": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+        "model_state": {k: v.detach().cpu() for k, v in model.state_dict().items() if not k.startswith("top_head")},   # TOP head is training-only
         "model_config": asdict(model.config),
         "meta": meta,
     }
@@ -6017,6 +6150,18 @@ def main() -> None:
         print0(f"PACK_MODE=bfd: best-fit-decreasing rows of {SEQ_LEN * PACK + 1} (buffer {BFD_BUFFER} docs, long docs: {BFD_LONG}, max open {BFD_MAX_OPEN})")
     elif PACK_MODE == "stream":
         _raw_loader = _stream_loader(DEVICE_BATCH_SIZE, SEQ_LEN, "train", loader_dev)
+    elif PACK_MAXDOC > 0:
+        class _MaxDocTokenizer:
+            # the provided packer only sees the tokenizer through encode()/get_bos_token_id(): drop over-length documents here
+            def __init__(self, inner): self._inner = inner; self.dropped = 0; self.seen = 0
+            def get_bos_token_id(self): return self._inner.get_bos_token_id()
+            def encode(self, texts, **kw):
+                out = [t for t in self._inner.encode(texts, **kw) if len(t) <= PACK_MAXDOC]
+                self.seen += len(texts); self.dropped += len(texts) - len(out)
+                if self.seen % 12800 < len(texts):
+                    print0(f"PACK_MAXDOC={PACK_MAXDOC}: dropped {self.dropped}/{self.seen} documents so far")
+                return out
+        _raw_loader = make_dataloader(_MaxDocTokenizer(tokenizer), DEVICE_BATCH_SIZE // PACK, SEQ_LEN * PACK, "train", loader_dev)
         print0(f"PACK_MODE=stream: eval-style stream-cut training rows (reshuffle epoch>=2: {STREAM_RESHUFFLE})")
     else:
         _raw_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE // PACK, SEQ_LEN * PACK, "train", loader_dev)
@@ -6037,7 +6182,7 @@ def main() -> None:
                 _x, _y, _st = next(src)
             st = dict(_st)
             st["epoch"] = _st.get("epoch", 1) + epoch_offset
-            if PACK_ROLL > 0 and PACK > 1:
+            if PACK_ROLL > 0 and PACK > 1 and (not PACK_ROLL_EP2 or st["epoch"] >= 2):
                 # B6: roll a PACK_ROLL fraction of the packed rows by a random offset before the reshape. Targets are the
                 # inputs shifted by one inside the packed row, so rolling x and y by the same offset keeps every (input,
                 # target) pair; the row then starts mid-document (like 99.9% of eval rows) and the document that spans the

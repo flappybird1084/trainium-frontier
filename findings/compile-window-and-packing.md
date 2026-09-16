@@ -9,6 +9,10 @@
 >   not binding at ~500 s). A8 (n-gram init): the unigram/bigram prior is learned in the first ~50 of 3400 steps, so the
 >   ceiling is ~1% of training; parked. Note also `findings/ema-cold-start-bug.md`: the step-0 clock inside the window
 >   was silently corrupting short screens until today.
+> - **Theme B RESULTS (all full 1800 s gates vs v43 0.98004):** P_BFD **+0.0025** (100% coverage loses: the long-document tails and cut
+>   remnants the provided packer drops are worth dropping; plus -2.3% steps from burst tokenization), P_ROLL **+0.0006** (all rows
+>   mid-document: not a lever), P_MAXDOC4097 +0.0004 (wash), P_MAXDOC2048 **+0.0033** (long documents are valuable). The provided
+>   best-fit packer at PACK=4 is the optimum of everything tried. B7 (re-cut the second pass, P_ROLL_EP2) +0.0003 = wash. Nothing on this axis is left.
 > - **Theme B implemented as vehicle knobs (default off) and gated:** `PACK_MODE=bfd` (B1 + B5: best-fit-decreasing over
 >   4096-document rounds, open rows carried across rounds, over-length docs split into whole rows, overflow closes keep
 >   the remainder -> 100% token coverage, ~94% of documents placed whole, no truncation loss; local smoke clean) =
@@ -93,7 +97,7 @@ compiled **before boundary 5**. A shape change later in the run is charged again
 
 ### A6. Precompute tokenizer-derived tables (free enablers)
 All of these are pure functions of the provided tokenizer, cost seconds, and each unlocks an idea from
-`wild-ideas-2026-09-15.md` that is otherwise priced with its preprocessing:
+`ideas.md` (byte-aware family, §2b) that is otherwise priced with its preprocessing:
 byte-length vector (enables exact-bpb reweighting), token->first-byte map (byte-marginal CE), BPE-impossible
 prev->next mask (canonical token masking), byte-trie / merge-rank structures, frequency-class assignment.
 

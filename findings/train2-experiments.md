@@ -103,7 +103,7 @@ Baseline L0 = 1.1260 @ 5138 steps / 720 s (idle 4080S ~1.35x the 3090; never com
   to respend on width/tables; also a Phase-2 KV-cache saver.
 - **DeepSeek-engram-style n-gram memory** (E31) — multi-order hashed tables with per-order learned gates, injected at a
   middle layer rather than only at the input. Full port +0.0127 at 420 steps; the distilled form (multi-head hashing — see
-  `external-techniques.md`) is untried on Trn2.
+  `ideas.md`, DeepSeek Engram) is untried on Trn2.
 - **Kimi/MoBA block-sparse attention** (E32) — queries route to top-k KV blocks via mean-pooled block keys (gated); at seq
   1024 (8 blocks of 128) the long-context efficiency motive mostly vanishes, so this tests whether the routing prior
   itself helps loss.

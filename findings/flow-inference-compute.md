@@ -384,7 +384,7 @@ step cost. Portal expectation ~0.9865. Everything else gated on the PACK=4 base 
 - **#1 prefix-token aux loss:** with the fused head it needs a second target gather inside head_fwd/head_bwd (a kernel edit)
   to be free; the speedrun claim is -15 steps of ~1500 (~1%) = ~0.0003 bpb here, below the 0.0004 band. Not pursued.
 
-## wild-ideas-2026-09-15.md - Tier 0 checks (no training run)
+## Tier 0 checks (from ideas.md §2a) - no training run
 - **0.1 batched Muon: already done.** The Muon kernel takes the whole (n, out, in) stack in one launch (LNC-sharded over
   the stack index) since the v9 "stacked params" change. Rationale (b), JOINT orthogonalization of the concatenated
   (12*d, d) matrix, is a different optimizer (changes update semantics) and would need a gate; not free.

@@ -153,7 +153,7 @@ plausible). **Zero extra forward cost - we are reading a log, not running a teac
 `engine-profile-v36.md`: every engine at 30-60%, MFU 17-19%, dependency-bound. **FLOPs are free; serial depth is
 expensive.** Every architecture change we have tried adds depth (serial) rather than branches (parallel).
 
-`arch-backlog-speedrun.md` #5 already says it and it was never run: *"Parallel residuals - discarded on loss at
+`ideas.md` (former arch-backlog #5) already said it: *"Parallel residuals - discarded on loss at
 fixed-time at width 256 on GPU, but it halves the serial dependency chain per block, which is what a launch-bound
 device pays for. **Re-test as a step-time experiment, not a loss one.**"* The verdict that killed it was measured
 on a machine that was not dependency-bound - the same re-test rule that flipped depth-12 (four sign changes) and
