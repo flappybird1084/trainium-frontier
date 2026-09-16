@@ -13,7 +13,7 @@
   faster step or a different training regime. This plan is about 0.97 local, and even that needs most levers to land.
 
 ## Exhausted - do not re-litigate (each with its number)
-compiler flags (9 configs, all 0.52-0.53 s; -O3 and any NEURON_CC_FLAGS corrupt eval); width 640 (lost 4x, +28% step;
+compiler flags (9 configs, all 0.52-0.53 s; the 'corrupt eval' was the cold-start EMA bug, see ema-cold-start-bug.md); width 640 (lost 4x, +28% step;
 kernels cap D at 512); depth 14 (OOB flake, 2 deaths); fp8 (~1%); comm flattening (worse) and async reduce-scatter (no
 gain, grad_sync 43 ms); own attention with strided DMAs (NaN in-model, rule #11); multi-hop attention at fixed time
 (+0.0074 at the gate; -0.008 at fixed steps); prehead denoise (+0.006); output-side logit flows, stack recurrence, latent
@@ -47,4 +47,4 @@ Best case if everything lands: ~-0.017 -> ~0.968. Realistic (A + half of C + one
 - Anything touching LR/schedule: **gates only** (1800 s). One change per gate. Reference every ~4-8 runs.
 - Judge only by eval bpb: training loss lies for anything with train/eval asymmetry (hops, EMA).
 - Never ship the vehicle while a queue has unlaunched lines; never run `prepare.py eval-public` standalone on the box.
-- A compiler flag or -O3 can corrupt eval silently; the harness cannot catch it. Stay at the default optimization level.
+- ~~A compiler flag or -O3 can corrupt eval silently~~ (retracted 2026-09-16: cold-start EMA bug). A cold screen shorter than compile/EMA_START is invalid without the step-0 elapsed_frac guard.

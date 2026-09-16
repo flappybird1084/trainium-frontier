@@ -194,8 +194,23 @@ NEURON_CC_FLAGS setting corrupt the eval-mode graph (~1.12 vs 1.053) while train
 ## SCALAR SWEEP ROUND 2 (v43 base, ref T60 0.979941; knobs never gated at full length on this line)
 | run | change | val_bpb | vs T60 |
 |---|---|---|---|
-| S2_HLR07 / S2_HLR14 | HEAD_LR_SCALE 0.7 / 1.4 | | |
-| S2_SLR07 / S2_SLR14 | SCALAR_LR_SCALE 0.7 / 1.4 | | |
-| S2_EMA099 / S2_EMA0997 | EMA decay 0.99 / 0.997 (was 0.9933) | | |
-| S2_WU100 | WARMUP 100 (was 50) | | |
-| S2_AS008 / S2_AS0125 | ATTN_SCALE 0.08 / 0.125 (was 0.1) | | |
+| S2_HLR07 / S2_HLR14 | HEAD_LR_SCALE 0.7 / 1.4 | 0.981040 / 0.981304 | +0.0011 / +0.0014: the current head LR is at the optimum (both sides worse) |
+| S2_SLR07 / S2_SLR14 | SCALAR_LR_SCALE 0.7 / 1.4 | 0.980448 / 0.985438 | +0.0005 / +0.0055: the scalar LR is at or just below its optimum; raising it hurts a lot |
+| S2_EMA099 | EMA decay 0.99 (was 0.9933) | 0.980245 | +0.0003: wash (0.997 running) |
+| S2_EMA0997 / S2_EMA0997b | EMA decay 0.997 (horizon ~330 steps) | 0.979383 / 0.979732 | **-0.0005 (pair mean vs v43 triple mean)**: both below every base sample; v44 candidate |
+| S2_EMA09985 | EMA decay 0.9985 (horizon ~670 steps = the whole tail window) | 0.979683 | same as the 0.997 pair: plateau; v44 keeps 0.997 |
+| **T61_gate_v44** | clean v44 = v43 + EMA 0.997 + step-0 clock guard (sha d0438814dade7e50) | **0.979132** | -0.0008 vs v43 (0.979941); causality passed; PROMOTED to submit/train.py |
+| S2_WU100 | WARMUP 100 (was 50) | 0.982003 | +0.0021: loses; warmup 50 stays |
+| S2_AS008 / S2_AS0125 | ATTN_SCALE 0.08 / 0.125 (was 0.1) | 0.982456 / 0.979996 | +0.0025 / +0.0001: 0.1 is on the plateau |
+| I_SYNC1 / I_SYNC4 / I_SYNC8 (+I_SYNC1b warm 1.1216) | host-device sync every 1 / 4 / 8 steps (300 s) | 562 / 564 / 560 steps | no throughput gain: syncs are off the critical path; sync batching CLOSED. I_SYNC1's 1.2605 was the cold-start EMA bug (findings/ema-cold-start-bug.md), not a result |
+| (bug) | tail-EMA started at step 0 on cold short screens | - | root cause of every 'corrupted eval' (FL_O3c/IDC/FCS, ATT_PLAIN_HOIST, S_HDC, I_SYNC1); fixed in the vehicle; S_HDC invalid -> re-measured: **S_HDCb 1.064601 vs S_REF600 1.051451 (+0.0132 at 600 s, warm, both valid): HDC binding loses honestly; CLOSED** |
+| compile-window-and-packing.md Theme A (A1-A5) | host work per micro-step | PROFILE2 (S_V26_HEAD_P2): host 7.3 ms vs fwd+bwd 159 ms; T60/S2 logs: no dt spike at EMA start (no charged recompiles) | A1/A2/A3 ceiling ~1.4% of the step (~0.0004) even with zero overlap; A5 already true. Re-measured at PACK=4 by H_PROF2 |
+| P_BFD | PACK_MODE=bfd: best-fit-decreasing packer, 4096-doc rounds, long docs split, remainders kept (B1+B5, 100% token coverage, ~94% docs whole) | queued | |
+| P_ROLL | PACK_ROLL=1.0: every packed 4097-row rolled by a random offset -> all sub-rows start mid-document (B6, f=1.0 vs 0.75) | queued | |
+| B26_d12_hdc (local, 500 fixed steps) | 3.1 HDC binding, no table vs 1.188775 | 1.205561 | +0.0168 | consistent with the box (+0.098 @600 s); B27 (no bigram at all) running = the floor |
+| B27_d12_nobigram (local, 500 fixed steps) | NO bigram signal at all vs 1.188775 | 1.206291 | +0.0175 | the floor. HDC (1.205561) sits 0.0007 above it = the binding carries ~nothing the head can use (the note's own falsifier). The learned table is worth 0.0175 at 500 steps locally and ~0.1 at 600 s on the box |
+
+## INFRASTRUCTURE (2026-09-15 night): host<->device sync cadence
+| run | config | step dt | note |
+|---|---|---|---|
+| I_SYNC1 / I_SYNC4 / I_SYNC8 (300 s each) | SYNC_EVERY = 1 (current) / 4 / 8: per-step syncs (loop-head drain, elapsed broadcast+item, end drain+boundary, loss item, control all-reduce) batched to every N steps; boundaries reported after the sync (one per completed step, verified in a CPU smoke: 11 steps -> 11 lines) | queued | the prize = the exposed launch gap per step |

@@ -436,3 +436,6 @@ step cost. Portal expectation ~0.9865. Everything else gated on the PACK=4 base 
 - Tooling lesson (bis): the Bash tool's shell is zsh, where an unquoted `$s` does not word-split, so `set -- $s` leaves the
   whole string in $1 and the generated queue line becomes "<ID> <ENV> full ..." (the malformed-line failure again).
   Generate queue lines with explicit printf per line, and ALWAYS verify `awk '{print $2}'` == full/secs before launching.
+- **HDC footnote:** local no-bigram floor 1.206291 vs HDC 1.205561 vs table 1.188775. The frozen binding adds ~0.0007 over
+  having no bigram signal at all, i.e. the composite is not separable by the head (the note's stated falsifier). The learned
+  table's value (0.0175 locally at 500 steps, ~0.1 at 600 s on the box) is in the LEARNED rows, not in bigram addressing.

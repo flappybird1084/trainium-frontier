@@ -125,7 +125,12 @@ MLP_RATIO = int(_ENV("NEURON_COMPETITION_R1_MLP_RATIO", "4"))
 
 PACK = int(_ENV("NEURON_COMPETITION_R1_PACK", "1"))   # v7: 1 = the baseline loader shape (rows of SEQ_LEN).
 PACK_MODE = _ENV("NEURON_COMPETITION_R1_PACK_MODE", "bestfit")   # bestfit = the provided best-fit packer (PACK-long rows reshaped) | stream = eval-style stream-cut rows (2026-09-14)
-STREAM_RESHUFFLE = _ENV("NEURON_COMPETITION_R1_STREAM_RESHUFFLE", "1") != "0"   # stream mode: seeded row-group permutation on epoch >= 2
+STREAM_RESHUFFLE = _ENV("NEURON_COMPETITION_R1_STREAM_RESHUFFLE", "1") != "0"
+PACK_ROLL = float(_ENV("NEURON_COMPETITION_R1_PACK_ROLL", "0"))   # compile-window-and-packing B6: fraction of the PACK-long packed rows rolled by a random
+                                                                    # offset before the reshape -> every sub-row starts mid-document (PACK=4 default: 75%)
+BFD_BUFFER = int(_ENV("NEURON_COMPETITION_R1_BFD_BUFFER", "4096"))  # PACK_MODE=bfd (B1): documents per packing round (the provided packer scans 512 online)
+BFD_LONG = _ENV("NEURON_COMPETITION_R1_BFD_LONG", "split")          # bfd: documents longer than a row -> split = whole rows + a remainder doc (B5) | drop = provided behaviour
+BFD_MAX_OPEN = int(_ENV("NEURON_COMPETITION_R1_BFD_MAX_OPEN", "512"))  # bfd: open (partially filled) rows carried across rounds before the fullest is closed by truncation   # stream mode: seeded row-group permutation on epoch >= 2
 MIR_FRAC = float(_ENV("NEURON_COMPETITION_R1_MIR_FRAC", "0"))     # masked-input regularization (repeat-regime.md idea 1): fraction of INPUT positions replaced by a random token (targets untouched, BOS kept); 0 = off
 MIR_ROWS = float(_ENV("NEURON_COMPETITION_R1_MIR_ROWS", "0.5"))   # fraction of rows per micro-batch that get the masking (the rest train clean); training-only, loader-side, eval path untouched
 PAR_RESID = _ENV("NEURON_COMPETITION_R1_PAR_RESID", "0") != "0"   # parallel residuals (repeat-regime.md idea 3): attn and MLP both read the block input; EAGER path only (the Trn2 layer op is sequential by construction)
@@ -275,6 +280,7 @@ EPOCH2 = _ENV("NEURON_COMPETITION_R1_EPOCH2", "0")                     # dev kno
 EMA_DECAY = float(os.environ.get("NEURON_COMPETITION_R1_EMA", "0.0"))                    # dev knob: >0 = keep an EMA of the weights from EMA_START of
 EMA_START = float(os.environ.get("NEURON_COMPETITION_R1_EMA_START", "0.5"))              # the budget on, and evaluate / save the EMA weights
 EMA_BLEND = float(os.environ.get("NEURON_COMPETITION_R1_EMA_BLEND", "1.0"))     # final = (1-b)*w + b*ema (speedrun tail-EMA: 0.35)
+SYNC_EVERY = int(os.environ.get("NEURON_COMPETITION_R1_SYNC_EVERY", "1"))   # host<->device sync cadence (steps): >1 lets the host queue launches ahead of the device; boundaries/health/stop are batched at sync steps
 NES_LOOK = float(os.environ.get("NEURON_COMPETITION_R1_NES_LOOK", "0"))       # EMA-Nesterov outer loop (strange-wins #9): lookahead = NES_LOOK * lrm along an EMA of the realized per-step displacement; 0 = off
 NES_GAMMA = float(os.environ.get("NEURON_COMPETITION_R1_NES_GAMMA", "0.99"))  # displacement-EMA decay
 NES_PREFILL = int(os.environ.get("NEURON_COMPETITION_R1_NES_PREFILL", "300")) # steps of EMA accumulation before the first jump
@@ -5922,7 +5928,94 @@ def main() -> None:
                         yb.copy_(t[:, 1:])
                         yield xb, yb, {"epoch": epoch}
 
-    if PACK_MODE == "stream":
+    def _bfd_loader(batch_size, seq_len, split, dev, shard_ids=None):
+        # PACK_MODE=bfd (2026-09-16, findings/compile-window-and-packing.md B1/B5): best-fit-DECREASING packing. The
+        # provided packer places documents online in stream order (best fit among the next 512, a gap it cannot fill is
+        # closed by truncating the shortest document); this one tokenizes BFD_BUFFER documents per round, sorts them
+        # long -> short and places each into the open row with the least remaining space that fits (the classical BFD
+        # sort is what buys the packing bound), keeps up to BFD_MAX_OPEN partially filled rows across rounds, and closes
+        # a row only when it is full or when the open set overflows (then the fullest is topped up by truncation, the
+        # provided rule). Over-length documents are split into whole rows plus a remainder (BFD_LONG=split; the provided
+        # packer never trains on them). Same rank-strided document split as the provided loader; custom packing is
+        # organizer-sanctioned. Rows are BOS-aligned at position 0 like the provided packer's (PACK_ROLL moves that).
+        import prepare as _prep
+        _ddp, _rank, _lr, _ws = _prep.get_dist_info()
+        batches = _prep._document_batches(split, _rank, _ws, 128, shard_ids=shard_ids)
+        bos = tokenizer.get_bos_token_id()
+        cap = seq_len + 1
+        d = torch.device(dev)
+        xb = torch.empty((batch_size, seq_len), dtype=torch.int32, device=d)
+        yb = torch.empty((batch_size, seq_len), dtype=torch.long, device=d)
+        open_rows: list[list[int]] = []       # partially filled rows (token lists), carried across rounds
+        done: list[list[int]] = []            # full rows waiting to be emitted
+        stats = {"docs": 0, "placed": 0, "split": 0, "overflow": 0, "rounds": 0}
+        epoch = 1
+
+        def close_fullest(fill_doc):
+            # the open set is full: top the fullest open row up with the head of fill_doc and emit it; the rest of
+            # fill_doc opens a new row (nothing is discarded - the provided packer would drop the remainder)
+            i = min(range(len(open_rows)), key=lambda j: cap - len(open_rows[j]))
+            row = open_rows.pop(i)
+            gap = cap - len(row)
+            row.extend(fill_doc[:gap]); done.append(row); stats["overflow"] += 1
+            rest = fill_doc[gap:]
+            while len(rest) > cap:
+                done.append(rest[:cap]); rest = rest[seq_len:]; stats["split"] += 1
+            if rest:
+                open_rows.append(list(rest))
+
+        while True:
+            docs: list[list[int]] = []
+            while len(docs) < BFD_BUFFER:
+                texts, epoch = next(batches)
+                docs.extend(tokenizer.encode(texts, prepend=bos, num_threads=4))
+            stats["docs"] += len(docs); stats["rounds"] += 1
+            if BFD_LONG == "split":
+                short: list[list[int]] = []
+                for doc in docs:
+                    while len(doc) > cap:          # whole rows straight to the output, the tail becomes a (mid-document) doc
+                        done.append(doc[:cap]); doc = doc[seq_len:]; stats["split"] += 1
+                    short.append(doc)
+                docs = short
+            docs.sort(key=len, reverse=True)
+            for doc in docs:
+                n = len(doc)
+                if n > cap:                        # BFD_LONG=drop: can never be placed whole; fills the fullest open row, rest re-opened
+                    if open_rows:
+                        close_fullest(doc)
+                    else:
+                        open_rows.append(list(doc[:cap])); done.append(open_rows.pop()); open_rows.append(list(doc[seq_len:]))
+                    continue
+                best = -1; best_rem = cap + 1
+                for j, row in enumerate(open_rows):
+                    rem = cap - len(row)
+                    if n <= rem < best_rem:
+                        best, best_rem = j, rem
+                        if rem == n:
+                            break
+                if best < 0:
+                    if len(open_rows) >= BFD_MAX_OPEN:
+                        close_fullest(doc); continue
+                    open_rows.append(list(doc))
+                else:
+                    open_rows[best].extend(doc)
+                    if len(open_rows[best]) == cap:
+                        done.append(open_rows.pop(best))
+                stats["placed"] += 1
+            if stats["rounds"] <= 3 or stats["rounds"] % 50 == 0:
+                print0(f"PACK_MODE=bfd round {stats['rounds']}: docs {stats['docs']} placed-whole {stats['placed']} split-rows {stats['split']} "
+                       f"overflow-closes {stats['overflow']} open-rows {len(open_rows)} full-rows {len(done)} epoch {epoch}")
+            while len(done) >= batch_size:
+                t = torch.tensor(done[:batch_size], dtype=torch.long)
+                del done[:batch_size]
+                xb.copy_(t[:, :-1].to(torch.int32))
+                yb.copy_(t[:, 1:])
+                yield xb, yb, {"epoch": epoch}
+
+    if PACK_MODE == "bfd":
+        _raw_loader = _bfd_loader(DEVICE_BATCH_SIZE // PACK, SEQ_LEN * PACK, "train", loader_dev)
+        print0(f"PACK_MODE=bfd: best-fit-decreasing rows of {SEQ_LEN * PACK + 1} (buffer {BFD_BUFFER} docs, long docs: {BFD_LONG}, max open {BFD_MAX_OPEN})")
+    elif PACK_MODE == "stream":
         _raw_loader = _stream_loader(DEVICE_BATCH_SIZE, SEQ_LEN, "train", loader_dev)
         print0(f"PACK_MODE=stream: eval-style stream-cut training rows (reshuffle epoch>=2: {STREAM_RESHUFFLE})")
     else:
@@ -5944,6 +6037,16 @@ def main() -> None:
                 _x, _y, _st = next(src)
             st = dict(_st)
             st["epoch"] = _st.get("epoch", 1) + epoch_offset
+            if PACK_ROLL > 0 and PACK > 1:
+                # B6: roll a PACK_ROLL fraction of the packed rows by a random offset before the reshape. Targets are the
+                # inputs shifted by one inside the packed row, so rolling x and y by the same offset keeps every (input,
+                # target) pair; the row then starts mid-document (like 99.9% of eval rows) and the document that spans the
+                # wrap is cut in two. Position 0 of the original row is BOS, so the wrap point is a proper document start.
+                L = _x.size(1)
+                roll = torch.rand(_x.size(0), device=_x.device) < PACK_ROLL
+                r = torch.randint(1, L, (_x.size(0),), device=_x.device) * roll
+                idx = (torch.arange(L, device=_x.device).unsqueeze(0) + r.unsqueeze(1)) % L
+                _x = _x.gather(1, idx); _y = _y.gather(1, idx)
             xr = _x.reshape(-1, SEQ_LEN)
             if MIR_FRAC > 0:
                 # masked-input regularization: in MIR_ROWS of the rows, replace MIR_FRAC of the input positions by a random
@@ -5967,6 +6070,8 @@ def main() -> None:
     next_plans = None
     ema_params = None
     nes_state = None; nes_pairs = None; nes_snap = None
+    pending_boundaries: list[int] = []   # SYNC_EVERY > 1: completed steps whose boundary is reported at the next sync
+    train_loss = 0.0
     ema_pairs = None
     if EMBED_IMPL in ("sidecar", "sidecar_torch") and not (EMBED_IMPL == "sidecar" and device.type != "neuron"):
         sidecar = EmbedSidecar(orig_model, EMBED_IMPL)
@@ -5992,7 +6097,8 @@ def main() -> None:
     startup_allowance_est = 0.0
 
     while step < args.num_steps:
-        synchronize(device)
+        if SYNC_EVERY == 1 or step % SYNC_EVERY == 0:
+            synchronize(device)
         if PROFILE3 and step == 20 and rank == 0:
             from torch.profiler import profile as _tprofile, ProfilerActivity as _PA
             tprof = _tprofile(activities=[_PA.CPU]); tprof.__enter__()
@@ -6079,7 +6185,15 @@ def main() -> None:
         if PROFILE and 10 <= step < 40:
             synchronize(device); t_gs = time.monotonic()
 
-        elapsed_frac = synced_elapsed_frac(budget_started, args.max_train_seconds, device)
+        if SYNC_EVERY == 1 or step % SYNC_EVERY == 0:
+            elapsed_frac = synced_elapsed_frac(budget_started, args.max_train_seconds, device)   # rank-0 clock, broadcast (a sync)
+        else:
+            elapsed_frac = (time.monotonic() - budget_started) / max(1.0, args.max_train_seconds)   # local clock between syncs (no device round trip)
+        if step < TRAIN_STARTUP_STEPS_EXCLUDED:
+            # The budget clock is restarted at the end of the excluded step(s); until then it still holds the cold
+            # compile, and a compile >= EMA_START x budget started the tail EMA at step 0 (2026-09-16: every
+            # "corrupted eval" on a cold short screen - FL_O3c, FL_IDC, FL_FCS, ATT_PLAIN_HOIST, S_HDC, I_SYNC1).
+            elapsed_frac = 0.0
         lrm = lr_multiplier(step, elapsed_frac)
         for group in optimizer.param_groups:
             group["lr"] = group["initial_lr"] * lrm
@@ -6126,8 +6240,13 @@ def main() -> None:
                     for e, p in zip(ema_params, ema_pairs):
                         e.lerp_(p.detach(), 1.0 - EMA_DECAY)
 
-        synchronize(device)
-        record_step_boundary(step)
+        _is_sync = SYNC_EVERY == 1 or (step + 1) % SYNC_EVERY == 0 or step + 1 >= args.num_steps
+        pending_boundaries.append(step)
+        if _is_sync:
+            synchronize(device)                       # every pending step has completed on the device at this point
+            for _s in pending_boundaries:
+                record_step_boundary(_s)
+            pending_boundaries.clear()
         dt = time.monotonic() - t0
         if tprof is not None and step == 22:
             tprof.__exit__(None, None, None)
@@ -6152,7 +6271,8 @@ def main() -> None:
                     mn = mprof["n"]
                     print0(f"PROFILE2 (synchronized avg ms per micro-step over {mn}): " + " ".join(f"{k}={v/mn*1000:.1f}" for k, v in mprof.items() if k != "n"))
         recent_step_times.append(dt)
-        train_loss = float(last_loss.item())
+        if _is_sync:
+            train_loss = float(last_loss.item())      # a device round trip: only at sync steps (the value is reused in between)
         if step + 1 == TRAIN_STARTUP_STEPS_EXCLUDED:
             # The runner excludes launch through this boundary (capped), so
             # restart the budget clock here to use the full charged budget.
@@ -6191,18 +6311,24 @@ def main() -> None:
                 )
             )
         )
-        control = torch.tensor(
-            [
-                1 if (math.isnan(train_loss) or train_loss > 100) else 0,
-                1 if stop_after_step else 0,
-            ],
-            device=device,
-            dtype=torch.int32,
-        )
-        if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(control, op=dist.ReduceOp.MAX)
-        if int(control[0].item()) != 0:
-            raise RuntimeError(f"bad loss detected: {train_loss}")
+        _stop = False
+        if _is_sync:   # health + stop decision ride ONE collective, only at sync steps (SYNC_EVERY > 1: the lookahead margin covers the queued steps)
+            if SYNC_EVERY > 1:
+                stop_after_step = stop_after_step or (reached_min_steps and elapsed_after_step + (SYNC_EVERY + 1) * max(recent_step_times[-20:])
+                                                      + CHECKPOINT_RESERVE_SECONDS >= args.max_train_seconds)
+            control = torch.tensor(
+                [
+                    1 if (math.isnan(train_loss) or train_loss > 100) else 0,
+                    1 if stop_after_step else 0,
+                ],
+                device=device,
+                dtype=torch.int32,
+            )
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(control, op=dist.ReduceOp.MAX)
+            if int(control[0].item()) != 0:
+                raise RuntimeError(f"bad loss detected: {train_loss}")
+            _stop = int(control[1].item()) != 0
 
         total_train_tokens += TOTAL_BATCH_SIZE
         smooth_loss = 0.9 * smooth_loss + 0.1 * train_loss
@@ -6221,9 +6347,13 @@ def main() -> None:
             gc.freeze()
             gc.disable()
         step += 1
-        if int(control[1].item()) != 0:
+        if _stop:
             break
 
+    synchronize(device)                                   # drain the device; report any boundaries still pending (SYNC_EVERY > 1)
+    for _s in pending_boundaries:
+        record_step_boundary(_s)
+    pending_boundaries.clear()
     if EMA_DECAY > 0 and ema_params is not None:
         with torch.no_grad():
             for e, p in zip(ema_params, ema_pairs):

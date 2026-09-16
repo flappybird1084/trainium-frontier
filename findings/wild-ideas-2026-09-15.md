@@ -88,7 +88,10 @@ Same gather, same scatter, different combine op - turns the memory from additive
 - **Falsifier:** if worse, additive superposition was load-bearing (multiplication is unforgiving of near-zero
   untrained rows) - which is itself a useful fact about the table.
 
-### 1.4 Rank-1 memory (frozen direction + learned scalar gain)
+### 1.4 Rank-1 memory (frozen direction + learned scalar gain) - DOWNGRADED, see 3.1
+**S_HDC (+0.098) is strong evidence against this.** HDC froze per-row content entirely; rank-1 leaves one learned
+scalar. Same axis, milder dose. Do not spend a gate here until something else re-opens the "less learned per-row
+capacity" direction.
 Stop learning 512 dims per bigram row. Freeze a random direction per row; learn only a scalar gain.
 - **Why:** with 2^18 rows and 446M tokens, most rare rows get 0-3 gradient updates all run. Fitting 512 dims from
   one noisy gradient is hopeless; fitting one scalar is tractable. This is the project's own "immediate gradient
@@ -135,7 +138,12 @@ no reverse pass at all.
 The table is 68% of the model. Every closed experiment resized it (2^19 lost), re-hashed it (prime worse), split
 it (wash), or decorrelated it (sign trick wash). **None changed its addressing or read mechanism.**
 
-### 3.1 HDC binding - delete the hash table entirely
+### 3.1 HDC binding - CLOSED, FAILED CATASTROPHICALLY (S_HDC, 2026-09-15 20:11)
+**Result: 1.150833 vs ~1.053 at 600 s = +0.098.** Also NOT cost-negative as predicted: 0.54 s/step, +4%.
+The learned table's *content* is load-bearing, not just its addressing - frozen algebraic binding cannot
+substitute for 134M learned parameters. **This is the strongest single fact to come out of this whole pass, and it
+propagates:** any idea that reduces per-row LEARNED capacity now carries a heavy negative prior, including 1.4
+(rank-1 memory) and the trigram-permutation extension below. Restructure the table's *read*, never its *content*.
 Replace the learned hashed-bigram table with vector-symbolic binding: a frozen random +-1 sign vector per token
 (8192x512, never trained), and the bigram feature is `wte(prev) (Hadamard) signbook[cur]`.
 - **Every one of the 8192^2 bigrams gets a distinct composite vector with graceful degradation instead of hard

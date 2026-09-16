@@ -6,6 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Starter kit for the NKI Frontier competition: train a language model from scratch on AWS Trainium under a fixed time budget (30 min Phase 1 / 4 hr Phase 2) and minimize validation bits-per-byte (`val_bpb`). Optimization can happen at any level — architecture, optimizer, data sampling, or custom Trainium kernels written in NKI (Neuron Kernel Interface).
 
+## Reporting to me
+
+Status reports must be **concise and terse**. I come up with the ideas; I did not write the code — assume I have no
+knowledge of the logs, file names, env-var spellings, or code internals. Lead with the outcome in one line, use plain
+language, and include only what changes what I would decide next (no knob tables, no hashes, no file inventories, no log
+excerpts unless I ask for them).
+
 ## Commands
 
 Assumes a Trainium DLAMI environment that already provides `torch`, `torch_neuronx`, and `neuronx-cc`. There is no test suite or linter.
