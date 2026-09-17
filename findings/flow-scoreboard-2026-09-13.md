@@ -218,6 +218,10 @@ NEURON_CC_FLAGS setting corrupt the eval-mode graph (~1.12 vs 1.053) while train
 | R_HOP / R_HOPKV (local, 500 steps) | plain hop vs K/V-reuse hop, eager | 1.183924 / 1.183902 | K/V reuse keeps 100% of the hop gain (lever D kill test passed); F_HOP44 (fused full-recompute hop on v44, 1800 s) decides whether the op is worth building |
 | **T62_gate_v45** | clean v45 = v44 + clamped-index embed kernels (sha 9c07811832fcebf5) | **0.979285** | +0.0002 vs v44 = band; PROMOTED to submit/train.py (flake-proof) |
 | F_HOP44 | fused multi-hop (1 hop / 2 blocks, detached) on the v44 base, 1800 s | 0.985652 | +0.0065 at 0.62 s/step (2857 steps); a 30% cheaper hop cannot close that: lever D CLOSED |
+| I_PAD0 / I_PAD1 | padded ZeRO sharding of the two MLP stacks (n=12 -> 16, 2 matrices per worker instead of 12 replicated Muon) | 560 / 566 steps in 300 s | +1.1% throughput, bit-identical math; free crumb, goes into the next version with the key-offset kernels |
+| I_KO0 / I_KO1 | key offset folded into the pre_attn fwd/bwd kernels (9 in-graph glue ops per layer removed; bit-exact) | 562 / 581 steps in 300 s | **+3.4% throughput** (-0.0036 at 300 s); v46 candidate together with OPT_SHARD_PAD (+1.1%) |
+| **G_KOPAD** | v44 base + in-kernel key offset + padded MLP-stack sharding (vehicle), 1800 s | **0.977482** | -0.0017 vs v44 (3547 steps, +3.5%): the first step-time win since v40; clean v46 gating |
+| **T63_gate_v46** | clean v46 = v45 + in-kernel key offset + padded MLP-stack sharding (sha af434c1bdb38d63b) | **0.976163** | -0.0030 vs v44; 3652 steps (+6.6%: the clean file gains more than the vehicle's 3547); PROMOTED to submit/train.py |
 | B26_d12_hdc (local, 500 fixed steps) | 3.1 HDC binding, no table vs 1.188775 | 1.205561 | +0.0168 | consistent with the box (+0.098 @600 s); B27 (no bigram at all) running = the floor |
 | B27_d12_nobigram (local, 500 fixed steps) | NO bigram signal at all vs 1.188775 | 1.206291 | +0.0175 | the floor. HDC (1.205561) sits 0.0007 above it = the binding carries ~nothing the head can use (the note's own falsifier). The learned table is worth 0.0175 at 500 steps locally and ~0.1 at 600 s on the box |
 
