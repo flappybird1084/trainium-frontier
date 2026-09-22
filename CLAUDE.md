@@ -69,10 +69,10 @@ Check it before any Trainium-side work.
 ## Findings directory
 
 `findings/` holds non-instruction, project-related knowledge. **Start with the newest `findings/handoff-*.md`
-(`handoff-2026-09-19.md`: state, the v44-v46 chain, what is closed with numbers, rules), then `findings/tools.md` (what every tool does and
+(`handoff-2026-09-22.md`: v46=0.9762 is the ceiling, the 0.96 push and everything closed with device evidence, board, next = upload v46 + Sep-30 gallery), then `findings/tools.md` (what every tool does and
 when to use it), then the ledger `trn2_results.tsv` and the newest entries of `findings/trn2-experiments.md`; read the rest of
 `findings/` before working on the competition** - it is the source of truth for anything not derivable from this repo's code,
-and new discoveries belong there, not in this file. Older handoffs (`handoff-2026-09-13b.md`, `handoff-2026-09-13.md`, `handoff-2026-09-11b.md`, `handoff-2026-09-11.md`, `handoff-2026-09-06*.md`) are history.
+and new discoveries belong there, not in this file. Older handoffs (`handoff-2026-09-19.md`, `handoff-2026-09-13b.md`, `handoff-2026-09-13.md`, `handoff-2026-09-11b.md`, `handoff-2026-09-11.md`, `handoff-2026-09-06*.md`) are history.
 
 `findings/` holds non-instruction, project-related knowledge: organizer rule clarifications, experiment results and lessons, hardware notes. **Start with the newest `findings/handoff-*.md` (session handoff: state, box, rules, next steps), then read every file in `findings/` before working on the competition** — it is the source of truth for anything not derivable from this repo's code, and new discoveries belong there, not in this file.
 
