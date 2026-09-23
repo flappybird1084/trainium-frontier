@@ -1646,7 +1646,10 @@ if NKI_AVAILABLE:
             a = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.sbuf)
             nisa.memset(a, 0.0)
             accv.append(a)
-        _wbuf = []
+        _wq = []
+        _wk = []
+        _wv = []
+        _wh = []
         for tbi in range(tiles):
             tb = tiles - 1 - tbi                      # reverse order: the carry comes from tile tb + 1 (already visited)
             t0 = tb * _NKI_P
@@ -1798,24 +1801,30 @@ if NKI_AVAILABLE:
             nisa.tensor_copy(dst=dxb, src=dx1)
             nisa.dma_copy(dst=dxm_out[t0:t0 + _NKI_P, :], src=dxb)
             # ---- wgrad: dW[o-chunk, in] += act[tok, o-chunk]^T @ h[tok, in]   (contraction over the token partitions)
-            _wbuf.append((dpq, dpk, gvb, h))
-            if len(_wbuf) >= 4 or tbi == tiles - 1:
+            _wq.append(dpq)
+            _wk.append(dpk)
+            _wv.append(gvb)
+            _wh.append(h)
+            if len(_wq) >= 4 or tbi == tiles - 1:
                 # as in mlp_bwd: the PE sums the group's token tiles in PSUM, so each accumulator takes one
                 # VectorE add per group of 4 tiles instead of one per tile. Exact (fp32 PSUM accumulation).
                 for o in range(kt):
                     wps = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.psum)
-                    for _i, _e in enumerate(_wbuf):
-                        nisa.nc_matmul(dst=wps, stationary=_e[0][:, o * _NKI_P:(o + 1) * _NKI_P], moving=_e[3], accumulate=(_i > 0))
+                    for _i in range(len(_wq)):
+                        nisa.nc_matmul(dst=wps, stationary=_wq[_i][:, o * _NKI_P:(o + 1) * _NKI_P], moving=_wh[_i], accumulate=(_i > 0))
                     nisa.tensor_tensor(dst=accq[o], data1=accq[o], data2=wps, op=nl.add)
                     wps2 = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.psum)
-                    for _i, _e in enumerate(_wbuf):
-                        nisa.nc_matmul(dst=wps2, stationary=_e[1][:, o * _NKI_P:(o + 1) * _NKI_P], moving=_e[3], accumulate=(_i > 0))
+                    for _i in range(len(_wq)):
+                        nisa.nc_matmul(dst=wps2, stationary=_wk[_i][:, o * _NKI_P:(o + 1) * _NKI_P], moving=_wh[_i], accumulate=(_i > 0))
                     nisa.tensor_tensor(dst=acck[o], data1=acck[o], data2=wps2, op=nl.add)
                     wps3 = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.psum)
-                    for _i, _e in enumerate(_wbuf):
-                        nisa.nc_matmul(dst=wps3, stationary=_e[2][:, o * _NKI_P:(o + 1) * _NKI_P], moving=_e[3], accumulate=(_i > 0))
+                    for _i in range(len(_wq)):
+                        nisa.nc_matmul(dst=wps3, stationary=_wv[_i][:, o * _NKI_P:(o + 1) * _NKI_P], moving=_wh[_i], accumulate=(_i > 0))
                     nisa.tensor_tensor(dst=accv[o], data1=accv[o], data2=wps3, op=nl.add)
-                _wbuf = []
+                _wq = []
+                _wk = []
+                _wv = []
+                _wh = []
         for o in range(kt):
             nisa.dma_copy(dst=dwq_out[o * _NKI_P:(o + 1) * _NKI_P, :], src=accq[o])
             nisa.dma_copy(dst=dwk_out[o * _NKI_P:(o + 1) * _NKI_P, :], src=acck[o])

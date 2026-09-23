@@ -229,24 +229,30 @@ PRE_WG_OLD = """            for o in range(kt):
                 wps3 = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.psum)
                 nisa.nc_matmul(dst=wps3, stationary=gvb[:, o * _NKI_P:(o + 1) * _NKI_P], moving=h)
                 nisa.tensor_tensor(dst=accv[o], data1=accv[o], data2=wps3, op=nl.add)"""
-PRE_WG_NEW = """            _wbuf.append((dpq, dpk, gvb, h))
-            if len(_wbuf) >= 4 or tbi == tiles - 1:
+PRE_WG_NEW = """            _wq.append(dpq)
+            _wk.append(dpk)
+            _wv.append(gvb)
+            _wh.append(h)
+            if len(_wq) >= 4 or tbi == tiles - 1:
                 # as in mlp_bwd: the PE sums the group's token tiles in PSUM, so each accumulator takes one
                 # VectorE add per group of 4 tiles instead of one per tile. Exact (fp32 PSUM accumulation).
                 for o in range(kt):
                     wps = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.psum)
-                    for _i, _e in enumerate(_wbuf):
-                        nisa.nc_matmul(dst=wps, stationary=_e[0][:, o * _NKI_P:(o + 1) * _NKI_P], moving=_e[3], accumulate=(_i > 0))
+                    for _i in range(len(_wq)):
+                        nisa.nc_matmul(dst=wps, stationary=_wq[_i][:, o * _NKI_P:(o + 1) * _NKI_P], moving=_wh[_i], accumulate=(_i > 0))
                     nisa.tensor_tensor(dst=accq[o], data1=accq[o], data2=wps, op=nl.add)
                     wps2 = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.psum)
-                    for _i, _e in enumerate(_wbuf):
-                        nisa.nc_matmul(dst=wps2, stationary=_e[1][:, o * _NKI_P:(o + 1) * _NKI_P], moving=_e[3], accumulate=(_i > 0))
+                    for _i in range(len(_wq)):
+                        nisa.nc_matmul(dst=wps2, stationary=_wk[_i][:, o * _NKI_P:(o + 1) * _NKI_P], moving=_wh[_i], accumulate=(_i > 0))
                     nisa.tensor_tensor(dst=acck[o], data1=acck[o], data2=wps2, op=nl.add)
                     wps3 = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.psum)
-                    for _i, _e in enumerate(_wbuf):
-                        nisa.nc_matmul(dst=wps3, stationary=_e[2][:, o * _NKI_P:(o + 1) * _NKI_P], moving=_e[3], accumulate=(_i > 0))
+                    for _i in range(len(_wq)):
+                        nisa.nc_matmul(dst=wps3, stationary=_wv[_i][:, o * _NKI_P:(o + 1) * _NKI_P], moving=_wh[_i], accumulate=(_i > 0))
                     nisa.tensor_tensor(dst=accv[o], data1=accv[o], data2=wps3, op=nl.add)
-                _wbuf = []"""
+                _wq = []
+                _wk = []
+                _wv = []
+                _wh = []"""
 nwg = s.count(PRE_WG_OLD)
 assert nwg == 2, f"pre wgrad: found {nwg}"
 sub_exact("pre_attn_bwd_ko wgrad PSUM grouping", PRE_WG_OLD, PRE_WG_NEW, expect=2, which=2)
@@ -256,7 +262,7 @@ lines = s.split("\n")
 st = next(i for i, l in enumerate(lines) if l.startswith("    def pre_attn_bwd_ko"))
 en = next(i for i in range(st + 1, len(lines)) if lines[i].startswith("    def "))
 li = max(i for i in range(st, en) if lines[i] == "        for tbi in range(tiles):")
-lines.insert(li, "        _wbuf = []")
+lines.insert(li, "        _wq = []\n        _wk = []\n        _wv = []\n        _wh = []")
 s = "\n".join(lines)
 applied["pre_attn_bwd_ko group buffer"] = 1
 
