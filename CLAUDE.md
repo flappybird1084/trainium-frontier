@@ -69,7 +69,7 @@ Check it before any Trainium-side work.
 ## Findings directory
 
 `findings/` holds non-instruction, project-related knowledge. **Start with the newest `findings/handoff-*.md`
-(`handoff-2026-09-24.md`: v49=0.971664 is the submission, -0.0045 in one session from exact kernel deletions with the
+(`handoff-2026-09-24.md`: v52=0.971674 mean over 4 gates is the submission, -0.0045 in one session from exact kernel deletions with the
 model unchanged; the backward is VectorE-bound so DELETE VectorE work rather than relocate it; multiple
 implementations of the same op mean a knob can silently reach a dead one; next = upload v49), then
 `findings/vector-deletions-2026-09-23.md`, then `findings/tools.md` (what every tool does and
