@@ -69,7 +69,10 @@ Check it before any Trainium-side work.
 ## Findings directory
 
 `findings/` holds non-instruction, project-related knowledge. **Start with the newest `findings/handoff-*.md`
-(`handoff-2026-09-22.md`: v46=0.9762 is the ceiling, the 0.96 push and everything closed with device evidence, board, next = upload v46 + Sep-30 gallery), then `findings/tools.md` (what every tool does and
+(`handoff-2026-09-24.md`: v49=0.971664 is the submission, -0.0045 in one session from exact kernel deletions with the
+model unchanged; the backward is VectorE-bound so DELETE VectorE work rather than relocate it; multiple
+implementations of the same op mean a knob can silently reach a dead one; next = upload v49), then
+`findings/vector-deletions-2026-09-23.md`, then `findings/tools.md` (what every tool does and
 when to use it), then the ledger `trn2_results.tsv` and the newest entries of `findings/trn2-experiments.md`; read the rest of
 `findings/` before working on the competition** - it is the source of truth for anything not derivable from this repo's code,
 and new discoveries belong there, not in this file. Older handoffs (`handoff-2026-09-19.md`, `handoff-2026-09-13b.md`, `handoff-2026-09-13.md`, `handoff-2026-09-11b.md`, `handoff-2026-09-11.md`, `handoff-2026-09-06*.md`) are history.
