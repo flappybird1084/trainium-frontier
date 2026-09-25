@@ -74,6 +74,11 @@ Check it before any Trainium-side work.
 cross-rank waiting, so do not re-open it; 0.970 needs +4.3% steps and the credible inventory is ~2.5%; before
 believing any per-section profile, check the sections sum to the phase. Then `handoff-2026-09-24.md`: the morning's
 -0.0045 from exact kernel deletions, and the rule that DELETING VectorE work pays while relocating it does not),
+then **`findings/exclusive-time-method-2026-09-25.md`** (THE analysis that is predictive on this machine:
+measure how long each engine is the ONLY one busy, because the step is ~70% overlapped and work on a busy engine
+is usually free. It explains why one change deleted 55k vector instructions for -5.6% and another deleted 176k
+for exactly 0, it found the 16.6 ms select_backward concentration that became v55, and it closed the vendor
+attention backward at ~3.5 ms exclusive. Scripts: experimental/critpath.py + excl_attrib.py),
 then **`findings/instruction-profile-2026-09-24.md`** (the NEFF instruction profile: the step is
 INSTRUCTION-bound, not element- or FLOP-bound; ~128 of the 166 ms of vector time is per-instruction overhead;
 the ~100-cycle tax is charged INSIDE instructions so interleaving is worthless and only fewer/wider
