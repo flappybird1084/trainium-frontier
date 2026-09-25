@@ -69,9 +69,17 @@ Check it before any Trainium-side work.
 ## Findings directory
 
 `findings/` holds non-instruction, project-related knowledge. **Start with the newest `findings/handoff-*.md`
-(`handoff-2026-09-24.md`: v52=0.971674 mean over 4 gates is the submission, -0.0045 in one session from exact kernel deletions with the
-model unchanged; the backward is VectorE-bound so DELETE VectorE work rather than relocate it; multiple
-implementations of the same op mean a knob can silently reach a dead one; next = upload v49), then
+(`handoff-2026-09-24b.md`: v52=0.971674 is the submission and is STILL NOT UPLOADED; the non-forward/backward
+107 ms of the step is now CLOSED - gradient-sync cost is neither bytes nor call count nor ordering but 42 ms of
+cross-rank waiting, so do not re-open it; 0.970 needs +4.3% steps and the credible inventory is ~2.5%; before
+believing any per-section profile, check the sections sum to the phase. Then `handoff-2026-09-24.md`: the morning's
+-0.0045 from exact kernel deletions, and the rule that DELETING VectorE work pays while relocating it does not),
+then **`findings/instruction-profile-2026-09-24.md`** (the NEFF instruction profile: the step is
+INSTRUCTION-bound, not element- or FLOP-bound; ~128 of the 166 ms of vector time is per-instruction overhead;
+the ~100-cycle tax is charged INSIDE instructions so interleaving is worthless and only fewer/wider
+instructions pay; the VENDOR attention backward is 101.5 ms = 21% of the step and has no external lever; and a
+per-line attribution in that profile is a BUCKET - cross-tab by opcode before believing it),
+then `findings/comm-bytes-2026-09-24.md`,
 `findings/vector-deletions-2026-09-23.md`, then `findings/tools.md` (what every tool does and
 when to use it), then the ledger `trn2_results.tsv` and the newest entries of `findings/trn2-experiments.md`; read the rest of
 `findings/` before working on the competition** - it is the source of truth for anything not derivable from this repo's code,
