@@ -65,6 +65,39 @@ The forward is **Scalar**-dominated (61% busy), the backward Vector-dominated - 
 
 **No concentration remains.** 0.9700 needs ~10 ms = 3-5 separate kernel surgeries at ~0.0002 each.
 
+> **RETRACTED 2026-09-26 - both of the "what to do next" items below were wrong. Do not act on them.**
+>
+> **1. The megakernel is already CLOSED BY A FULL GATE, which this file failed to cite.** Ledger `G_FUSED`
+> (2026-09-17, `submission_raw/train3_fused.py`, `LAYER_FUSED=1`) built *exactly* this fusion - "one fused
+> kernel per layer forward (pre_ko + nested vendor attention + post)" - bit-exact (`FUSED_DEV`: all 13 outputs
+> bit-exact, 7.413 vs 8.156 ms per layer = **-9.1% standalone**) and gated it at **3462 steps vs 3547 = 2.4%
+> SLOWER**, val_bpb +0.0012. Recorded reason: "lost overlap/scheduling across the former kernel boundary."
+> Independently, `mfu-profile-2026-09-21.md` ("Megakernel moonshot: DEAD ON ARRIVAL") shows the vendor
+> `_attention_cte` reads Q only from HBM and writes O only to HBM (no SBUF-out parameter), and b*NH=64
+> full-length sequences need 48 MB against 24 MB of SBUF - so fusion cannot remove the attention HBM round
+> trip, which is the only thing that would have paid.
+>
+> **2. The "8.1 ms of pure idle" may not be idle at all.** `experimental/critpath.py` sweeps
+> `sorted(set(eng))` from `Instruction.parquet`, which holds only Vector/Tensor/Scalar/GpSimd/Sync. **DMA is
+> not in the sweep and is 49% busy in the forward**, so "no engine busy" can mean "DMA only". Add the DMA/queue
+> intervals to the sweep before believing any idle figure from this method.
+>
+> **3. The out-proj operand swap is worth ~0 or negative, and this file contradicted a sibling findings file on
+> it.** `instruction-profile-2026-09-24.md` §2 says, from the *same* profile: "LDWEIGHTS (55 ms) **overlaps**
+> MATMUL in the PE pipeline... the 1:1 LDWEIGHTS:MATMUL ratio costs nothing extra - **do not chase it**." That
+> is the correct reading. Swapping removes only the LDWEIGHTS share (~0.9 ms true, not 4.4), and it costs more
+> than it saves: with the weight stationary the output arrives D-major while the next ops need token-major
+> (`submit/train.py:1401-1412`), so recovering the layout costs 16 extra `nc_transpose` + 16 `tensor_copy` per
+> 512-token chunk to delete 16 LDWEIGHTS that were already hidden.
+>
+> **The method in this file stands; these three conclusions drawn from it do not.** The deeper lesson is that
+> **exclusive engine time is an excellent FINDER and a bad BOUND**: an instruction can sit on the critical path
+> while another engine is busy with unrelated work, and the sweep scores it zero. Per the two captures, the
+> backward's span is 199.9 ms against a busiest engine (Vector) of 139.7 ms, and the forward's 103 ms against
+> Scalar's 62.8 ms - so **~100 ms of the 303 ms of graph time is dependency-chain slack that is invisible to
+> both the exclusive total (65 ms) and the idle total (13 ms)**. The real budget is larger than this file
+> implies, but not in the places it named. See `findings/step-split-2026-09-26.md`.
+
 The one structurally different lever left is the forward's **8.1 ms of pure idle** - inter-kernel launch/sync
 gaps, ~48 kernel launches per forward at ~0.17 ms each. Recovering it means FUSING pre_attn + attention +
 post_attn into fewer kernels (the megakernel direction). Multi-day, but it is the only remaining item of the
