@@ -69,26 +69,25 @@ Check it before any Trainium-side work.
 ## Findings directory
 
 `findings/` holds non-instruction, project-related knowledge. **Start with the newest `findings/handoff-*.md`
-(`handoff-2026-09-24b.md`: v52=0.971674 is the submission and is STILL NOT UPLOADED; the non-forward/backward
-107 ms of the step is now CLOSED - gradient-sync cost is neither bytes nor call count nor ordering but 42 ms of
-cross-rank waiting, so do not re-open it; 0.970 needs +4.3% steps and the credible inventory is ~2.5%; before
-believing any per-section profile, check the sections sum to the phase. Then `handoff-2026-09-24.md`: the morning's
--0.0045 from exact kernel deletions, and the rule that DELETING VectorE work pays while relocating it does not),
-then **`findings/exclusive-time-method-2026-09-25.md`** (THE analysis that is predictive on this machine:
-measure how long each engine is the ONLY one busy, because the step is ~70% overlapped and work on a busy engine
-is usually free. It explains why one change deleted 55k vector instructions for -5.6% and another deleted 176k
-for exactly 0, it found the 16.6 ms select_backward concentration that became v55, and it closed the vendor
-attention backward at ~3.5 ms exclusive. Scripts: experimental/critpath.py + excl_attrib.py),
-then **`findings/instruction-profile-2026-09-24.md`** (the NEFF instruction profile: the step is
-INSTRUCTION-bound, not element- or FLOP-bound; ~128 of the 166 ms of vector time is per-instruction overhead;
-the ~100-cycle tax is charged INSIDE instructions so interleaving is worthless and only fewer/wider
-instructions pay; the VENDOR attention backward is 101.5 ms = 21% of the step and has no external lever; and a
-per-line attribution in that profile is a BUCKET - cross-tab by opcode before believing it),
-then `findings/comm-bytes-2026-09-24.md`,
-`findings/vector-deletions-2026-09-23.md`, then `findings/tools.md` (what every tool does and
-when to use it), then the ledger `trn2_results.tsv` and the newest entries of `findings/trn2-experiments.md`; read the rest of
-`findings/` before working on the competition** - it is the source of truth for anything not derivable from this repo's code,
-and new discoveries belong there, not in this file. Older handoffs (`handoff-2026-09-19.md`, `handoff-2026-09-13b.md`, `handoff-2026-09-13.md`, `handoff-2026-09-11b.md`, `handoff-2026-09-11.md`, `handoff-2026-09-06*.md`) are history.
+(`handoff-2026-09-26.md`: v58=0.970383 is the submission and is STILL NOT UPLOADED — the portal has v52 and we are
+10th of 10 with top 10 advancing; the public leaderboard JSON needs no sign-in and the portal RE-TRAINS on its own
+hardware, so use a +0.0069 offset. THE GOVERNING FACT: dense capacity nets only ~-0.0024 per e-fold at fixed TIME,
+so we sit on a flat ridge and the whole (width, depth) plane from 512-896 x 7-16 is within -0.0001..+0.0024 of
+512x12 — do not reopen shape. Exchange rate measured properly at -0.0293/e-fold, so 0.9650 needs +22% steps.
+All three ANVIL optimizer pieces LOSE here; only weight-averaging transferred. The two wins were our own code not
+matching the metric, which is the pattern to repeat),** then `findings/step-split-2026-09-26.md` (the first full
+measurement of the non-forward/backward step: the optimizer MATH is only 18.6 ms and 58% of that phase is the
+parameter all_gather; the embedding scatter plan is 78.7% padding against a docstring claiming ~150 rounds),
+then `findings/quality-levers-2026-09-26.md` (the leaderboard, the charged-budget defect v56 fixed, and the
+eval-side items — including one DISCARDED as against the rules and recorded so it is not rediscovered),
+then **`findings/exclusive-time-method-2026-09-25.md`** (THE analysis that finds concentrations — but read its
+RETRACTED box: it nominated a megakernel already gated 2.4% SLOWER, and exclusive time is a good FINDER and a bad
+BOUND), then `findings/instruction-profile-2026-09-24.md` (also carries a retraction), then
+`findings/comm-bytes-2026-09-24.md`, `findings/vector-deletions-2026-09-23.md`, then `findings/tools.md`,
+then the ledger `trn2_results.tsv` and the newest entries of `findings/trn2-experiments.md`; read the rest of
+`findings/` before working on the competition** - it is the source of truth for anything not derivable from this
+repo's code, and new discoveries belong there, not in this file.
+Older handoffs (`handoff-2026-09-19.md`, `handoff-2026-09-13b.md`, `handoff-2026-09-13.md`, `handoff-2026-09-11b.md`, `handoff-2026-09-11.md`, `handoff-2026-09-06*.md`) are history.
 
 `findings/` holds non-instruction, project-related knowledge: organizer rule clarifications, experiment results and lessons, hardware notes. **Start with the newest `findings/handoff-*.md` (session handoff: state, box, rules, next steps), then read every file in `findings/` before working on the competition** — it is the source of truth for anything not derivable from this repo's code, and new discoveries belong there, not in this file.
 
