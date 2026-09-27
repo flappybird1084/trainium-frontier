@@ -303,6 +303,122 @@ EMA_TABLE_MAX = 34_000_000      # numel ceiling: admits the 4.19M tables, exclud
 WARMDOWN_TIME_FRAC = 0.90       # linear decay over the last 90% of the time budget ...
 FINAL_LR_FRAC = 0.02            # ... to 2% of peak
 
+# -----------------------------------------------------------------------------
+# SAVE_EMA_PARTS (DEV INSTRUMENT, default off): the tail-EMA blend is a pure post-training linear combination,
+#
+#     p_final = (1 - b) * p_raw + b * p_avg
+#
+# applied once after the last optimizer step, so a run that keeps p_raw AND p_avg determines the optimum for EVERY
+# b exactly, offline, with zero gate time. That is how v60 was found (EMA_BLEND 0.35 -> 0.65, -0.000484 on the
+# box, predicted to 0.00001 by the offline grid). The live blend DESTROYS p_raw: `p.lerp_(e, EMA_BLEND)` writes
+# in place, and only the accumulator `e` survives - so the raw weights must be copied out BEFORE the blend or the
+# information is gone. This flag does exactly that, and nothing else.
+#
+# The parts go to a SEPARATE file `ema_parts.pt` beside `final.pt`, never into `final.pt` itself: `final.pt` is
+# what the scorer reads through `load_for_eval` and it must stay byte-identical to a flag-off run (v59 put the
+# parts inside the checkpoint, which tripled it to 1.4 GB and put dev-only tensors in the scored payload).
+# The file is written AFTER the charged-budget timestamps are taken, so its ~570 MB of I/O is not charged.
+SAVE_EMA_PARTS = os.environ.get("NEURON_COMPETITION_R1_SAVE_EMA_PARTS", "0") != "0"
+# Extra tail-EMA tracks at OTHER decays, maintained in parallel, purely so the DECAY axis is also free offline
+# (one accumulator per decay; the offline tool then sweeps decay x blend, and convex mixes of two tracks
+# interpolate between their horizons). Comma-separated, e.g. "0.997,0.9990". Ignored unless SAVE_EMA_PARTS is on.
+# COST, measured not guessed: each track is 16 more in-place `lerp_` calls per step on tensors already resident in
+# device memory. The four table lerps are ~0.07 ms (noted above), and the 60-75 ms-per-eager-op figure does NOT
+# apply here - that is the cost of a torch op that BREAKS the traced graph inside the model forward, whereas these
+# run after optimizer.step() on resident buffers. Empirically: T_V66 carried two tracks and got 4230 steps against
+# v62's 4238 and v64's 4219, i.e. inside the run-to-run scatter. Memory is ~285 MB of device HBM per extra track
+# (71.3M fp32 elements: 54.5M matrix/head/scalar + 16.8M tables) and ~285 MB more in the output file.
+EMA_DECAY_EXTRA = [float(s) for s in
+                   os.environ.get("NEURON_COMPETITION_R1_EMA_DECAY_EXTRA", "").replace(" ", "").split(",") if s]
+
+# -----------------------------------------------------------------------------
+# BRANCH B2: the LINEAR-TEMPERATURE regime.  One flag, default off; with B2=0 every value below is unused and the
+# file is the canon file.
+#
+# WHY THE (lr, wd, schedule) PLANE LOOKS PINNED, AND WHAT IT IS ACTUALLY PINNING
+# Every matrix in this model is read through an RMSNorm (pre-norm blocks, QK-norm, a final norm before the head),
+# so the forward pass is invariant to the SCALE of every Muon-owned matrix.  What the loss can feel is therefore
+# not the learning rate and not the weight norm, but their ratio - the RELATIVE distance the weights move per
+# step.  Call it the temperature  T = lr / ||W||.
+# The Muon update has a FIXED Frobenius norm (orthogonalised, then per-row normalised and Frobenius-renormalised
+# back to ||O||_F ~ sqrt(min(out,in))), so the norm obeys
+#       d||W||^2 = - 2 lr wd ||W||^2 + lr^2 ||O||^2      ->   ||W||_eq  ~  sqrt(lr/wd),   T_eq ~ sqrt(lr wd)
+# with a relaxation time of 1/(2 lr wd) steps.  For our stacks that is 82 steps (MLP, lr_eff x sqrt(6)) to 201
+# steps (square), i.e. 9-12 e-folds over a 4390-step run: THE MATRIX NORMS ARE AT THEIR lr.wd EQUILIBRIUM for
+# essentially the whole run.  Three consequences, and all three are visible in the ledger:
+#   1. In the bulk, T ~ sqrt(lr_t wd): halving the LR only drops the temperature by 1.41x, because the norm
+#      shrinks to meet it.  The schedule is SELF-STABILISING in the middle.  This is why WARMDOWN_TIME_FRAC is
+#      flat from 0.5 to 0.95 (23% of LR area, and only 0.66 -> 0.78 of mid-run temperature).  And the two knobs
+#      are the SAME knob: plot the v29 MATRIX_LR curve (x0.5/0.6/0.7/0.8/1.0/1.2, optimum x0.7) against ln T and
+#      it has an up-slope of +0.0121 bpb/e-fold and a down-slope of -0.0047.  Those two numbers, taken from the
+#      LR rows alone, predict the WD rows: WD 0.20 is +0.347 e-folds of T -> predicted +0.0042, measured
+#      +0.0032 (v20) / +0.0045 (PACK=4); WD 0.05 is -0.347 -> predicted +0.0016, measured +0.0022 / +0.0003.
+#      (WD 0.30 is predicted +0.0067 and measured +0.0109 - the curve steepens, as a quadratic would.)  The
+#      whole (lr, wd) plane is pinning ONE quantity, T, and T is at its optimum.  That is what 637 axis-aligned
+#      experiments established, and it is why no further scaling of either knob can pay.
+#   2. Late in the run the relaxation time 1/(2 lr_t wd) grows past the number of remaining steps and the norm
+#      FREEZES; from there T ~ lr_t, i.e. linear.  For this config that crossover lands at 80-88% of the budget
+#      (square stacks first, the x sqrt(6) MLP stacks later).  EMA_START was tuned empirically to 0.75, i.e. the
+#      averaging window that measurement picked opens just where the trajectory changes character from
+#      equilibrium diffusion to deterministic annealing.
+#   3. Therefore the temperature trajectory the model actually experiences is 1.00 -> ~0.54 over the first 75% of
+#      the run and ~0.54 -> ~0.04 over the last 25%.  ALL of the annealing happens in the last quarter, and the
+#      first three quarters are a nearly isothermal random walk.  The "dead middle / sharp ends" sensitivity
+#      structure in the ledger is not a property of the problem; it is the sqrt() compression above.
+#
+# THE JUMP: make wd track the LR (wd_t = WEIGHT_DECAY * lrm).  Then ||W||_eq ~ sqrt(lr_t/wd_t) is CONSTANT and
+# T ~ lr_t is LINEAR in the schedule multiplier.  The isothermal plateau and the terminal cliff both disappear;
+# the same total anneal is spread smoothly over the whole run, at constant geometry.  This is a different regime,
+# not a knob: at lrm = 1 it is identical to the baseline, so it cannot be reached by scaling lr or wd, and no
+# single-knob sweep can see it because both knobs move T and this move does not.
+# It is free: the Muon kernel already takes lr*wd as a per-step device scalar (_muon_step builds `scal` every
+# step), so this is a host-side float, no new buffer and no new op.
+B2 = os.environ.get("NEURON_COMPETITION_R1_B2", "0") != "0"
+# (a) the mechanism itself.
+B2_WD_TRACK = os.environ.get("NEURON_COMPETITION_R1_B2_WD_TRACK", "1") != "0"
+# (b) the terminal LR fraction, RE-DERIVED.  FINAL_LR_FRAC is sharp (0.05 = +0.0015, 0.10 = +0.0022, 0.0 =
+# +0.0004) because it sets the terminal TEMPERATURE.  The baseline's norm freezes at G0*sqrt(lrm_freeze) with
+# lrm_freeze = 0.21-0.29, so it ships T_final = 0.02/(0.46..0.54) = 0.037..0.043 in units of the peak.  Under (a)
+# the norm stays at G0, so the SAME terminal temperature needs lrm_final = 0.034..0.041; 0.034 is the
+# conservative end of that band.  Keeping 0.02 here would UNDERSHOOT the measured-optimal terminal temperature by
+# ~1.9x - 0.02 is optimal only against a collapsing norm.  This is the coupling no sweep could find: the optimum
+# of FINAL_LR_FRAC MOVES with the wd schedule, and every row that measured it held wd fixed.
+B2_FINAL_LR_FRAC = float(os.environ.get("NEURON_COMPETITION_R1_B2_FINAL_LR", "0.034"))
+# (c) warmup.  Measured gradient: 50 -> 100 steps cost +0.0021 (S2_WU100), so shorter is the measured direction
+# and it has never been tried.  Under (a) the decay is ~0 during warmup (wd_t ~ lrm), so the early phase no
+# longer needs the extra protection the long ramp was buying.
+B2_WARMUP_STEPS = int(os.environ.get("NEURON_COMPETITION_R1_B2_WARMUP", "35"))
+# (d) momentum, and (e) the NorMuon second-moment horizon.  The in-house mechanism ("shorter averaging horizons
+# win, because the terminal rampdown makes late weights improve fast, so mixing older state pays a bias cost
+# that beats its variance benefit") is CAUSED by consequence 3 above: a rate of improvement concentrated in the
+# last quarter.  Under (a) that concentration is gone - the same anneal is spread over the whole run, so the
+# instantaneous rate of improvement near the end is LOWER and the bias charged to a given horizon falls with it.
+# This is the honest, mechanism-respecting way to lengthen horizons: not "the mechanism is wrong" but "its
+# premise is a property of the schedule shape, and this branch changes the shape".  Note which direction each
+# piece of evidence actually covered: G_MOMON lowered the Muon momentum peak to 0.93 (lost), T_V65 lengthened
+# the RAMP to 850 steps (wash), the ANVIL twin-rail ran two lanes (lost).  A HIGHER constant peak is untested.
+B2_MUON_MOMENTUM = float(os.environ.get("NEURON_COMPETITION_R1_B2_MOM", "0.97"))
+B2_MUON_BETA2 = float(os.environ.get("NEURON_COMPETITION_R1_B2_MUON_BETA2", "0.93"))
+# (f) the terminal weight average.  Its window was tuned to start at the norm-freeze crossover (0.75); under (a)
+# there is no crossover and no norm collapse for it to sit downstream of, so the window can open where the
+# trajectory is already cold and smooth, and the horizon can lengthen for the same reason as (d).  EMA_DECAY
+# 0.997 is a measured interior optimum (0.9933 lost by 0.0006, tau 714 lost by 0.0011) - but both of those were
+# measured against the cliff this branch removes.  Blends stay at the offline-exact 0.65: the raw/average
+# relationship is what moved, not the blend's arithmetic.
+B2_EMA_START = float(os.environ.get("NEURON_COMPETITION_R1_B2_EMA_START", "0.60"))
+B2_EMA_DECAY = float(os.environ.get("NEURON_COMPETITION_R1_B2_EMA_DECAY", "0.9982"))
+# Optional: print the Muon stacks' Frobenius norms every N steps. This is the branch's FALSIFIER - the claim is
+# that the baseline's norms fall ~1.7x across the warmdown while B2's stay flat. Off by default because each
+# norm is an eager device op (~60-75 ms).
+B2_DIAG_EVERY = int(os.environ.get("NEURON_COMPETITION_R1_B2_DIAG", "0"))
+
+_EFF_WARMUP_STEPS = B2_WARMUP_STEPS if B2 else WARMUP_STEPS
+_EFF_FINAL_LR_FRAC = B2_FINAL_LR_FRAC if B2 else FINAL_LR_FRAC
+_EFF_MUON_MOMENTUM = B2_MUON_MOMENTUM if B2 else 0.95
+_EFF_MUON_BETA2 = B2_MUON_BETA2 if B2 else 0.90
+_EFF_EMA_START = B2_EMA_START if B2 else EMA_START
+_EFF_EMA_DECAY = B2_EMA_DECAY if B2 else EMA_DECAY
+
 POLAR_EXPRESS_COEFFS = [
     (8.156554524902461, -22.48329292557795, 15.878769915207462),
     (4.042929935166739, -2.808917465908714, 0.5000178451051316),
@@ -2956,12 +3072,14 @@ def check_fused_loss(model: "GPT", x: torch.Tensor, y: torch.Tensor, emb) -> Non
     plain PyTorch - print both, and disable the fused path if they disagree beyond bf16 tolerance. Runs once at startup."""
     if _HEAD_OPS is None or x.device.type != "neuron":
         return
-    with torch.no_grad():
-        fused = model(x, y, emb=emb)
-        model._fused_loss_ok = False
-        explicit = model(x, y, emb=emb)
-        model._fused_loss_ok = True
-        diff = (fused - explicit).abs().item()
+    try:
+        with torch.no_grad():
+            fused = model(x, y, emb=emb)
+            model._fused_loss_ok = False
+            explicit = model(x, y, emb=emb)          # materialises the full fp32 logits: the one forward in the
+            diff = (fused - explicit).abs().item()   # program never otherwise exercised, so the OOM-prone one
+    finally:
+        model._fused_loss_ok = True   # a DIAGNOSTIC must never be able to disable the path it is checking
     print0(f"fused-loss check: fused {fused.item():.5f} vs cross_entropy(head_logits) {explicit.item():.5f}, |diff| {diff:.2e}")
     if not (diff < 0.02 * max(1.0, explicit.item())):
         model._fused_loss_ok = False
@@ -3225,7 +3343,7 @@ class GPT(nn.Module):
             dict(kind="adamw", params=scalar_params, lr=SCALAR_LR, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0),
         ]
         for key in sorted(self.stacks.keys()):
-            param_groups.append(dict(kind="muon", params=[self.stacks[key]], lr=MATRIX_LR, momentum=0.95, beta2=0.90, ns_steps=NS_STEPS, weight_decay=WEIGHT_DECAY))
+            param_groups.append(dict(kind="muon", params=[self.stacks[key]], lr=MATRIX_LR, momentum=_EFF_MUON_MOMENTUM, beta2=_EFF_MUON_BETA2, ns_steps=NS_STEPS, weight_decay=WEIGHT_DECAY))
         canon_params = [p for _n, p in self.named_parameters() if ".canon_" in _n]
         if canon_params:
             param_groups.append(dict(kind="adamw", params=canon_params, lr=CANON_LR, betas=(0.9, 0.95),
@@ -3243,6 +3361,16 @@ class GPT(nn.Module):
         opt = MuonAdamW(param_groups)
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
+        # the log must prove which path is live
+        if B2:
+            print0(f"B2 LINEAR-TEMPERATURE regime ON: wd_track={B2_WD_TRACK} (wd_t = {WEIGHT_DECAY} * lrm) "
+                   f"final_lr_frac={_EFF_FINAL_LR_FRAC} warmup={_EFF_WARMUP_STEPS} muon_mom_peak={_EFF_MUON_MOMENTUM} "
+                   f"muon_beta2={_EFF_MUON_BETA2} ema_start={_EFF_EMA_START} ema_decay={_EFF_EMA_DECAY} "
+                   f"blend={EMA_BLEND}/{EMA_TABLE_BLEND} (unchanged) diag_every={B2_DIAG_EVERY}")
+        else:
+            print0(f"B2 off: baseline schedule (warmup={_EFF_WARMUP_STEPS} final_lr_frac={_EFF_FINAL_LR_FRAC} "
+                   f"muon_mom_peak={_EFF_MUON_MOMENTUM} muon_beta2={_EFF_MUON_BETA2} wd={WEIGHT_DECAY} const "
+                   f"ema_start={_EFF_EMA_START} ema_decay={_EFF_EMA_DECAY})")
         return opt
 
     def head_logits(self, x: torch.Tensor) -> torch.Tensor:
@@ -3727,6 +3855,7 @@ class EmbedSidecar:
                             build_nki_embed()[1][(1,)](self.gbuf[name], g2c, perm_t, sidx_t)
                         done = True
                     except Exception as exc:   # kernel lowering failure for a rare shape: the device's own index_add_
+                        note_fallback(f"embedding scatter {name} -> index_add_", exc)
                         print0(f"scatter kernel failed ({str(exc)[:80]}); index_add_ fallback")
                 if not done:
                     R = self.tables[name].shape[0]
@@ -3949,7 +4078,11 @@ class MuonAdamW(torch.optim.Optimizer):
                 except Exception as exc:
                     self.use_nki = False
                     note_fallback("NKI AdamW -> PyTorch (WHOLE OPTIMIZER)", exc)
-                print0(f"NKI AdamW kernel unavailable ({str(exc)[:80]}); using the PyTorch step")
+                    # MUST stay inside the except clause: Python deletes exc at clause exit, so at 16 spaces
+                    # this raised UnboundLocalError out of optimizer.step() and killed the run BEFORE the
+                    # checkpoint was written - turning a graceful ~7x slowdown into no score at all. Its twin
+                    # in _muon_step is correctly indented, which is how the asymmetry survived.
+                    print0(f"NKI AdamW kernel unavailable ({str(exc)[:80]}); using the PyTorch step")
             p.mul_(1 - lr_t * group["weight_decay"])
             exp_avg.lerp_(grad, 1 - beta1)
             exp_avg_sq.lerp_(grad.square(), 1 - beta2)
@@ -4147,18 +4280,18 @@ def load_for_eval(checkpoint_path: str, device: torch.device) -> nn.Module:
 
 
 def lr_multiplier(step: int, elapsed_frac: float) -> float:
-    if step < WARMUP_STEPS:
-        return (step + 1) / max(1, WARMUP_STEPS)
+    if step < _EFF_WARMUP_STEPS:
+        return (step + 1) / max(1, _EFF_WARMUP_STEPS)
     warmdown_start = 1.0 - WARMDOWN_TIME_FRAC
     if elapsed_frac <= warmdown_start:
         return 1.0
     frac = min(1.0, (elapsed_frac - warmdown_start) / WARMDOWN_TIME_FRAC)
-    return 1.0 - (1.0 - FINAL_LR_FRAC) * frac
+    return 1.0 - (1.0 - _EFF_FINAL_LR_FRAC) * frac
 
 
 def muon_momentum(step: int) -> float:
     frac = min(step / 300, 1.0)
-    return (1 - frac) * 0.85 + frac * 0.95
+    return (1 - frac) * 0.85 + frac * _EFF_MUON_MOMENTUM
 
 
 def synced_elapsed_frac(budget_started: float, max_seconds: float, device: torch.device) -> float:
@@ -4312,6 +4445,10 @@ def main() -> None:
     ema_pairs = None
     ema_tab_params = None
     ema_tab_pairs = None
+    ema_names = None            # SAVE_EMA_PARTS only: state_dict keys for ema_pairs / ema_tab_pairs, in the same
+    ema_tab_names = None        # order, so the offline tool can key its dicts by name
+    ema_extra = None            # SAVE_EMA_PARTS + EMA_DECAY_EXTRA only: one accumulator list per extra decay
+    ema_tab_extra = None
     next_plans = None
     loop_started = time.monotonic()
     budget_started = loop_started
@@ -4334,7 +4471,11 @@ def main() -> None:
                 if sidecar is not None:
                     emb, plans = sidecar.gather(x, next_plans)
                     if step == 0 and micro == 0:
-                        check_fused_loss(orig_model, x, y, emb)     # once, eagerly, before the compiled graph is traced
+                        try:    # once, eagerly, before the compiled graph is traced. ISOLATED: without this, an OOM
+                            check_fused_loss(orig_model, x, y, emb)   # here hits the sidecar handler below, which
+                        except Exception as _diag_exc:                # loses the sidecar for the WHOLE RUN (~+0.0070)
+                            print0(f"!!! fused-loss check could not run "
+                                   f"({str(_diag_exc)[:120]}); fused path KEPT")
                     loss = model(x, y, emb=emb)
                     last_loss = loss.detach()
                     (loss / grad_accum_steps).backward()
@@ -4348,6 +4489,9 @@ def main() -> None:
                 (loss / grad_accum_steps).backward()
             except Exception as exc:
                 if sidecar is not None and step == 0:
+                    # record it: the in-graph one-hot scatter is ~20% of the step, so a run that loses the
+                    # sidecar is about +0.0070 bpb - and without this it still printed NKI_FALLBACKS: 0.
+                    note_fallback("embedding sidecar -> tables in the graph (WHOLE RUN)", exc)
                     print0(f"embedding sidecar failed at step 0 ({str(exc)[:200]}); tables in the graph")
                     sidecar = None
                     optimizer.zero_grad(set_to_none=True)
@@ -4401,9 +4545,14 @@ def main() -> None:
             group["lr"] = group["initial_lr"] * lrm
             if group["kind"] == "muon":
                 group["momentum"] = muon_momentum(step)
+                if B2 and B2_WD_TRACK:
+                    # THE BRANCH: wd tracks the LR, so ||W||_eq ~ sqrt(lr_t/wd_t) is constant and the temperature
+                    # lr_t/||W|| is LINEAR in lrm instead of sqrt(lrm). Read fresh by both Muon paths every step
+                    # (the kernel takes lr*wd as a device scalar), so this costs nothing.
+                    group["weight_decay"] = WEIGHT_DECAY * lrm
         optimizer.refresh_scalars()
         optimizer.step()
-        if elapsed_frac >= EMA_START:
+        if elapsed_frac >= _EFF_EMA_START:
             with torch.no_grad():
                 if ema_params is None:
                     tables = {id(m.weight) for m in orig_model.transformer.values() if isinstance(m, nn.Embedding)}
@@ -4420,11 +4569,36 @@ def main() -> None:
                            + " | excluded: " + ", ".join(
                                f"{n}({m.weight.numel():,})" for n, m in orig_model.transformer.items()
                                if isinstance(m, nn.Embedding) and m.weight.numel() > EMA_TABLE_MAX))
+                    if SAVE_EMA_PARTS:
+                        # named_parameters() has the same order and the same predicate as the parameters() call
+                        # above, so this only recovers the state_dict keys - the EMA math is untouched.
+                        ema_names = [n for n, p in orig_model.named_parameters() if id(p) not in tables]
+                        ema_tab_names = [f"transformer.{n}.weight" for n, _p in _tabs]
+                        if len(ema_names) != len(ema_pairs) or len(ema_tab_names) != len(ema_tab_pairs):
+                            # Deliberately NOT an assert: this fires ~60% into a 30-minute gate, and losing the
+                            # gate to a broken dev instrument is far worse than losing the instrument.
+                            print(f"!!! SAVE_EMA_PARTS DISABLED: name/parameter count mismatch "
+                                  f"({len(ema_names)} vs {len(ema_pairs)}, {len(ema_tab_names)} vs "
+                                  f"{len(ema_tab_pairs)}). Training continues normally; no parts will be written.",
+                                  flush=True)
+                            ema_names = ema_tab_names = None
+                        elif EMA_DECAY_EXTRA:
+                            ema_extra = [[p.detach().clone() for p in ema_pairs] for _d in EMA_DECAY_EXTRA]
+                            ema_tab_extra = [[p.detach().clone() for p in ema_tab_pairs] for _d in EMA_DECAY_EXTRA]
+                            print0(f"SAVE_EMA_PARTS: {len(EMA_DECAY_EXTRA)} extra EMA track(s) at decay "
+                                   + ", ".join(f"{d} (tau {1.0 / max(1e-9, 1.0 - d):.0f} steps)"
+                                               for d in EMA_DECAY_EXTRA))
                 else:
                     for e, p in zip(ema_params, ema_pairs):
-                        e.lerp_(p.detach(), 1.0 - EMA_DECAY)
+                        e.lerp_(p.detach(), 1.0 - _EFF_EMA_DECAY)
                     for e, p in zip(ema_tab_params, ema_tab_pairs):
-                        e.lerp_(p.detach(), 1.0 - EMA_DECAY)
+                        e.lerp_(p.detach(), 1.0 - _EFF_EMA_DECAY)
+                    if ema_extra is not None:      # dev instrument only; never on a scored run
+                        for _d, _es, _ets in zip(EMA_DECAY_EXTRA, ema_extra, ema_tab_extra):
+                            for e, p in zip(_es, ema_pairs):
+                                e.lerp_(p.detach(), 1.0 - _d)
+                            for e, p in zip(_ets, ema_tab_pairs):
+                                e.lerp_(p.detach(), 1.0 - _d)
 
         synchronize(device)
         record_step_boundary(step)
@@ -4465,6 +4639,15 @@ def main() -> None:
         total_train_tokens += TOTAL_BATCH_SIZE
         smooth_loss = 0.9 * smooth_loss + 0.1 * train_loss
         debiased = smooth_loss / (1 - 0.9 ** (step + 1))
+        if B2_DIAG_EVERY > 0 and rank == 0 and step % B2_DIAG_EVERY == 0:
+            # THE FALSIFIER: the claim is that the baseline's Muon matrices lose ~1.7x of Frobenius norm across the
+            # warmdown (the norm tracks sqrt(lr_t/wd) and then freezes) while B2's stay flat. Eager device ops, so
+            # only under the flag.
+            with torch.no_grad():
+                norms = {k: float(v.detach().float().norm().item()) for k, v in sorted(orig_model.stacks.items())}
+            _wd_now = next((g["weight_decay"] for g in optimizer.param_groups if g["kind"] == "muon"), float("nan"))
+            print(f"B2DIAG step {step:05d} lrm {lrm:.3f} wd {_wd_now:.4f} | "
+                  + " ".join(f"{k}:{n:.1f}" for k, n in norms.items()), flush=True)
         if rank == 0 and (step < 5 or step % 10 == 0):
             remaining_time = max(0.0, args.max_train_seconds - (time.monotonic() - budget_started))
             print(
@@ -4481,6 +4664,33 @@ def main() -> None:
         if int(control[1].item()) != 0:
             break
 
+    # SAVE_EMA_PARTS: copy the RAW weights out BEFORE the blend below overwrites them in place. This is the only
+    # part of the instrument that has to happen inside the timed region; it is ~570 MB of D2H (~285 MB raw +
+    # ~285 MB per average track) and cost T_V59 ~18 of 4240 steps. rank 0 only - every rank holds the same
+    # consolidated weights here, and only rank 0 writes files.
+    ema_parts = None
+    if ema_params is not None and SAVE_EMA_PARTS and ema_names is not None and rank == 0:
+        with torch.no_grad():
+            ema_parts = {
+                "raw": {n: p.detach().cpu().clone() for n, p in zip(ema_names, ema_pairs)},
+                "avg": {n: e.detach().cpu().clone() for n, e in zip(ema_names, ema_params)},
+                "tab_raw": {n: p.detach().cpu().clone() for n, p in zip(ema_tab_names, ema_tab_pairs)},
+                "tab_avg": {n: e.detach().cpu().clone() for n, e in zip(ema_tab_names, ema_tab_params)},
+                # the coefficients and window this run actually shipped, so the offline tool can print the
+                # as-shipped point of the grid without being told it
+                "blend": EMA_BLEND, "table_blend": EMA_TABLE_BLEND,
+                "decay": _EFF_EMA_DECAY, "ema_start": _EFF_EMA_START,
+                "b2": B2, "frac_by_steps": FRAC_BY_STEPS, "steps": step,
+                "extra_decays": list(EMA_DECAY_EXTRA),
+            }
+            if ema_extra is not None:
+                ema_parts["avg_extra"] = [{n: e.detach().cpu().clone() for n, e in zip(ema_names, _es)}
+                                          for _es in ema_extra]
+                ema_parts["tab_avg_extra"] = [{n: e.detach().cpu().clone() for n, e in zip(ema_tab_names, _ets)}
+                                              for _ets in ema_tab_extra]
+        print0(f"SAVE_EMA_PARTS: captured {len(ema_parts['raw'])} raw/avg pairs + {len(ema_parts['tab_raw'])} "
+               f"table pairs at blend {EMA_BLEND}/{EMA_TABLE_BLEND}, decay {_EFF_EMA_DECAY}"
+               + (f" + {len(ema_extra)} extra track(s)" if ema_extra is not None else ""))
     if ema_params is not None:
         with torch.no_grad():
             for e, p in zip(ema_params, ema_pairs):
@@ -4501,6 +4711,23 @@ def main() -> None:
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
     budget_elapsed_after_save = time.monotonic() - budget_started
+
+    # SAVE_EMA_PARTS: write the parts to their OWN file, after both charged-budget timestamps are taken, so the
+    # ~570 MB of I/O does not inflate charged_seconds_est and the instrument run stays comparable to a plain gate.
+    # `final.pt` above is byte-for-byte what a flag-off run would have written.
+    if ema_parts is not None:
+        parts_path = Path(args.out_dir) / "ema_parts.pt"
+        try:
+            torch.save(ema_parts, parts_path)
+            print0(f"SAVE_EMA_PARTS: wrote {parts_path} ({parts_path.stat().st_size / 1e6:.0f} MB) - sweep it "
+                   f"with experimental/blend_reconstruct.py; final.pt is unchanged by this flag")
+        except Exception as exc:      # a full disk must not cost us the run: final.pt is already written
+            print(f"!!! SAVE_EMA_PARTS: could not write {parts_path} ({exc}); the run is otherwise unaffected",
+                  flush=True)
+        del ema_parts
+    elif SAVE_EMA_PARTS and rank == 0:
+        print("!!! SAVE_EMA_PARTS was set but NO parts were written: the tail EMA never started this run "
+              f"(needs elapsed_frac >= {_EFF_EMA_START}). There is nothing to sweep.", flush=True)
 
     public_eval = None
     causal = None
