@@ -239,6 +239,34 @@ WARMDOWN_TIME_FRAC = 0.90       # linear decay over the last 90% of the time bud
 FINAL_LR_FRAC = 0.02            # ... to 2% of peak
 
 # -----------------------------------------------------------------------------
+# SAVE_EMA_PARTS (DEV INSTRUMENT, default off): the tail-EMA blend is a pure post-training linear combination,
+#
+#     p_final = (1 - b) * p_raw + b * p_avg
+#
+# applied once after the last optimizer step, so a run that keeps p_raw AND p_avg determines the optimum for EVERY
+# b exactly, offline, with zero gate time. That is how v60 was found (EMA_BLEND 0.35 -> 0.65, -0.000484 on the
+# box, predicted to 0.00001 by the offline grid). The live blend DESTROYS p_raw: `p.lerp_(e, EMA_BLEND)` writes
+# in place, and only the accumulator `e` survives - so the raw weights must be copied out BEFORE the blend or the
+# information is gone. This flag does exactly that, and nothing else.
+#
+# The parts go to a SEPARATE file `ema_parts.pt` beside `final.pt`, never into `final.pt` itself: `final.pt` is
+# what the scorer reads through `load_for_eval` and it must stay byte-identical to a flag-off run (v59 put the
+# parts inside the checkpoint, which tripled it to 1.4 GB and put dev-only tensors in the scored payload).
+# The file is written AFTER the charged-budget timestamps are taken, so its ~570 MB of I/O is not charged.
+SAVE_EMA_PARTS = os.environ.get("NEURON_COMPETITION_R1_SAVE_EMA_PARTS", "0") != "0"
+# Extra tail-EMA tracks at OTHER decays, maintained in parallel, purely so the DECAY axis is also free offline
+# (one accumulator per decay; the offline tool then sweeps decay x blend, and convex mixes of two tracks
+# interpolate between their horizons). Comma-separated, e.g. "0.997,0.9990". Ignored unless SAVE_EMA_PARTS is on.
+# COST, measured not guessed: each track is 16 more in-place `lerp_` calls per step on tensors already resident in
+# device memory. The four table lerps are ~0.07 ms (noted above), and the 60-75 ms-per-eager-op figure does NOT
+# apply here - that is the cost of a torch op that BREAKS the traced graph inside the model forward, whereas these
+# run after optimizer.step() on resident buffers. Empirically: T_V66 carried two tracks and got 4230 steps against
+# v62's 4238 and v64's 4219, i.e. inside the run-to-run scatter. Memory is ~285 MB of device HBM per extra track
+# (71.3M fp32 elements: 54.5M matrix/head/scalar + 16.8M tables) and ~285 MB more in the output file.
+EMA_DECAY_EXTRA = [float(s) for s in
+                   os.environ.get("NEURON_COMPETITION_R1_EMA_DECAY_EXTRA", "").replace(" ", "").split(",") if s]
+
+# -----------------------------------------------------------------------------
 # BRANCH B2: the LINEAR-TEMPERATURE regime.  One flag, default off; with B2=0 every value below is unused and the
 # file is the canon file.
 #
@@ -4131,6 +4159,10 @@ def main() -> None:
     ema_pairs = None
     ema_tab_params = None
     ema_tab_pairs = None
+    ema_names = None            # SAVE_EMA_PARTS only: state_dict keys for ema_pairs / ema_tab_pairs, in the same
+    ema_tab_names = None        # order, so the offline tool can key its dicts by name
+    ema_extra = None            # SAVE_EMA_PARTS + EMA_DECAY_EXTRA only: one accumulator list per extra decay
+    ema_tab_extra = None
     next_plans = None
     loop_started = time.monotonic()
     budget_started = loop_started
@@ -4244,11 +4276,36 @@ def main() -> None:
                            + " | excluded: " + ", ".join(
                                f"{n}({m.weight.numel():,})" for n, m in orig_model.transformer.items()
                                if isinstance(m, nn.Embedding) and m.weight.numel() > EMA_TABLE_MAX))
+                    if SAVE_EMA_PARTS:
+                        # named_parameters() has the same order and the same predicate as the parameters() call
+                        # above, so this only recovers the state_dict keys - the EMA math is untouched.
+                        ema_names = [n for n, p in orig_model.named_parameters() if id(p) not in tables]
+                        ema_tab_names = [f"transformer.{n}.weight" for n, _p in _tabs]
+                        if len(ema_names) != len(ema_pairs) or len(ema_tab_names) != len(ema_tab_pairs):
+                            # Deliberately NOT an assert: this fires ~60% into a 30-minute gate, and losing the
+                            # gate to a broken dev instrument is far worse than losing the instrument.
+                            print(f"!!! SAVE_EMA_PARTS DISABLED: name/parameter count mismatch "
+                                  f"({len(ema_names)} vs {len(ema_pairs)}, {len(ema_tab_names)} vs "
+                                  f"{len(ema_tab_pairs)}). Training continues normally; no parts will be written.",
+                                  flush=True)
+                            ema_names = ema_tab_names = None
+                        elif EMA_DECAY_EXTRA:
+                            ema_extra = [[p.detach().clone() for p in ema_pairs] for _d in EMA_DECAY_EXTRA]
+                            ema_tab_extra = [[p.detach().clone() for p in ema_tab_pairs] for _d in EMA_DECAY_EXTRA]
+                            print0(f"SAVE_EMA_PARTS: {len(EMA_DECAY_EXTRA)} extra EMA track(s) at decay "
+                                   + ", ".join(f"{d} (tau {1.0 / max(1e-9, 1.0 - d):.0f} steps)"
+                                               for d in EMA_DECAY_EXTRA))
                 else:
                     for e, p in zip(ema_params, ema_pairs):
                         e.lerp_(p.detach(), 1.0 - _EFF_EMA_DECAY)
                     for e, p in zip(ema_tab_params, ema_tab_pairs):
                         e.lerp_(p.detach(), 1.0 - _EFF_EMA_DECAY)
+                    if ema_extra is not None:      # dev instrument only; never on a scored run
+                        for _d, _es, _ets in zip(EMA_DECAY_EXTRA, ema_extra, ema_tab_extra):
+                            for e, p in zip(_es, ema_pairs):
+                                e.lerp_(p.detach(), 1.0 - _d)
+                            for e, p in zip(_ets, ema_tab_pairs):
+                                e.lerp_(p.detach(), 1.0 - _d)
 
         synchronize(device)
         record_step_boundary(step)
@@ -4314,6 +4371,33 @@ def main() -> None:
         if int(control[1].item()) != 0:
             break
 
+    # SAVE_EMA_PARTS: copy the RAW weights out BEFORE the blend below overwrites them in place. This is the only
+    # part of the instrument that has to happen inside the timed region; it is ~570 MB of D2H (~285 MB raw +
+    # ~285 MB per average track) and cost T_V59 ~18 of 4240 steps. rank 0 only - every rank holds the same
+    # consolidated weights here, and only rank 0 writes files.
+    ema_parts = None
+    if ema_params is not None and SAVE_EMA_PARTS and ema_names is not None and rank == 0:
+        with torch.no_grad():
+            ema_parts = {
+                "raw": {n: p.detach().cpu().clone() for n, p in zip(ema_names, ema_pairs)},
+                "avg": {n: e.detach().cpu().clone() for n, e in zip(ema_names, ema_params)},
+                "tab_raw": {n: p.detach().cpu().clone() for n, p in zip(ema_tab_names, ema_tab_pairs)},
+                "tab_avg": {n: e.detach().cpu().clone() for n, e in zip(ema_tab_names, ema_tab_params)},
+                # the coefficients and window this run actually shipped, so the offline tool can print the
+                # as-shipped point of the grid without being told it
+                "blend": EMA_BLEND, "table_blend": EMA_TABLE_BLEND,
+                "decay": _EFF_EMA_DECAY, "ema_start": _EFF_EMA_START,
+                "b2": B2, "frac_by_steps": FRAC_BY_STEPS, "steps": step,
+                "extra_decays": list(EMA_DECAY_EXTRA),
+            }
+            if ema_extra is not None:
+                ema_parts["avg_extra"] = [{n: e.detach().cpu().clone() for n, e in zip(ema_names, _es)}
+                                          for _es in ema_extra]
+                ema_parts["tab_avg_extra"] = [{n: e.detach().cpu().clone() for n, e in zip(ema_tab_names, _ets)}
+                                              for _ets in ema_tab_extra]
+        print0(f"SAVE_EMA_PARTS: captured {len(ema_parts['raw'])} raw/avg pairs + {len(ema_parts['tab_raw'])} "
+               f"table pairs at blend {EMA_BLEND}/{EMA_TABLE_BLEND}, decay {_EFF_EMA_DECAY}"
+               + (f" + {len(ema_extra)} extra track(s)" if ema_extra is not None else ""))
     if ema_params is not None:
         with torch.no_grad():
             for e, p in zip(ema_params, ema_pairs):
@@ -4334,6 +4418,23 @@ def main() -> None:
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
     budget_elapsed_after_save = time.monotonic() - budget_started
+
+    # SAVE_EMA_PARTS: write the parts to their OWN file, after both charged-budget timestamps are taken, so the
+    # ~570 MB of I/O does not inflate charged_seconds_est and the instrument run stays comparable to a plain gate.
+    # `final.pt` above is byte-for-byte what a flag-off run would have written.
+    if ema_parts is not None:
+        parts_path = Path(args.out_dir) / "ema_parts.pt"
+        try:
+            torch.save(ema_parts, parts_path)
+            print0(f"SAVE_EMA_PARTS: wrote {parts_path} ({parts_path.stat().st_size / 1e6:.0f} MB) - sweep it "
+                   f"with experimental/blend_reconstruct.py; final.pt is unchanged by this flag")
+        except Exception as exc:      # a full disk must not cost us the run: final.pt is already written
+            print(f"!!! SAVE_EMA_PARTS: could not write {parts_path} ({exc}); the run is otherwise unaffected",
+                  flush=True)
+        del ema_parts
+    elif SAVE_EMA_PARTS and rank == 0:
+        print("!!! SAVE_EMA_PARTS was set but NO parts were written: the tail EMA never started this run "
+              f"(needs elapsed_frac >= {_EFF_EMA_START}). There is nothing to sweep.", flush=True)
 
     public_eval = None
     causal = None
