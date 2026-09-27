@@ -36,6 +36,7 @@ ap.add_argument("--vehicle", default="submission_raw/submission_v72_clean_dyfuse
 ap.add_argument("--tokens", type=int, default=4 * 524288)
 ap.add_argument("--rows", type=int, default=4)
 ap.add_argument("--offsets", default="10,30,80")
+ap.add_argument("--temps", default="0.96,0.98,1.02,1.04,1.08")
 args = ap.parse_args()
 
 import importlib.util  # noqa: E402
@@ -78,6 +79,20 @@ def run(fn, label):
 
 
 ref = run(None, "BASELINE")
+
+# ---- TEMP: a scalar on the logits. WHY THIS IS NOT TRIVIALLY 1.0 -----------------------------------------
+# Training minimises exactly this metric, so at the training optimum the calibration is already right and a
+# temperature can only hurt. But the shipped recipe BLENDS WEIGHTS AFTER TRAINING ENDS (tail-EMA, blend 0.65 on
+# the table group) and nothing re-calibrates afterwards. A convex average of two weight vectors generally has a
+# SMALLER effective logit scale than either endpoint - averaging in weight space shrinks the margin - which makes
+# the blended model systematically UNDER-confident on a metric that rewards confidence when correct. So the
+# optimum here is expected slightly ABOVE 1.0, and it is free: one scalar, pure output space, exactly evaluable.
+# The learned logit softcap (tanh) does not absorb this: it squashes the tail, it does not rescale the body.
+for t in [float(x) for x in args.temps.split(",")]:
+    def fn(lg, idx, t=t):
+        return lg * t
+    b = run(fn, f"TEMP x{t:g}")
+    print(f"{'':28s}   delta {b - ref:+.6f}", flush=True)
 
 # ---- SPECIAL: a finite negative offset on the never-scored ids -------------------------------------------
 sp_idx = torch.tensor(never, device=dev, dtype=torch.long)
