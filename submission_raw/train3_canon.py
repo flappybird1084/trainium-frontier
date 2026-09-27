@@ -159,6 +159,13 @@ KEY_OFFSET = os.environ.get("NEURON_COMPETITION_R1_KEY_OFFSET", "1") != "0"   # 
 # in our own data to the Canon-style conv that C_PRE3 just showed we cannot afford as torch ops. hq <= HD/2,
 # because the kernel shifts dims hq:2hq.
 KEY_OFFSET_DIV = int(os.environ.get("NEURON_COMPETITION_R1_KEY_OFFSET_DIV", "4"))
+# RESIDUAL-BRANCH INIT SCALE, never swept in 654 rows. init_weights zero-initialises BOTH residual output
+# projections (attn.c_proj and mlp.c_proj). That is standard practice for stability, but Muon normalises the
+# UPDATE rather than the weight, so a zero-init matrix can only GROW, at a fixed Frobenius rate per step - it
+# spends a large part of the run travelling to its operating norm instead of learning at it. Our own B2 norm
+# diagnostic measured exactly that: the w512x3072 (c_proj) stack goes 0.0 -> 74.8 -> 123.5 -> 142.1 -> 145.7 and
+# only then plateaus. 0 keeps the zeros; a value multiplies the same `s` the other projections use.
+CPROJ_INIT = float(os.environ.get("NEURON_COMPETITION_R1_CPROJ_INIT", "0"))
 # Canon-style causal depthwise conv on the residual stream (ranked quality item 6). Width in taps: 0/1 = off.
 # CANON_ATTN acts on the attention input, CANON_MLP on the MLP input. Identity init, so off == on at step 0.
 CANON_ATTN_W = int(os.environ.get("NEURON_COMPETITION_R1_CANON_ATTN", "0"))
@@ -208,6 +215,45 @@ NEST_END = float(os.environ.get("NEURON_COMPETITION_R1_NEST_END", "0.75"))
 _NEST_B = [0.0]            # beta to bake in for the NEXT forward, set by the training loop each step
 CANON_LR = float(os.environ.get("NEURON_COMPETITION_R1_CANON_LR", "0.02"))
 CANON_ON = CANON_ATTN_W > 1 or CANON_MLP_W > 1   # these two live INSIDE the fused layer op -> explicit path only
+# ---------------------------------------------------------------------------------------------------------------
+# MUDD (multiway dynamic dense connections) -- the modded-nanogpt RECORD variant (PR #259, merged), NOT the paper's.
+#
+# Published, n=10 per arm: baseline 1480 steps / 84.70 s / 3.2788 nats; baseline 1430 / 81.68 s / 3.2867;
+# +MUDD 1430 / 83.20 s / 3.2783. At MATCHED steps that is -8.4 millinats for +1.84% step time; in our units
+# 1 millinat = 0.000359 bpb, so -0.0030 bpb published.
+#
+# WHY THIS IS NOT THE VERSION THIS PROJECT ALREADY REJECTED (ledger 466-469, submission_raw/train3_mudd_op.py,
+# MUDD_W1_G = +62% step time and a fixed-time LOSS): that file built `MuddMixer(n_embd, i+1, ways)` for EVERY one
+# of the 12 blocks, each mixing ALL i+1 prior residual states -> sum_i (i+1) = 78 weighted-sum terms, 12 mixer
+# MLPs, 12 RMSNorms, and a `.float()` cast on every source (the whole mix ran in fp32). The record's author, on
+# the paper version: "too expensive at this model scale". His trimmed version, implemented here, is
+#   - only the LAST TWO layers consume MUDD; every earlier layer is byte-unchanged;
+#   - tiny source subsets: layer N-2 mixes {x0, h_mid, x} (3), layer N-1 mixes {x0, x} (2);
+#   - TWO channels only: `v_mudd` added into V, `resid_mudd` added into the residual stream (Q and K dropped);
+#   - NO new projection: v_mudd is produced in V's shape and rides the `ve` input the fused layer op ALREADY takes
+#     (`v = c_v(x) + ve_lambda * ve`), so no NKI kernel changes at all.
+# That is 5 sources x 2 channels = 10 weighted-sum terms and 2 mixer MLPs, in the residual dtype, against 78
+# terms / 12 mixers / 12 norms in fp32 -- roughly 15x less work, and it touches 2 sites instead of 12.
+#
+# STEP-TIME RISK (the thing that decides this): a torch op between the fused layer custom-ops is not folded into
+# the compiled graph on this backend (C_CAN3). But C_CAN3's ~95 ms per conv SITE is a `cat`/`slice`/`masked_fill`
+# shift along the TOKEN axis; MUDD adds only broadcast-multiply and add, the cheapest member of the class, and
+# MUDD_W1_G is a direct measurement of exactly these ops here (+62% for ~78 terms -> ~+8% pessimistic for 10).
+#
+# CORRECTNESS CHECK BUILT IN: w2 and bs are ZERO-initialised, so every coefficient is exactly 0 at step 0 and
+# MUDD-on is bit-identical to MUDD-off on the first step. If a run's step-0 loss differs, the wiring is wrong.
+MUDD = os.environ.get("NEURON_COMPETITION_R1_MUDD", "0") != "0"
+# 2 = published (v + residual); 1 = v-only, which adds NOTHING to the residual stream between the fused layer ops
+# and only enlarges a tensor already being passed into the op -> roughly half the step cost, about half the effect.
+MUDD_CHANNELS = int(os.environ.get("NEURON_COMPETITION_R1_MUDD_CHANNELS", "2"))
+MUDD_DIM = int(os.environ.get("NEURON_COMPETITION_R1_MUDD_DIM", "64"))     # mixer bottleneck width
+MUDD_MID = int(os.environ.get("NEURON_COMPETITION_R1_MUDD_MID", "7"))      # the mid-depth source: output of block 7
+MUDD_SITES_ENV = os.environ.get("NEURON_COMPETITION_R1_MUDD_LAYERS", "")   # default: the last two layers
+MUDD_LR_SCALE = float(os.environ.get("NEURON_COMPETITION_R1_MUDD_LR_SCALE", "0.25"))   # x SCALAR_LR, as published
+# Safety knob only: feed RMSNorm(x) to the mixer instead of raw x. The record feeds raw x and that is the default
+# here; the rejected version needed the norm because it mixed in fp32 over a residual that grows across all 12
+# layers. Turn on only if a run diverges.
+MUDD_NORM = os.environ.get("NEURON_COMPETITION_R1_MUDD_NORM", "0") != "0"
 FRAC_BY_STEPS = os.environ.get("NEURON_COMPETITION_R1_FRAC_BY_STEPS", "0") != "0"
 EMA_DECAY = 0.997               # tail-EMA of the weights over the last 15% of the budget (tau ~330; 0.9933 -> 0.997 = -0.0006 at 1800 s, S2_EMA0997), ...
 # EMA_START 0.85 -> 0.75: the averaging window and the blend are COUPLED, and the blend just moved a lot.
@@ -371,7 +417,9 @@ if NKI_AVAILABLE:
             nisa.dma_copy(dst=ix, src=idx[t * _NKI_P:(t + 1) * _NKI_P, :])
             ixc = nl.ndarray((_NKI_P, 1), dtype=nl.uint32, buffer=nl.sbuf)
             nisa.tensor_scalar(dst=ixc, data=ix, op0=nl.minimum, operand0=R - 1)
-            rows = nl.ndarray((_NKI_P, C), dtype=nl.float32, buffer=nl.sbuf)
+            # BTE_BF16: the staging buffer follows the table (nl.float32 for the four fp32 token tables, so this is
+            # trace-identical there). A converting INDIRECT DMA could reinterpret bytes rather than failing.
+            rows = nl.ndarray((_NKI_P, C), dtype=table.dtype, buffer=nl.sbuf)
             nisa.dma_copy(dst=rows, src=table.ap(pattern=[[C, _NKI_P], [1, C]], vector_offset=ixc, indirect_dim=0))
             nisa.dma_copy(dst=out[t * _NKI_P:(t + 1) * _NKI_P, :], src=rows)
         return out
@@ -393,7 +441,9 @@ if NKI_AVAILABLE:
             nisa.dma_copy(dst=ix, src=idx[t * _NKI_P:(t + 1) * _NKI_P, :])
             ixc = nl.ndarray((_NKI_P, 1), dtype=nl.uint32, buffer=nl.sbuf)
             nisa.tensor_scalar(dst=ixc, data=ix, op0=nl.minimum, operand0=Rp - 1)
-            rows = nl.ndarray((_NKI_P, C), dtype=nl.float32, buffer=nl.sbuf)
+            # BTE_BF16: `table` here is the gradient ACCUMULATOR and dma_compute adds into it in place, so all three
+            # operands must share a dtype (nl.float32 for the four fp32 token tables: trace-identical there).
+            rows = nl.ndarray((_NKI_P, C), dtype=table.dtype, buffer=nl.sbuf)
             nisa.dma_copy(dst=rows, src=grad.ap(pattern=[[C, _NKI_P], [1, C]], vector_offset=pmc, indirect_dim=0))
             tgt = table.ap(pattern=[[C, _NKI_P], [1, C]], vector_offset=ixc, indirect_dim=0)
             nisa.dma_compute(dst=tgt, srcs=[tgt, rows], reduce_op=nl.add)
@@ -2943,6 +2993,54 @@ def canon_conv(h: torch.Tensor, w: torch.Tensor, doc_start) -> torch.Tensor:
     return out
 
 
+def mudd_sites(n_layer: int) -> tuple[int, ...]:
+    """Which blocks consume MUDD. Default = the last two (N-2, N-1), as in the record."""
+    if MUDD_SITES_ENV:
+        return tuple(int(s) for s in MUDD_SITES_ENV.split(",") if s.strip() != "")
+    return (n_layer - 2, n_layer - 1)
+
+
+class MuddMixer(nn.Module):
+    """Per-token mixing coefficients over `n_src` earlier hidden states, for `ch` channels.
+
+    c = w2 @ gelu(w1 @ x) + bs, shape (b, t, ch * n_src). Channel j accumulates sum_k c[..., j, k] * srcs[k]
+    straight into its DESTINATION tensor (V's `ve` input for j=0, the residual stream for j=1), which is one
+    fewer (b, t, D) op than building the sum from zero and adding it afterwards.
+
+    Exactly a no-op at init: w2 and bs are zero, so every coefficient is 0 and every destination comes out
+    unchanged, bit for bit. The mixer MLP runs on the small (b, t, MUDD_DIM) / (b, t, ch*n_src) tensors in fp32
+    (free at this size) while the weighted sum stays in the residual dtype (bf16 on Trainium) -- the rejected
+    version cast every (b, t, D) SOURCE to fp32, which doubled the traffic of the expensive part.
+    """
+
+    def __init__(self, d: int, n_src: int, ch: int, dim: int):
+        super().__init__()
+        self.n_src, self.ch = n_src, ch
+        self.w1 = nn.Parameter(torch.empty(dim, d))
+        self.w2 = nn.Parameter(torch.zeros(ch * n_src, dim))
+        self.bs = nn.Parameter(torch.zeros(ch * n_src))
+        self.reset_parameters()
+
+    @torch.no_grad()
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.w1, a=math.sqrt(5))
+        self.w2.zero_()
+        self.bs.zero_()
+
+    def forward(self, x: torch.Tensor, srcs, dests):
+        assert len(srcs) == self.n_src and len(dests) >= self.ch
+        h = norm(x) if MUDD_NORM else x
+        c = F.linear(h, self.w1.to(dtype=h.dtype))                       # (b, t, MUDD_DIM), the only big read
+        c = F.linear(F.gelu(c.float()), self.w2.float(), self.bs.float())   # (b, t, ch * n_src), fp32, tiny
+        outs = []
+        for j in range(self.ch):
+            acc = dests[j]
+            for k, s in enumerate(srcs):
+                acc = acc + c[..., j * self.n_src + k:j * self.n_src + k + 1].to(s.dtype) * s
+            outs.append(acc)
+        return outs
+
+
 class Block(nn.Module):
     def __init__(self, config: GPTConfig, registry: StackRegistry):
         super().__init__()
@@ -3007,6 +3105,17 @@ class GPT(nn.Module):
         })
         registry = StackRegistry()
         self.transformer["h"] = nn.ModuleList([Block(config, registry) for _ in range(config.n_layer)])
+        if MUDD:
+            # One mixer per consuming site. The FIRST site also reads the mid-depth hidden h_mid (output of block
+            # MUDD_MID); later sites read {x0, x} only. MUDD_MID must precede the first site or h_mid would not
+            # exist yet -- asserted rather than silently falling back to 2 sources.
+            self._mudd_sites = mudd_sites(config.n_layer)
+            assert all(0 <= s < config.n_layer for s in self._mudd_sites), f"MUDD sites {self._mudd_sites} out of range"
+            assert MUDD_MID < min(self._mudd_sites), f"MUDD_MID={MUDD_MID} must precede the first MUDD site {min(self._mudd_sites)}"
+            assert MUDD_CHANNELS in (1, 2), "MUDD_CHANNELS must be 1 (v only) or 2 (v + residual)"
+            self.mudd = nn.ModuleDict({
+                str(s): MuddMixer(config.n_embd, 3 if s == self._mudd_sites[0] else 2, MUDD_CHANNELS, MUDD_DIM)
+                for s in self._mudd_sites})
         self.stacks = registry.build()
         for m in self.modules():
             if isinstance(m, StackedLinear):
@@ -3040,9 +3149,15 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
+            if CPROJ_INIT > 0:
+                torch.nn.init.uniform_(block.attn.c_proj.weight, -CPROJ_INIT * s, CPROJ_INIT * s)
+            else:
+                torch.nn.init.zeros_(block.attn.c_proj.weight)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -0.4 * s, 0.4 * s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if CPROJ_INIT > 0:
+                torch.nn.init.uniform_(block.mlp.c_proj.weight, -CPROJ_INIT * s, CPROJ_INIT * s)
+            else:
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
         self.block_scalars["resid"].fill_(1.0)
         self.block_scalars["x0"].fill_(0.05)
         self.block_scalars["ve"].fill_(0.5)
@@ -3051,6 +3166,9 @@ class GPT(nn.Module):
         self.bigram_lambda.fill_(0.2)
         self.softcap_pos.fill_(LOGIT_SOFTCAP)
         self.softcap_neg.fill_(LOGIT_SOFTCAP)
+        if MUDD:
+            for _m in self.mudd.values():       # w2 / bs back to zero -> MUDD-on == MUDD-off at step 0
+                _m.reset_parameters()
         cos, sin = self._precompute_rotary_embeddings(self.config.sequence_len, self.config.n_embd // self.config.n_head)
         self.cos.copy_(cos)
         self.sin.copy_(sin)
@@ -3089,6 +3207,16 @@ class GPT(nn.Module):
         if canon_params:
             param_groups.append(dict(kind="adamw", params=canon_params, lr=CANON_LR, betas=(0.9, 0.95),
                                      eps=1e-10, weight_decay=0.0))
+        if MUDD:
+            # Exactly the published group. flat=True routes it through _adamw_step_flat: w1 is 64x512 = 32768
+            # elements, above the 4096 ceiling that auto-detects the scalar group, and 6 separate parameters on the
+            # per-parameter path would be 6 all_reduces plus ~8 eager ops each (the ledger prices 8 tiny parameters
+            # there at ~28 ms/step). The flat path is 1 cat, 1 all_reduce, the AdamW ops once, and a copy per
+            # parameter, with identical math: same betas/eps/wd and one shared step counter, and every mixer
+            # parameter starts at step 0 together.
+            param_groups.append(dict(kind="adamw", params=[p for _n, p in self.named_parameters() if _n.startswith("mudd.")],
+                                     lr=SCALAR_LR * MUDD_LR_SCALE, betas=(0.9, 0.99), eps=1e-10, weight_decay=0.0,
+                                     flat=True))
         opt = MuonAdamW(param_groups)
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
@@ -3172,12 +3300,26 @@ class GPT(nn.Module):
         n_dec_start = self.config.n_layer - n_enc
         skips: list[torch.Tensor] = []
         bs = self.block_scalars
+        h_mid = None                  # MUDD: output of block MUDD_MID, the one mid-depth source
         for i, block in enumerate(self.transformer.h):
             if i >= n_dec_start:
                 x = x + self.skip_lambdas[i - n_dec_start] * skips.pop()
             ve_i = ve1 if i < t1 else (ve_mid if i < t2 else ve2)
+            if MUDD and i in self._mudd_sites:
+                # Per-token dynamic mix of earlier hiddens into (a) V, via the `ve` input the fused layer op already
+                # takes, and (b) the residual stream. Causal and stateless: the coefficients are a pointwise MLP of
+                # x at the SAME position, and every source is position-aligned, so out[t] reads only inputs <= t.
+                # The `ve` channel is scaled by the block's learned ve_lambda (v = c_v(.) + ve_lambda * ve); the
+                # mixer's w2 absorbs that factor, it only makes this channel learn ~1/ve_lambda slower at the start.
+                srcs = (x0, h_mid, x) if i == self._mudd_sites[0] else (x0, x)
+                mixed = self.mudd[str(i)](x, srcs, (ve_i, x))
+                ve_i = mixed[0]
+                if MUDD_CHANNELS > 1:
+                    x = mixed[1]
             x = block(x, x0, ve_i, cos, sin, bs["resid"][i], bs["x0"][i], bs["ve"][i], bs["sink"][i], dense_mask, bounds,
                       doc_start=doc_start, rope_tabs=rope_tabs, wviews=wviews)
+            if MUDD and i == MUDD_MID:
+                h_mid = x
             if i < n_enc:
                 skips.append(x)
         if targets is None:
@@ -3226,6 +3368,50 @@ SCATTER_BINS = int(os.environ.get("NEURON_COMPETITION_R1_SCATTER_BINS", "128"))
 SCATTER_DENSE_K = int(os.environ.get("NEURON_COMPETITION_R1_SCATTER_DENSE_K", "32"))
 SCATTER_DENSE_FP32 = os.environ.get("NEURON_COMPETITION_R1_SCATTER_DENSE_FP32", "1") != "0"
 SCATTER_CHECK = os.environ.get("NEURON_COMPETITION_R1_SCATTER_CHECK", "1") != "0"
+
+# BTE_BF16: hold the 2^18 x 512 hashed bigram table (and, forced by torch, its sidecar gradient buffer) in bf16.
+# It is 134.2M of the 218.1M ZeRO-sharded elements. Two mechanisms: its gradient reduce_scatter halves its bytes
+# with NO cast pass (a standalone probe measured 8.89 -> 4.62 ms; this is why the full-size GRAD_BF16 was a wash -
+# its cast cost as much as it saved), and the parameter all_gather writes p.data directly, deleting a ~805 MB/step
+# converting copy. A 300 s paired screen of the vehicle measured total step 0.480 vs 0.485 (-1.0%) and 653 vs 646
+# steps. The graph is unaffected: the table is read only by the sidecar's row-gather kernel, which emits bf16 rows
+# either way, so nothing in the compiled forward changes dtype and no recompile is triggered.
+#
+# HISTORY - READ BEFORE TRUSTING THE LEDGER ROWS: `submission_v53_clean_bte_bf16.py` was gated three times and
+# "REJECTED as a wash" (0.000004 bpb vs v52). That verdict is VOID. In that frozen file the cast was written
+# inside the `if args.compile_only:` block, which returns before training, so it never executed; and only the
+# PADDED `pshard` clone was forced to fp32, not the plain one the bigram table actually uses. v53 was
+# behaviourally identical to v52, which is exactly why the three gates found nothing. The change has therefore
+# never been gated live. Both defects are fixed here.
+#
+# NUMERICS, the one real cost: the sidecar's gradient accumulator must share the parameter's dtype (torch rejects
+# `p.grad = <fp32>` on a bf16 parameter), so the scatter accumulates in bf16 and an fp32 accumulator is not an
+# option without exactly the full-size cast pass this change exists to avoid. 16384 hashes over 262144 rows means
+# almost every row takes a single contribution and already carries 0.16% error today (the gradient ROWS arriving
+# from the gather kernel are bf16 either way); the hottest bigram is hit 41-201 times, and measured bf16 sequential
+# accumulation error over 512 channels is 0.5% at 16 adds, 0.8% at 41 and 1.7% at 201. So the change costs ~1.5% of
+# relative gradient accuracy on a few hundred hot rows. That is what a gate has to justify against ~1% step time.
+BTE_BF16 = os.environ.get("NEURON_COMPETITION_R1_BTE_BF16", "0") != "0"
+
+
+def apply_bte_bf16(model: "GPT") -> None:
+    """Cast the bigram table's replica to bf16. MUST run before setup_sharding clones the fp32 master out of
+    p.data, and before EmbedSidecar builds its gradient buffers (which follow the table's dtype)."""
+    if not BTE_BF16:
+        return
+    bte = model.transformer.bte
+    # The tail EMA clones its buffers from the parameter, so a bf16 EMA buffer would make e.lerp_(p, 0.003) a
+    # silent no-op. Both exclusions are asserted rather than assumed: group 1 excludes every nn.Embedding,
+    # group 2 admits only tables at or below EMA_TABLE_MAX. A silent numerical bug here would read as a
+    # mediocre score, not as an error.
+    if not isinstance(bte, nn.Embedding):
+        raise ValueError("BTE_BF16: bte must be an nn.Embedding (that is what excludes it from tail-EMA group 1)")
+    if bte.weight.numel() <= EMA_TABLE_MAX:
+        raise ValueError(f"BTE_BF16: the bigram table ({bte.weight.numel():,}) is admitted by the tail-EMA table "
+                         f"group (EMA_TABLE_MAX={EMA_TABLE_MAX:,}); a bf16 EMA buffer would silently drop the "
+                         f"{1.0 - EMA_DECAY:.3f} lerp")
+    bte.weight.data = bte.weight.data.to(torch.bfloat16)
+    print0(f"BTE_BF16: bigram table held in bf16 ({bte.weight.numel():,} elements)")
 
 
 def scatter_packed(idx, rows, bins=None, dense_k=None):
@@ -3521,7 +3707,9 @@ class EmbedSidecar:
                         print0(f"scatter kernel failed ({str(exc)[:80]}); index_add_ fallback")
                 if not done:
                     R = self.tables[name].shape[0]
-                    self.gbuf[name][:R].index_add_(0, ind_t.view(-1).long(), g2.float())
+                    # the accumulator's dtype, not fp32: index_add_ rejects a source of a different scalar type,
+                    # and under BTE_BF16 the bigram accumulator is bf16 (.float() here would crash this fallback)
+                    self.gbuf[name][:R].index_add_(0, ind_t.view(-1).long(), g2.to(self.gbuf[name].dtype))
 
     def attach(self):
         for name, w in self.tables.items():
@@ -3538,7 +3726,10 @@ class MuonAdamW(torch.optim.Optimizer):
 
     @staticmethod
     def _is_small_group(group):
-        return group["kind"] == "adamw" and len(group["params"]) > 1 and all(p.numel() <= 4096 for p in group["params"])
+        # `flat=True` is an explicit opt-in to the flat path for a group whose parameters are above the 4096-element
+        # auto-detect ceiling (the MUDD mixers). No existing group sets it, so this is a no-op without MUDD.
+        return group["kind"] == "adamw" and (group.get("flat", False)
+                                             or (len(group["params"]) > 1 and all(p.numel() <= 4096 for p in group["params"])))
 
     @torch.no_grad()
     def _adamw_step_flat(self, group):
@@ -3595,7 +3786,7 @@ class MuonAdamW(torch.optim.Optimizer):
                         continue
                     lo, hi = min(n, rank * per), min(n, (rank + 1) * per)
                     gpad = torch.zeros((per,) + tuple(p.shape[1:]), dtype=p.dtype, device=p.device)
-                    pshard = p.data[lo:hi].clone()
+                    pshard = p.data[lo:hi].clone().float()   # master stays fp32 even where the replica is bf16
                     pshard.grad = gpad[:hi - lo]
                     self.plan[p] = dict(pshard=pshard, gshard=gpad[:hi - lo], gpad=gpad, lo=lo, hi=hi, per=per,
                                         npad=per * world_size, n=n, pad=True, active=hi > lo)
@@ -3605,7 +3796,10 @@ class MuonAdamW(torch.optim.Optimizer):
                     continue
                 if group["kind"] == "muon" and per % (NKI_GRID[0] if NKI_AVAILABLE else 1) != 0:
                     continue
-                pshard = p.data[rank * per:(rank + 1) * per].clone()
+                # .float() is a no-op for an fp32 replica; under BTE_BF16 the bigram table takes THIS branch (not the
+                # padded one above), and the fused NKI Muon/AdamW kernels need an fp32 (pshard, gshard) pair behind a
+                # try/except that would otherwise disable the WHOLE NKI optimizer silently
+                pshard = p.data[rank * per:(rank + 1) * per].clone().float()
                 pshard.grad = torch.zeros_like(pshard)
                 self.plan[p] = dict(pshard=pshard, gshard=pshard.grad)
 
@@ -3623,6 +3817,15 @@ class MuonAdamW(torch.optim.Optimizer):
                 if zpad is None:
                     zpad = plan["zpad"] = torch.zeros((plan["npad"] - plan["n"],) + tuple(p.shape[1:]), dtype=p.grad.dtype, device=p.device)
                 dist.reduce_scatter_tensor(plan["gpad"], torch.cat([p.grad, zpad]), op=dist.ReduceOp.AVG)
+            elif plan is not None and p.grad.dtype != plan["gshard"].dtype:
+                # BTE_BF16: bf16 gradient buffer, fp32 optimizer shard. Reduce at the GRADIENT's dtype (half the
+                # bytes, and no full-size cast pass - the cast pass is what made GRAD_BF16 a wash) and cast only
+                # the 1/8-size result up; the fused NKI AdamW requires an fp32 pair.
+                gs = plan.get("gsmall")
+                if gs is None:
+                    gs = plan["gsmall"] = torch.empty_like(plan["gshard"], dtype=p.grad.dtype)
+                dist.reduce_scatter_tensor(gs, p.grad, op=dist.ReduceOp.AVG)
+                plan["gshard"].copy_(gs)
             elif plan is not None:
                 dist.reduce_scatter_tensor(plan["gshard"], p.grad, op=dist.ReduceOp.AVG)
             else:
@@ -3642,6 +3845,12 @@ class MuonAdamW(torch.optim.Optimizer):
                     spad[:plan["hi"] - plan["lo"]].copy_(plan["pshard"])
                 dist.all_gather_into_tensor(plan["fpad"], spad)   # every rank takes part (ranks with no matrices send zeros)
                 p.data.copy_(plan["fpad"][:plan["n"]])
+                continue
+            if p.data.dtype == torch.bfloat16:
+                # BTE_BF16: the collective writes the replica directly - a ~805 MB/step converting copy (and a
+                # 268 MB staging buffer) deleted. Numerically identical to the p16 path below, which already
+                # rounds every gathered weight to bf16.
+                dist.all_gather_into_tensor(p.data, plan["pshard"].to(torch.bfloat16))
                 continue
             p16 = plan.get("p16")
             if p16 is None:
@@ -3846,17 +4055,37 @@ def sync_gradients(model: nn.Module, optimizer: MuonAdamW) -> None:
 def save_checkpoint(path: Path, model: GPT, meta: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "model_state": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+        # BTE_BF16: a bf16 replica is written back as fp32 so the checkpoint the scorer loads is dtype-identical to
+        # every other version (the values are the same bf16 numbers training used). With the flag off no tensor in
+        # state_dict is bf16 - every parameter is fp32 and the rotary buffers are persistent=False - so this is a
+        # no-op there.
+        "model_state": {k: (v.detach().cpu().float() if v.dtype == torch.bfloat16 else v.detach().cpu())
+                        for k, v in model.state_dict().items()},
         "model_config": asdict(model.config),
         "meta": meta,
     }
+    if MUDD:
+        # MUDD changes the SCORED forward, so the shape of the model the scorer rebuilds must not depend on the
+        # scorer's environment. This key exists only when MUDD is on, so the flag-off payload is unchanged.
+        payload["mudd"] = dict(channels=MUDD_CHANNELS, dim=MUDD_DIM, mid=MUDD_MID, norm=int(MUDD_NORM),
+                               sites=list(model._mudd_sites))
     torch.save(payload, path)
 
 
 def load_for_eval(checkpoint_path: str, device: torch.device) -> nn.Module:
-    global COMPUTE_DTYPE
+    global COMPUTE_DTYPE, MUDD, MUDD_CHANNELS, MUDD_DIM, MUDD_MID, MUDD_NORM, MUDD_SITES_ENV
     COMPUTE_DTYPE = compute_dtype_for(device)
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    _mudd = payload.get("mudd")
+    if _mudd is not None:        # rebuild the mixers exactly as trained, without needing the env vars set here
+        MUDD = True
+        MUDD_CHANNELS, MUDD_DIM, MUDD_MID = int(_mudd["channels"]), int(_mudd["dim"]), int(_mudd["mid"])
+        MUDD_NORM = bool(_mudd.get("norm", 0))
+        MUDD_SITES_ENV = ",".join(str(s) for s in _mudd["sites"])
+        print0(f"MUDD: sites={MUDD_SITES_ENV} channels={MUDD_CHANNELS} dim={MUDD_DIM} mid={MUDD_MID} (from the checkpoint)")
+    elif MUDD:                  # a checkpoint without mixers: strict load_state_dict would fail
+        MUDD = False
+        print0("MUDD requested but the checkpoint has no mixers; evaluating without MUDD")
     config = GPTConfig(**payload["model_config"])
     model = GPT(config)
     model.init_weights()
@@ -3938,6 +4167,10 @@ def main() -> None:
     model.to(device)
     num_params = sum(p.numel() for p in model.parameters())
     print0(f"num_params={num_params:,}")
+    if MUDD:
+        _mp = sum(p.numel() for _n, p in model.named_parameters() if _n.startswith("mudd."))
+        print0(f"MUDD live: sites={model._mudd_sites} channels={MUDD_CHANNELS} dim={MUDD_DIM} mid={MUDD_MID} "
+               f"norm={int(MUDD_NORM)} lr={SCALAR_LR * MUDD_LR_SCALE:.5f} params={_mp:,}")
     orig_model = model
     global USE_STACK_FUNCTION
     if LAYER_IMPL == "op" and device_type == "neuron" and NKI_AVAILABLE:
@@ -3972,6 +4205,7 @@ def main() -> None:
         synthetic_x = torch.zeros((device_batch_size, SEQ_LEN), dtype=torch.int32).to(device)
         synthetic_y = torch.zeros((device_batch_size, SEQ_LEN), dtype=torch.long).to(device)
         optimizer = model.setup_optimizer()
+        apply_bte_bf16(orig_model)      # --compile-only warms the NEFF cache: it must trace what the real run traces
         model.zero_grad(set_to_none=True)
         for _ in range(grad_accum_steps):
             loss = model(synthetic_x, synthetic_y)
@@ -4024,6 +4258,9 @@ def main() -> None:
     train_loader = _packed()
     x, y, loader_state = next(train_loader)
     optimizer = model.setup_optimizer()
+    # before setup_sharding clones the fp32 master out of p.data, before EmbedSidecar sizes its gradient buffers from
+    # the table dtypes, and before the first forward traces the graph (so the run still pays exactly one compile)
+    apply_bte_bf16(orig_model)
     optimizer.setup_sharding(world_size, rank)
     # embedding tables live outside the compiled graph (whose backward lowers their scatter-add as one-hot matmuls,
     # ~20% of the step): gather rows before the graph, scatter-add their gradients after it
