@@ -249,10 +249,29 @@ MUDD_CHANNELS = int(os.environ.get("NEURON_COMPETITION_R1_MUDD_CHANNELS", "2"))
 MUDD_DIM = int(os.environ.get("NEURON_COMPETITION_R1_MUDD_DIM", "64"))     # mixer bottleneck width
 MUDD_MID = int(os.environ.get("NEURON_COMPETITION_R1_MUDD_MID", "7"))      # the mid-depth source: output of block 7
 MUDD_SITES_ENV = os.environ.get("NEURON_COMPETITION_R1_MUDD_LAYERS", "")   # default: the last two layers
-MUDD_LR_SCALE = float(os.environ.get("NEURON_COMPETITION_R1_MUDD_LR_SCALE", "0.25"))   # x SCALAR_LR, as published
-# Safety knob only: feed RMSNorm(x) to the mixer instead of raw x. The record feeds raw x and that is the default
-# here; the rejected version needed the norm because it mixed in fp32 over a residual that grows across all 12
-# layers. Turn on only if a run diverges.
+# PUBLISHED VALUE IS SCALAR_LR * 0.25. THAT DOES NOT TRANSFER AND 0.25 DIVERGES HERE (measured, see below).
+# Our SCALAR_LR = 0.284 is tuned for genuine SCALARS - the per-layer resid/x0/ve/sink lambdas, all O(1) - so
+# SCALAR_LR * 0.25 = 0.071 is applied to `w1`, a 64x512 matrix whose init bound is 1/sqrt(512) = 0.044. One AdamW
+# step at 0.071 therefore moves every entry by more than its own init scale, and AdamW is scale-invariant, so it
+# does that however small the true gradient is. The right reference for a fan-in-512 matrix under AdamW in THIS
+# stack is UNEMBEDDING_LR = 0.0104 (the lm_head), i.e. a scale of 0.035. A 16-step CPU probe on real data:
+#   scale 0.25, raw x:  max|c| 0.0 -> 1.4e7 by step 15, the residual stream itself blowing up with it (RUNAWAY)
+#   scale 0.035, raw x: max|c| peaks 2.7, mixer hidden stays at the residual's own scale (STABLE)
+# The runaway is a genuine positive feedback loop, not gradient noise: c*x is added into x, which grows x, which
+# grows w1 @ x, which grows c. It is present with MUDD_CHANNELS=1 too (slower - it closes through attention's
+# out-projection instead of directly). Set 0.25 to reproduce the published number.
+MUDD_LR_SCALE = float(os.environ.get("NEURON_COMPETITION_R1_MUDD_LR_SCALE", "0.035"))
+# Soft cap on the coefficients: c <- cap * tanh(c / cap), applied to the (b, t, ch*n_src) tensor, which is ~85x
+# smaller than one source, so it costs nothing measurable. It is deliberately FAR above the operating range (the
+# stable probe peaks at |c| ~ 2.7) so that it never binds: at |c| = 3 it is the identity to 0.3%, and at |c| = 1 to
+# 0.04%. It exists only to stop a runaway reaching inf/NaN and wasting a gate - the measured runaway passed 1e7,
+# so 30 catches it five orders early. A cap TIGHT enough to bind would be worse than no cap, because a saturated
+# tanh has no gradient: at cap=4 with the published LR the probe drove |c| to 4263, i.e. a dead on/off gate.
+# 0 disables it.
+MUDD_CAP = float(os.environ.get("NEURON_COMPETITION_R1_MUDD_CAP", "30.0"))
+# Second safety knob: feed RMSNorm(x) to the mixer instead of raw x. The record feeds raw x (its residual stream is
+# O(1)); ours is O(20) by layer 10, so the mixer hidden is ~10x larger here and so are the coefficients. Costs ~10
+# extra (b, t, D) ops for the two sites, which is why it is not on by default now that the LR is right.
 MUDD_NORM = os.environ.get("NEURON_COMPETITION_R1_MUDD_NORM", "0") != "0"
 FRAC_BY_STEPS = os.environ.get("NEURON_COMPETITION_R1_FRAC_BY_STEPS", "0") != "0"
 EMA_DECAY = 0.997               # tail-EMA of the weights over the last 15% of the budget (tau ~330; 0.9933 -> 0.997 = -0.0006 at 1800 s, S2_EMA0997), ...
@@ -488,12 +507,21 @@ if NKI_AVAILABLE:
                      beta1: float = 0.8, beta2: float = 0.995, eps: float = 1e-10):
         """One pass of AdamW over a 2-D fp32 parameter, in place. scal[:, k] = lr, 1/bias1, 1/sqrt(bias2), lr*wd."""
         R, C = p_in.shape
-        out = nl.ndarray((R, C), dtype=p_in.dtype, buffer=nl.shared_hbm)
+        nprog = nl.num_programs(0)
+        pid = nl.program_id(0)
+        # The caller DISCARDS this return value; the update that counts is the in-place write to p_in/m_in/v_in
+        # below. A full (R, C) copy of the parameter used to be written to HBM here every step for nothing:
+        # 77.6 MB/step for AdamW plus 31.4 MB for Muon = 0.56% of the step's 19.51 GB of DMA, which at the
+        # measured 41.7 ns/KiB marginal rate is ~0.3 ms (see findings/dma-descriptors-2026-09-27.md). Shrunk to
+        # one tile per program, written once after the loop and SOURCED FROM p_in so the data dependence on the
+        # in-place writes is preserved. Same contract as embed_scatter_add_v2, which mutates its input in place
+        # and returns a single row that every caller discards - on device since v45.
+        out = nl.ndarray((nprog * P, C), dtype=p_in.dtype, buffer=nl.shared_hbm)
         sc = nl.ndarray((P, 4), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=sc, src=scal)
-        per = (R // P) // nl.num_programs(0)
+        per = (R // P) // nprog
         for ii in nl.affine_range(per):
-            i = nl.program_id(0) * per + ii
+            i = pid * per + ii
             rows = slice(i * P, (i + 1) * P)
             p = nl.ndarray((P, C), dtype=nl.float32, buffer=nl.sbuf)
             g = nl.ndarray((P, C), dtype=nl.float32, buffer=nl.sbuf)
@@ -518,10 +546,12 @@ if NKI_AVAILABLE:
             nisa.reciprocal(dst=den, data=den)
             nisa.scalar_tensor_tensor(dst=tmp, data=m, op0=nl.multiply, operand0=sc[:, 1:2], op1=nl.multiply, operand1=den)
             nisa.scalar_tensor_tensor(dst=p, data=tmp, op0=nl.multiply, operand0=sc[:, 0:1], op1=nl.subtract, operand1=p, reverse1=True)
-            nisa.dma_copy(dst=out[rows, :], src=p)
             nisa.dma_copy(dst=p_in[rows, :], src=p)
             nisa.dma_copy(dst=m_in[rows, :], src=m)
             nisa.dma_copy(dst=v_in[rows, :], src=v)
+        # one tile per program, read back from the buffer the loop just mutated: disjoint across programs, and the
+        # read forces the output to depend on every in-place write
+        nisa.dma_copy(dst=out[pid * P:(pid + 1) * P, :], src=p_in[pid * per * P:(pid * per + 1) * P, :])
         return out
 
     @nki.jit
@@ -537,14 +567,18 @@ if NKI_AVAILABLE:
         k = i_ if tall else o
         mt, kt, mc = m // P, k // P, m // FMAX
         ot = o // P
-        w_out = nl.ndarray((n, o, i_), dtype=nl.float32, buffer=nl.shared_hbm)
+        nprog = nl.num_programs(0)
+        pid = nl.program_id(0)
+        # see adamw_kernel: the caller discards this, the real update is the in-place w_in write, so one tile per
+        # program instead of a full (n, o, i_) second copy of the whole stack
+        w_out = nl.ndarray((nprog, P, i_), dtype=nl.float32, buffer=nl.shared_hbm)
         sc = nl.ndarray((P, 4), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=sc, src=scal)
         ones32 = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(ones32, 1.0)
-        per = n // nl.num_programs(0)
+        per = n // nprog
         for ii in nl.affine_range(per):
-            i = nl.program_id(0) * per + ii
+            i = pid * per + ii
             # momentum update and nesterov blend, natural layout, bf16 result
             Gn = []
             for _j in range(ot):
@@ -726,8 +760,9 @@ if NKI_AVAILABLE:
                 nisa.tensor_scalar(dst=wdm, data=wdm, op0=nl.multiply, operand0=sc[:, 2:3])
                 nisa.scalar_tensor_tensor(dst=gg, data=gg, op0=nl.multiply, operand0=sc[:, 1:2], op1=nl.add, operand1=wdm)
                 nisa.tensor_tensor(dst=w, data1=w, data2=gg, op=nl.subtract)
-                nisa.dma_copy(dst=w_out[i, p * P:(p + 1) * P, :], src=w)
                 nisa.dma_copy(dst=w_in[i, p * P:(p + 1) * P, :], src=w)
+        # one tile per program, read back from the stack the loop just mutated (see adamw_kernel)
+        nisa.dma_copy(dst=w_out[pid, :, :], src=w_in[pid * per, 0:P, :])
         return w_out
 
     adamw_step_nki = wrap_nki(adamw_kernel)
@@ -2996,7 +3031,9 @@ def canon_conv(h: torch.Tensor, w: torch.Tensor, doc_start) -> torch.Tensor:
 def mudd_sites(n_layer: int) -> tuple[int, ...]:
     """Which blocks consume MUDD. Default = the last two (N-2, N-1), as in the record."""
     if MUDD_SITES_ENV:
-        return tuple(int(s) for s in MUDD_SITES_ENV.split(",") if s.strip() != "")
+        # sorted: element 0 is the SHALLOWEST site and the only one that also reads h_mid, so the order must be
+        # depth order however the knob was spelled (and it must match what load_for_eval rebuilds)
+        return tuple(sorted(int(s) for s in MUDD_SITES_ENV.split(",") if s.strip() != ""))
     return (n_layer - 2, n_layer - 1)
 
 
@@ -3032,6 +3069,8 @@ class MuddMixer(nn.Module):
         h = norm(x) if MUDD_NORM else x
         c = F.linear(h, self.w1.to(dtype=h.dtype))                       # (b, t, MUDD_DIM), the only big read
         c = F.linear(F.gelu(c.float()), self.w2.float(), self.bs.float())   # (b, t, ch * n_src), fp32, tiny
+        if MUDD_CAP > 0:
+            c = MUDD_CAP * torch.tanh(c / MUDD_CAP)     # identity for |c| << cap; bounds the feedback loop
         outs = []
         for j in range(self.ch):
             acc = dests[j]
@@ -4068,12 +4107,12 @@ def save_checkpoint(path: Path, model: GPT, meta: dict) -> None:
         # MUDD changes the SCORED forward, so the shape of the model the scorer rebuilds must not depend on the
         # scorer's environment. This key exists only when MUDD is on, so the flag-off payload is unchanged.
         payload["mudd"] = dict(channels=MUDD_CHANNELS, dim=MUDD_DIM, mid=MUDD_MID, norm=int(MUDD_NORM),
-                               sites=list(model._mudd_sites))
+                               cap=float(MUDD_CAP), sites=list(model._mudd_sites))
     torch.save(payload, path)
 
 
 def load_for_eval(checkpoint_path: str, device: torch.device) -> nn.Module:
-    global COMPUTE_DTYPE, MUDD, MUDD_CHANNELS, MUDD_DIM, MUDD_MID, MUDD_NORM, MUDD_SITES_ENV
+    global COMPUTE_DTYPE, MUDD, MUDD_CHANNELS, MUDD_DIM, MUDD_MID, MUDD_NORM, MUDD_CAP, MUDD_SITES_ENV
     COMPUTE_DTYPE = compute_dtype_for(device)
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     _mudd = payload.get("mudd")
@@ -4081,8 +4120,10 @@ def load_for_eval(checkpoint_path: str, device: torch.device) -> nn.Module:
         MUDD = True
         MUDD_CHANNELS, MUDD_DIM, MUDD_MID = int(_mudd["channels"]), int(_mudd["dim"]), int(_mudd["mid"])
         MUDD_NORM = bool(_mudd.get("norm", 0))
+        MUDD_CAP = float(_mudd.get("cap", 0.0))      # every knob that enters the SCORED forward comes from here
         MUDD_SITES_ENV = ",".join(str(s) for s in _mudd["sites"])
-        print0(f"MUDD: sites={MUDD_SITES_ENV} channels={MUDD_CHANNELS} dim={MUDD_DIM} mid={MUDD_MID} (from the checkpoint)")
+        print0(f"MUDD: sites={MUDD_SITES_ENV} channels={MUDD_CHANNELS} dim={MUDD_DIM} mid={MUDD_MID} "
+               f"norm={int(MUDD_NORM)} cap={MUDD_CAP} (from the checkpoint)")
     elif MUDD:                  # a checkpoint without mixers: strict load_state_dict would fail
         MUDD = False
         print0("MUDD requested but the checkpoint has no mixers; evaluating without MUDD")
