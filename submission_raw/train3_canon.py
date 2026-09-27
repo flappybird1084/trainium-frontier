@@ -96,6 +96,11 @@ GLOBAL_LR = float(os.environ.get("NEURON_COMPETITION_R1_GLOBAL_LR", "1.0"))
 # Build the train loader on the HOST and do the H2D copy ourselves. Bit-identical math (same documents, same
 # packing, same order); only the device the loader writes into changes.
 LOADER_CPU = os.environ.get("NEURON_COMPETITION_R1_LOADER_CPU", "0") != "0"
+# Polar Express iteration count, never swept in 634 ledger rows. It selects a PREFIX of POLAR_EXPRESS_COEFFS, so
+# lowering it is one token and makes the Muon kernel CHEAPER. Direction has a mechanism behind it: the ANVIL 6-map
+# cascade, whose envelope is [0.9951, 1.00041] against our ~[0.86, 1.14], LOST here by +0.00062 - so tighter
+# orthogonalisation does not help, and looser may.
+NS_STEPS = int(os.environ.get("NEURON_COMPETITION_R1_NS_STEPS", "5"))
 NKI_STRICT = os.environ.get("NEURON_COMPETITION_R1_NKI_STRICT", "0") != "0"
 _FALLBACKS = []          # every silent degradation this run took
 
@@ -3073,7 +3078,7 @@ class GPT(nn.Module):
             dict(kind="adamw", params=scalar_params, lr=SCALAR_LR, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0),
         ]
         for key in sorted(self.stacks.keys()):
-            param_groups.append(dict(kind="muon", params=[self.stacks[key]], lr=MATRIX_LR, momentum=0.95, beta2=0.90, ns_steps=5, weight_decay=WEIGHT_DECAY))
+            param_groups.append(dict(kind="muon", params=[self.stacks[key]], lr=MATRIX_LR, momentum=0.95, beta2=0.90, ns_steps=NS_STEPS, weight_decay=WEIGHT_DECAY))
         canon_params = [p for _n, p in self.named_parameters() if ".canon_" in _n]
         if canon_params:
             param_groups.append(dict(kind="adamw", params=canon_params, lr=CANON_LR, betas=(0.9, 0.95),
