@@ -8,8 +8,11 @@ would reach across a document start. What is checked, against the SAME kernels r
 reference (so the reference is the vehicle's own `canon_conv` and its autograd, not a re-derivation):
 
   fwd   pre_attn_fwd_ko(x, ck_w=W)              vs  pre_attn_fwd_ko(canon_conv(x), ck_w=0)      - all 6 outputs
-  bwd   pre_attn_bwd_ko(..., ck_w=W).dxm        vs  d(canon_conv)/dx   applied to ck_w=0's dxm
+  bwd   pre_attn_bwd_ko(..., ck_w=W).dxm        vs  ck_w=0's dxm, bit for bit (the conv must not disturb dL/dxm)
+        pre_attn_bwd_ko(..., ck_w=W).dxc        vs  d(canon_conv)/dx   applied to ck_w=0's dxm
         pre_attn_bwd_ko(..., ck_w=W).dck        vs  d(canon_conv)/dw   applied to ck_w=0's dxm
+  MODEL the mix and its whole backward, kernel + torch glue, vs autograd on Block.forward's own expression - see
+        mix_level(), which is the check a kernel-level test structurally cannot make
 
 Two data regimes:
   exact   x, dx1 small integers and w a power-of-2 per channel -> every product and sum is exact in bf16/fp32, so the
@@ -54,7 +57,7 @@ fwd_k, bwd_k = _mod.pre_attn_fwd_ko, _mod.pre_attn_bwd_ko
 
 _ns = {"torch": torch, "CK_W": W}
 exec(compile(src[src.index("def canon_conv("):src.index("class Block(")], "<vehicle>", "exec"), _ns)  # noqa: S102
-canon_conv, ck_table = _ns["canon_conv"], _ns["ck_table"]
+canon_conv, ck_table, ck_mix_backward = _ns["canon_conv"], _ns["ck_table"], _ns["ck_mix_backward"]
 
 if dev == "sim":
     run = lambda kern, *a, **kw: nki.simulate(kern)(*a, **kw)
@@ -108,7 +111,7 @@ def one_shape(b, t, exact):
     global ok
     T = b * t
     tiles = T // 128
-    tag = f"b{b} t{t} T{T} tiles{tiles} ({'exact' if exact else 'random'}, dck groups of {4 if tiles % 4 == 0 else 1})"
+    tag = f"b{b} t{t} T{T} tiles{tiles} tiles/row {t // 128} ({'exact' if exact else 'random'})"
     print(f"\n=== {tag} ===", flush=True)
     torch.manual_seed(0)
     ds = doc_starts(b, t)
@@ -175,12 +178,107 @@ def one_shape(b, t, exact):
     # shift, and the reference's g is ck_w=0's bf16 output where the kernel used its fp32 internal value.
     tol_dx = 0.0 if exact else 6e-3 * max(1.0, g.abs().max().item())
     tol_dw = 0.0 if exact else 6e-3 * (g.abs().reshape(T, D) * x.float().abs()).sum(0).max().item()
-    check("dxm (A^T g)", new[0], xr.grad.reshape(T, D), tol_dx)
-    check("dck (dw)", new[5][0:1].reshape(W, D), wr.grad, tol_dw)
+    # dxm_out (output 0) is dL/dxm and must be UNTOUCHED by the conv - the kernel's internal gradient depends only on
+    # its inputs, so it has to match the ck_w=0 run bit for bit. The conv transpose is its own output (6).
+    check("dxm == base g", new[0], base[0], 0.0)
+    check("dxc (A^T g)", new[6], xr.grad.reshape(T, D), tol_dx)
+    check("dck (dw)", new[5].sum(0).reshape(W, D), wr.grad, tol_dw)   # 128 per-partition partials, as the op sums them
     for nm in range(1, 5):   # everything else must be untouched by the conv
         check(("", "gv2", "dWq", "dWk", "dWv")[nm], new[nm], base[nm], 0.0)
     if exact:   # and the conv-free part of the gradient must really be dx1 in this regime
         check("g == dx1", base[0], dx1.float(), 0.0)
+
+
+def mix_level(b=2, t=256, exact=True):
+    """MODEL-level equivalence: the layer's residual mix and its FULL backward - kernel PLUS the torch glue
+    (`ck_mix_backward`) - against autograd on the expression Block.forward actually evaluates:
+
+        u = canon_conv(x2, w, doc_start)          xm = resid * u + x0l * x02
+
+    checked for dx2, dx02, d_resid, d_x0 and dw at once.
+
+    THIS is the test whose absence let a real bug ship (2026-09-27): `one_shape` compares the kernel against a torch
+    reference of the KERNEL'S OWN operation, so any mistake about WHICH gradient the conv transpose belongs to cancels
+    on both sides and the kernel still looks bit-exact. The kernel had returned A^T g in place of dL/dxm, so the glue
+    fed A^T g to the x0 terms as well - the embedding-skip gradient went through the conv. Model-level, that shows up
+    instantly as dx02 and d_x0 disagreeing with autograd while everything else passes.
+    The ve path is not exercised here (dv = 0 keeps the kernel's internal g equal to dx1 so the check can be exact);
+    it is covered bit-exactly by the ck_w=0 comparison in off_is_baseline, and CK does not touch it."""
+    print(f"\n=== MODEL level: mix fwd/bwd vs autograd on canon_conv + the residual mix (b{b} t{t}, "
+          f"{'exact' if exact else 'random'}) ===", flush=True)
+    T = b * t
+    torch.manual_seed(3)
+    ds = doc_starts(b, t)
+    dsb = ds.bool().reshape(b, t)
+    if exact:      # integers and power-of-two scalars/taps: every quantity below is exact in bf16 and fp32
+        x = torch.randint(-4, 5, (T, D)).float().bfloat16()
+        x0 = torch.randint(-4, 5, (T, D)).float().bfloat16()
+        dx1 = torch.randint(-4, 5, (T, D)).float().bfloat16()
+        w = torch.zeros(W, D)
+        w[0] = 1.0
+        for _i in range(1, W):
+            w[_i] = torch.pow(2.0, -torch.randint(1, 4, (D,)).float()) * torch.randint(0, 2, (D,)).mul(2).sub(1).float()
+        rl, xl, vl = 1.0, 0.5, 0.25
+    else:
+        x = torch.randn(T, D).bfloat16()
+        x0 = torch.randn(T, D).bfloat16()
+        dx1 = (torch.randn(T, D) * 0.1).bfloat16()
+        w = torch.randn(W, D) * 0.2
+        w[0] += 1.0
+        rl, xl, vl = 0.9, 0.1, 0.5
+    ve = torch.randn(T, D).bfloat16()
+    wq, wk, wv = [(torch.randn(D, D) * D ** -0.5).bfloat16() for _ in range(3)]
+    ang = torch.outer(torch.arange(t).float(), 1.0 / (10000 ** (torch.arange(half).float() / half)))
+    cos = torch.cos(ang).repeat(b, 1).contiguous()
+    sin = torch.sin(ang).repeat(b, 1).contiguous()
+    tab = ck_table(dsb, b, t, ds.device).reshape(T, 1 + 2 * (W - 1)).contiguous()
+    srow = torch.tensor([rl, xl, vl, 0.0]).view(1, 4)
+    scal_ck = torch.cat([srow, w.reshape(1, W * D).float()], dim=1).expand(128, 4 + W * D).contiguous()
+
+    # ---- the torch model, differentiated by autograd
+    xr = x.float().reshape(b, t, D).clone().requires_grad_(True)
+    x0r = x0.float().reshape(b, t, D).clone().requires_grad_(True)
+    wr = w.clone().requires_grad_(True)
+    rr = torch.tensor(rl, requires_grad=True)
+    xlr = torch.tensor(xl, requires_grad=True)
+    xm_ref = rr * canon_conv(xr, wr, dsb) + xlr * x0r
+    # dq = dk = dv = 0 makes the kernel's internal dL/dxm exactly dx1, so the incoming gradient is known
+    xm_ref.backward(dx1.float().reshape(b, t, D))
+
+    # ---- the kernel forward gives xm; the kernel backward plus the glue gives every gradient
+    fwd = run(fwd_k, x, x0, ve, wq, wk, wv, cos, sin, scal_ck, tab,
+              n_head=NH, eps=eps, t_len=t, q_scale=scale, hq=HQ, ck_w=W)
+    sync()
+    # random regime: xm, dxm, dxc and the glue's own outputs are all STORED as bf16 while the reference is fp32, so
+    # allow two bf16 ULP of each quantity's own magnitude; the scalars are sums over T*D such terms, so their bound is
+    # 2^-8 of the summed absolute terms. The exact regime allows nothing.
+    ulp = (lambda r: 0.0) if exact else (lambda r: 2.0 ** -7 * max(1.0, r.abs().max().item()))
+    dot = (lambda a, c: 0.0) if exact else (lambda a, c: 2.0 ** -8 * (a.abs() * c.float().abs()).sum().item())
+    check("xm (mix fwd)", cvt(fwd[3]), xm_ref.detach().reshape(T, D), ulp(xm_ref))
+    z = torch.zeros(b * NH, t, HD).bfloat16()
+    bw = run(bwd_k, z, z, z, torch.randn(NH, T, HD).bfloat16(), torch.randn(NH, T, HD).bfloat16(),
+             torch.randn(T, D).bfloat16(), dx1, cos, sin, tab, wq, wk, wv, x, scal_ck,
+             n_head=NH, eps=eps, scale=scale, hq=HQ, ck_w=W)
+    sync()
+    dxm, gv2, dck, dxc = cvt(bw[0]), cvt(bw[1]), cvt(bw[5]), cvt(bw[6])
+    dx2, dx02, dve2, dscal = ck_mix_backward(dxm, gv2, x, x0, ve, scal_ck, dxc, dck.sum(0, keepdim=True))
+    check("dx2", dx2.float(), xr.grad.reshape(T, D), ulp(xr.grad))
+    check("dx02", dx02.float(), x0r.grad.reshape(T, D), ulp(x0r.grad))            # <- the bug showed up HERE
+    check("d_resid", dscal[0:1, 0], rr.grad.reshape(1), dot(dxc, x))
+    check("d_x0", dscal[0:1, 1], xlr.grad.reshape(1), dot(dxm, x0))               # <- and HERE
+    check("dcanon", dscal[0:1, 4:].reshape(W, D), wr.grad, dot(dxm, x) / D)
+    check("dscal zero rows", dscal[1:], torch.zeros_like(dscal[1:]), 0.0)         # the expand backward sums rows
+    if exact:
+        # NEGATIVE CONTROL: re-create the pre-fix wiring (the kernel returned A^T g AS dxm, so the glue saw it
+        # everywhere) and require this test to reject it. Without this line the test could silently lose its teeth.
+        global ok
+        bad = ck_mix_backward(dxc, gv2, x, x0, ve, scal_ck, dxc, dck.sum(0, keepdim=True))
+        e02 = (bad[1].float() - x0r.grad.reshape(T, D)).abs().max().item()
+        ex0 = (bad[3][0:1, 1] - xlr.grad.reshape(1)).abs().max().item()
+        good = e02 > 0.0 and ex0 > 0.0
+        ok &= good
+        print(f"  {'PASS' if good else 'FAIL'} negative ctl  the pre-fix wiring misses dx02 by {e02:.3e} and "
+              f"d_x0 by {ex0:.3e} (both must be > 0, or this test has no teeth)", flush=True)
 
 
 def off_is_baseline(b=2, t=256):
@@ -255,14 +353,20 @@ def algebra(b=2, t=256):
     check("dscal -> canon_p", cp.grad, (dck * 0.9).view(W, D), 0.0)
 
 
-if "prod" in sys.argv:             # the real training shape: 8 tiles per sequence row, 128 tiles, groups of 4
+if "prod" in sys.argv:             # the real training shape: 8 tiles per sequence row, 128 tiles
     one_shape(16, 1024, True)
     one_shape(16, 1024, False)
 else:
     off_is_baseline()
     algebra()
+    mix_level(exact=True)
+    mix_level(exact=False)
     for _exact in (True, False):
-        one_shape(2, 256, _exact)  # tiles = 4  -> dck reduced in groups of 4
-    one_shape(2, 384, True)        # tiles = 6  -> groups of 1 (uniform matmul count per PSUM tile, rule #12)
+        one_shape(2, 256, _exact)
+    # tile-count sweep: nothing in the CK code may depend on the tile count (an earlier four-tile PE reduction of
+    # the weight gradient compiled at 8 tiles and hit [NCC_ILMM003] at 4). 1 tile = first and last tile of its row
+    # at once; 7 tiles = prime, one sequence row; 6 = not a multiple of 4.
+    for _b, _t in ((1, 128), (1, 256), (2, 384), (1, 896)):
+        one_shape(_b, _t, True)
 print(f"\n{'ALL PASS' if ok else 'FAILURES'} (W={W}, {dev})")
 sys.exit(0 if ok else 1)

@@ -1819,13 +1819,15 @@ if NKI_AVAILABLE:
 
         ck_w > 1 additionally folds in the CK conv backward (x_in = the PRE-conv block input, scal carries the conv
         weights; see pre_attn_fwd_ko). With g = dL/dxm as this kernel computes it today and u = conv(x):
-          - dxm_out becomes A^T g, i.e. (A^T g)[p, d] = sum_i w[i, d] * c_i[p+i] * g[p+i, d]: the transposed conv, one
+          - dxm_out is UNCHANGED: it is g, exactly as with ck_w = 0. The conv transpose comes back as a SEPARATE
+            output dxc_out = A^T g, (A^T g)[p, d] = sum_i w[i, d] * c_i[p+i] * g[p+i, d] - the transposed conv, one
             causal shift the OTHER way. Tiles already run in reverse, so the carry comes from the tile just visited.
-            A^T commutes with the (scalar) resid/x0 mix, so the op's torch glue is unchanged: dx = resid * A^T g is the
-            gradient w.r.t. the pre-conv input and d_resid = sum(A^T g * x) = sum(g * u) still holds exactly.
-          - dck_out (_NKI_P, ck_w*D) fp32 carries the conv weight gradient in ROW 0 (a 128-row store, not a 1-row one):
-            dck[i, d] = sum_p g[p, d] * x[p-i, d] * c_i[p], contracted over the token axis on the PE and summed over
-            the four-tile groups the Q/K/V wgrad already uses. The op multiplies it by resid (dL/du = resid * g)."""
+            Both are needed because only TWO of the four terms the mix backward builds differentiate the conv's own
+            input; see ck_mix_backward, which is where returning only A^T g went wrong on 2026-09-27.
+          - dck_out (_NKI_P, ck_w*D) fp32 carries the conv weight gradient as 128 PARTIAL SUMS per channel (row p holds
+            every 128th token's terms): dck[i, d] = sum_p g[p, d] * x[p-i, d] * c_i[p]. The op sums the 128 rows and
+            multiplies by resid (dL/du = resid * g). Accumulating per partition instead of contracting the token axis
+            on the PE keeps this path free of PSUM tiles, so its cost and its legality are the same at every shape."""
         T, D = xm_in.shape
         BH, t, HD = dq_in.shape
         half = HD // 2
@@ -1837,6 +1839,7 @@ if NKI_AVAILABLE:
         dwq_out = nl.ndarray((D, D), dtype=nl.float32, buffer=nl.shared_hbm)
         dwk_out = nl.ndarray((D, D), dtype=nl.float32, buffer=nl.shared_hbm)
         dwv_out = nl.ndarray((D, D), dtype=nl.float32, buffer=nl.shared_hbm)
+        dxc_out = None                                # CK: A^T (dL/dxm), alongside the UNCHANGED dxm_out
         # key-offset backward shift matrices: St[k, m] = 1 iff m == k - 1 ; Et[k, m] = 1 iff k == 0 and m == _NKI_P-1
         ones = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.sbuf)
         nisa.memset(ones, 1.0)
@@ -1856,20 +1859,20 @@ if NKI_AVAILABLE:
         ckEt = []
         ckg0 = []                                     # c_i * g of the current / next tile, double-buffered by tile parity
         ckg1 = []
-        ckt0 = []                                     # tap-0 dck products, held over a tile group
-        ckt1 = []                                     # ckt1[i-1] = the same for tap i
         dck_out = None
         dcka = None
-        ckone = None
-        ckgrp = 4 if (tiles % 4 == 0) else 1          # uniform matmul count per dck PSUM tile (tracer rule #12)
         if ck_w > 1:
             sc = nl.ndarray((_NKI_P, scal.shape[1]), dtype=nl.float32, buffer=nl.sbuf)
             nisa.dma_copy(dst=sc, src=scal)
+            # dck is accumulated PER PARTITION (row p of the tile keeps the terms of every 128th token) and the 128
+            # rows are summed by the op. No PSUM tile and no matmul in this path at all, so the accumulate-flag rule
+            # (#12) cannot be reached by it for ANY tile count - an earlier four-tile PE reduction through (1, D) PSUM
+            # tiles compiled at 8 tiles and died with NCC_ILMM003 at 4 (one group), which is exactly the kind of
+            # shape-dependent landmine this kernel must not have.
             dck_out = nl.ndarray((_NKI_P, ck_w * D), dtype=nl.float32, buffer=nl.shared_hbm)
+            dxc_out = nl.ndarray((T, D), dtype=nl.bfloat16, buffer=nl.shared_hbm)
             dcka = nl.ndarray((_NKI_P, ck_w * D), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.memset(dcka, 0.0)                    # only row 0 is ever written; the store stays a 128-row block
-            ckone = nl.ndarray((_NKI_P, 1), dtype=nl.bfloat16, buffer=nl.sbuf)
-            nisa.memset(ckone, 1.0)                   # token-axis contraction: [K=128 tokens, M=1] against the products
+            nisa.memset(dcka, 0.0)
             for _i in range(1, ck_w):
                 _s = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.sbuf)
                 nisa.affine_select(dst=_s, pattern=[[1, _NKI_P]], channel_multiplier=-1, offset=_i, on_true_tile=ones, on_false_value=0.0)
@@ -1883,7 +1886,6 @@ if NKI_AVAILABLE:
                 _y = nl.ndarray((_NKI_P, D), dtype=nl.bfloat16, buffer=nl.sbuf)
                 nisa.memset(_y, 0.0)
                 ckg1.append(_y)
-                ckt1.append([])                       # (parallel lists: no tuple unpacking anywhere, tracer rule #14)
         # resident weights in natural (out, in) layout: chunk o = rows o*128:(o+1)*128 = the dgrad moving operand [K=out, N=in]
         Wq = []
         Wk = []
@@ -2070,8 +2072,10 @@ if NKI_AVAILABLE:
             nisa.tensor_copy(dst=dx1, src=dx1b)
             nisa.scalar_tensor_tensor(dst=dx1, data=sq, op0=nl.multiply, operand0=rstd, op1=nl.add, operand1=dx1)
             dxb = nl.ndarray((_NKI_P, D), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=dxb, src=dx1)
+            nisa.dma_copy(dst=dxm_out[t0:t0 + _NKI_P, :], src=dxb)
             if ck_w > 1:
-                # ---- CK backward: dx = A^T g (g = dx1, the gradient w.r.t. xm) and the per-tap dck products.
+                # ---- CK backward: A^T g (g = dx1, the gradient w.r.t. xm) and the per-tap dck products.
                 # The mask sits at the SOURCE row of the up-shift (c_i[p+i] applied at row p+i), which is c_i itself.
                 xf = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.dma_copy(dst=xf, src=x_in[t0:t0 + _NKI_P, :])
@@ -2079,41 +2083,34 @@ if NKI_AVAILABLE:
                 if p0 + _NKI_P >= t:                  # last tile of the sequence row: nothing carries back from the next row
                     for _i in range(ck_w - 1):
                         nisa.memset((ckg1 if _par == 0 else ckg0)[_i], 0.0)
+                dxcb = nl.ndarray((_NKI_P, D), dtype=nl.bfloat16, buffer=nl.sbuf)
                 dxc = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_tensor(dst=dxc, data1=dx1, data2=sc[:, 4:4 + D], op=nl.multiply)          # tap 0
                 _t0p = nl.ndarray((_NKI_P, D), dtype=nl.bfloat16, buffer=nl.sbuf)
                 nisa.tensor_tensor(dst=_t0p, data1=dx1, data2=xf, op=nl.multiply)                     # dck[0] = sum_p g * x
-                ckt0.append(_t0p)
+                nisa.tensor_tensor(dst=dcka[:, 0:D], data1=dcka[:, 0:D], data2=_t0p, op=nl.add)
                 for _i in range(1, ck_w):             # one tap at a time: only one CK PSUM tile is ever live
                     _cur = (ckg0 if _par == 0 else ckg1)[_i - 1]
                     _prv = (ckg1 if _par == 0 else ckg0)[_i - 1]
                     nisa.tensor_scalar(dst=_cur, data=dx1, op0=nl.multiply, operand0=ds[:, _i:_i + 1])
+                    # [NCC_ILMM003] "accumulation flags need to be all set or all unset": every matmul into one PSUM
+                    # tile must pass `accumulate` or none may. Omitting it on the first call (as the key-offset code
+                    # does, where each tile takes exactly ONE matmul) and passing it on the second is the one thing
+                    # this file may not do - it cost a device compile at every shape. Pass it on both.
                     _ps = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.psum)
-                    nisa.nc_matmul(dst=_ps, stationary=ckSt[_i - 1], moving=_cur)
+                    nisa.nc_matmul(dst=_ps, stationary=ckSt[_i - 1], moving=_cur, accumulate=False)
                     nisa.nc_matmul(dst=_ps, stationary=ckEt[_i - 1], moving=_prv, accumulate=True)
                     _tm = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.sbuf)
                     nisa.tensor_tensor(dst=_tm, data1=_ps, data2=sc[:, 4 + _i * D:4 + (_i + 1) * D], op=nl.multiply)
-                    if _i == ck_w - 1:                # the last add writes bf16, in place of the plain cast below
-                        nisa.tensor_tensor(dst=dxb, data1=dxc, data2=_tm, op=nl.add)
+                    if _i == ck_w - 1:                # the last add writes the bf16 store tile directly
+                        nisa.tensor_tensor(dst=dxcb, data1=dxc, data2=_tm, op=nl.add)
                     else:
                         nisa.tensor_tensor(dst=dxc, data1=dxc, data2=_tm, op=nl.add)
                     _tp = nl.ndarray((_NKI_P, D), dtype=nl.bfloat16, buffer=nl.sbuf)
                     nisa.tensor_tensor(dst=_tp, data1=_ps, data2=xf, op=nl.multiply)                  # dck[i] = sum_p (c_i g)[p+i] * x[p]
-                    ckt1[_i - 1].append(_tp)
-            else:
-                nisa.tensor_copy(dst=dxb, src=dx1)
-            nisa.dma_copy(dst=dxm_out[t0:t0 + _NKI_P, :], src=dxb)
-            if ck_w > 1 and len(ckt0) >= ckgrp:
-                for _i in range(ck_w):
-                    _lst = ckt0 if _i == 0 else ckt1[_i - 1]
-                    cwps = nl.ndarray((1, D), dtype=nl.float32, buffer=nl.psum)
-                    for _j in range(len(_lst)):
-                        nisa.nc_matmul(dst=cwps, stationary=ckone, moving=_lst[_j], accumulate=(_j > 0))
-                    nisa.tensor_tensor(dst=dcka[0:1, _i * D:(_i + 1) * D], data1=dcka[0:1, _i * D:(_i + 1) * D],
-                                       data2=cwps, op=nl.add)
-                ckt0 = []
-                for _i in range(ck_w - 1):
-                    ckt1[_i] = []
+                    nisa.tensor_tensor(dst=dcka[:, _i * D:(_i + 1) * D], data1=dcka[:, _i * D:(_i + 1) * D],
+                                       data2=_tp, op=nl.add)
+                nisa.dma_copy(dst=dxc_out[t0:t0 + _NKI_P, :], src=dxcb)
             # ---- wgrad: dW[o-chunk, in] += act[tok, o-chunk]^T @ h[tok, in]   (contraction over the token partitions)
             _wq.append(dpq)
             _wk.append(dpk)
@@ -2145,7 +2142,7 @@ if NKI_AVAILABLE:
             nisa.dma_copy(dst=dwv_out[o * _NKI_P:(o + 1) * _NKI_P, :], src=accv[o])
         if ck_w > 1:
             nisa.dma_copy(dst=dck_out, src=dcka)
-            return dxm_out, gv_out, dwq_out, dwk_out, dwv_out, dck_out
+            return dxm_out, gv_out, dwq_out, dwk_out, dwv_out, dck_out, dxc_out
         return dxm_out, gv_out, dwq_out, dwk_out, dwv_out
 
     _HVC = 512   # vocab chunk width of the fused head kernels (2026-09-08, nki_head.py)
@@ -2940,7 +2937,7 @@ def build_layer_ops(n_head: int):
 
     # CK returns one more tensor (the conv weight gradient); the schema is the one thing that has to differ, so the
     # annotation is built from CK_W and the body is shared. With CK off the op is the baseline op.
-    _LBRET = tuple[tuple([torch.Tensor] * (10 if CK_W > 1 else 9))]
+    _LBRET = tuple[tuple([torch.Tensor] * (11 if CK_W > 1 else 9))]
 
     @nki_op("tf_nki::layer_bwd", mutates_args={})
     def layer_bwd(dout2: torch.Tensor, x2: torch.Tensor, x02: torch.Tensor, ve2: torch.Tensor, xm: torch.Tensor, rq: torch.Tensor,
@@ -2975,8 +2972,9 @@ def build_layer_ops(n_head: int):
                               dv4.reshape(b * NH, t, HD).contiguous(), rq.contiguous(), rk.contiguous(),
                               xm.contiguous(), dx1.contiguous(), cos_full, sin_full, dstart.reshape(T, -1), wq, wk, wv,
                               x2, scal, n_head=NH, eps=eps, scale=scale, hq=HQ, ck_w=CK_W)
-        if CK_W > 1:
-            return (res[0], res[1], res[2], res[3], res[4], dWo, dW1p.sum(0), dW2p.sum(0), dsink, res[5])
+        if CK_W > 1:   # ... + the conv weight gradient (128 partial sums) and A^T (dL/dxm)
+            return (res[0], res[1], res[2], res[3], res[4], dWo, dW1p.sum(0), dW2p.sum(0), dsink,
+                    res[5].sum(0, keepdim=True), res[6])
         dxm, gv2, dWq, dWk, dWv = res
         return dxm, gv2, dWq, dWk, dWv, dWo, dW1p.sum(0), dW2p.sum(0), dsink
 
@@ -2993,17 +2991,8 @@ def build_layer_ops(n_head: int):
             dout2, x2, x02, ve2, xm, rq, rk, q4, k4, v4, outT, neg_max, recip, y2, x1, preT, cos2d, sin2d, sink, start, end,
             dstart, wq, wk, wv, wo, w1, w2, scal)
         dxm, gv2, dWq, dWk, dWv, dWo, dW1, dW2, dsink = _bres[0], _bres[1], _bres[2], _bres[3], _bres[4], _bres[5], _bres[6], _bres[7], _bres[8]
-        resid = scal[0:1, 0:1]; x0l = scal[0:1, 1:2]; vel = scal[0:1, 2:3]
-        # CK: dxm is already A^T (dL/dxm), the transposed conv. A^T is linear and commutes with the scalar mix, so
-        # dx2 = resid * A^T g is the gradient w.r.t. the PRE-conv input and d_resid = sum(A^T g * x2) == sum(g * conv(x2))
-        # still holds exactly - i.e. every line below is unchanged, and only the conv weight row is appended.
-        dxf = dxm.float()
-        dx2 = (dxf * resid).to(x2.dtype); dx02 = (dxf * x0l).to(x02.dtype); dve2 = (gv2.float() * vel).to(ve2.dtype)
-        d_resid = (dxf * x2.float()).sum(); d_x0 = (dxf * x02.float()).sum(); d_ve = (gv2.float() * ve2.float()).sum()
-        row0 = torch.stack([d_resid, d_x0, d_ve, torch.zeros((), device=scal.device, dtype=torch.float32)]).view(1, 4)
-        if CK_W > 1:   # dL/du = resid * dL/dxm, and the conv weights ride in scal columns 4:, so their grad rides here
-            row0 = torch.cat([row0, _bres[9][0:1].float() * resid], dim=1)   # row 0 of the (128, CK_W*D) store
-        dscal = torch.cat([row0, torch.zeros((127, row0.shape[1]), device=scal.device, dtype=torch.float32)], dim=0)
+        dx2, dx02, dve2, dscal = ck_mix_backward(dxm, gv2, x2, x02, ve2, scal,
+                                                 _bres[10] if CK_W > 1 else None, _bres[9] if CK_W > 1 else None)
         return (dx2, dx02, dve2, None, None, None, None, dscal, dsink.to(sink.dtype), None, None, None,
                 dWq.to(wq.dtype), dWk.to(wk.dtype), dWv.to(wv.dtype), dWo.to(wo.dtype), dW1.to(w1.dtype), dW2.to(w2.dtype))
 
@@ -3137,6 +3126,42 @@ def ck_table(doc_start, b: int, t: int, device) -> torch.Tensor:
         ci = cols[i]
         cols.append(torch.cat([ci[:, i:], torch.zeros_like(ci[:, :i])], dim=1))
     return torch.stack(cols, dim=-1).contiguous()
+
+
+def ck_mix_backward(dxm, gv2, x2, x02, ve2, scal, dxc=None, dck=None):
+    """The residual-mix half of tf_nki::layer_fwd's backward: the layer computes
+
+        u = conv(x2)  (identity with CK off)        xm = resid * u + x0l * x02        v += vel * ve2
+
+    so with g = dL/dxm (dxm) and A^T g (dxc, the kernel's conv transpose; None with CK off):
+
+        dx2   = resid * A^T g        d_resid = sum(A^T g * x2) == sum(g * u)      <- differentiate the conv's INPUT
+        dx02  = x0l * g              d_x0    = sum(g * x02)                       <- x0 is NOT convolved
+        dve2  = vel * gv2            d_ve    = sum(gv2 * ve2)
+        dcanon = resid * dck                                                      (rides in scal columns 4:)
+
+    A^T belongs to the first line ONLY. Feeding A^T g to the x0 terms as well - which is what returning A^T g as dxm
+    did until 2026-09-27 - smears the embedding-skip gradient through the conv and cost about 90% of the mechanism
+    (-0.0014 in kernel against -0.0137 in torch at 600 matched steps), with the error growing as the taps grow away
+    from their identity init, so it also reversed with horizon. nki/nki_ck_test.py checks this function against
+    autograd on the torch mix; a kernel-level test cannot see it, because the flow error is here and not in the kernel.
+    Split out of `backward()` for exactly that reason. With CK off it is the baseline sequence, op for op."""
+    resid = scal[0:1, 0:1]
+    x0l = scal[0:1, 1:2]
+    vel = scal[0:1, 2:3]
+    dxf = dxm.float()
+    dxcf = dxf if dxc is None else dxc.float()
+    dx2 = (dxcf * resid).to(x2.dtype)
+    dx02 = (dxf * x0l).to(x02.dtype)
+    dve2 = (gv2.float() * vel).to(ve2.dtype)
+    d_resid = (dxcf * x2.float()).sum()
+    d_x0 = (dxf * x02.float()).sum()
+    d_ve = (gv2.float() * ve2.float()).sum()
+    row0 = torch.stack([d_resid, d_x0, d_ve, torch.zeros((), device=scal.device, dtype=torch.float32)]).view(1, 4)
+    if dck is not None:
+        row0 = torch.cat([row0, dck.float() * resid], dim=1)
+    dscal = torch.cat([row0, torch.zeros((127, row0.shape[1]), device=scal.device, dtype=torch.float32)], dim=0)
+    return dx2, dx02, dve2, dscal
 
 
 class Block(nn.Module):
