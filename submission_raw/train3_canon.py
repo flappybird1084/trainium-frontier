@@ -507,21 +507,12 @@ if NKI_AVAILABLE:
                      beta1: float = 0.8, beta2: float = 0.995, eps: float = 1e-10):
         """One pass of AdamW over a 2-D fp32 parameter, in place. scal[:, k] = lr, 1/bias1, 1/sqrt(bias2), lr*wd."""
         R, C = p_in.shape
-        nprog = nl.num_programs(0)
-        pid = nl.program_id(0)
-        # The caller DISCARDS this return value; the update that counts is the in-place write to p_in/m_in/v_in
-        # below. A full (R, C) copy of the parameter used to be written to HBM here every step for nothing:
-        # 77.6 MB/step for AdamW plus 31.4 MB for Muon = 0.56% of the step's 19.51 GB of DMA, which at the
-        # measured 41.7 ns/KiB marginal rate is ~0.3 ms (see findings/dma-descriptors-2026-09-27.md). Shrunk to
-        # one tile per program, written once after the loop and SOURCED FROM p_in so the data dependence on the
-        # in-place writes is preserved. Same contract as embed_scatter_add_v2, which mutates its input in place
-        # and returns a single row that every caller discards - on device since v45.
-        out = nl.ndarray((nprog * P, C), dtype=p_in.dtype, buffer=nl.shared_hbm)
+        out = nl.ndarray((R, C), dtype=p_in.dtype, buffer=nl.shared_hbm)
         sc = nl.ndarray((P, 4), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=sc, src=scal)
-        per = (R // P) // nprog
+        per = (R // P) // nl.num_programs(0)
         for ii in nl.affine_range(per):
-            i = pid * per + ii
+            i = nl.program_id(0) * per + ii
             rows = slice(i * P, (i + 1) * P)
             p = nl.ndarray((P, C), dtype=nl.float32, buffer=nl.sbuf)
             g = nl.ndarray((P, C), dtype=nl.float32, buffer=nl.sbuf)
@@ -546,12 +537,10 @@ if NKI_AVAILABLE:
             nisa.reciprocal(dst=den, data=den)
             nisa.scalar_tensor_tensor(dst=tmp, data=m, op0=nl.multiply, operand0=sc[:, 1:2], op1=nl.multiply, operand1=den)
             nisa.scalar_tensor_tensor(dst=p, data=tmp, op0=nl.multiply, operand0=sc[:, 0:1], op1=nl.subtract, operand1=p, reverse1=True)
+            nisa.dma_copy(dst=out[rows, :], src=p)
             nisa.dma_copy(dst=p_in[rows, :], src=p)
             nisa.dma_copy(dst=m_in[rows, :], src=m)
             nisa.dma_copy(dst=v_in[rows, :], src=v)
-        # one tile per program, read back from the buffer the loop just mutated: disjoint across programs, and the
-        # read forces the output to depend on every in-place write
-        nisa.dma_copy(dst=out[pid * P:(pid + 1) * P, :], src=p_in[pid * per * P:(pid * per + 1) * P, :])
         return out
 
     @nki.jit
@@ -567,18 +556,14 @@ if NKI_AVAILABLE:
         k = i_ if tall else o
         mt, kt, mc = m // P, k // P, m // FMAX
         ot = o // P
-        nprog = nl.num_programs(0)
-        pid = nl.program_id(0)
-        # see adamw_kernel: the caller discards this, the real update is the in-place w_in write, so one tile per
-        # program instead of a full (n, o, i_) second copy of the whole stack
-        w_out = nl.ndarray((nprog, P, i_), dtype=nl.float32, buffer=nl.shared_hbm)
+        w_out = nl.ndarray((n, o, i_), dtype=nl.float32, buffer=nl.shared_hbm)
         sc = nl.ndarray((P, 4), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=sc, src=scal)
         ones32 = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(ones32, 1.0)
-        per = n // nprog
+        per = n // nl.num_programs(0)
         for ii in nl.affine_range(per):
-            i = pid * per + ii
+            i = nl.program_id(0) * per + ii
             # momentum update and nesterov blend, natural layout, bf16 result
             Gn = []
             for _j in range(ot):
@@ -760,9 +745,8 @@ if NKI_AVAILABLE:
                 nisa.tensor_scalar(dst=wdm, data=wdm, op0=nl.multiply, operand0=sc[:, 2:3])
                 nisa.scalar_tensor_tensor(dst=gg, data=gg, op0=nl.multiply, operand0=sc[:, 1:2], op1=nl.add, operand1=wdm)
                 nisa.tensor_tensor(dst=w, data1=w, data2=gg, op=nl.subtract)
+                nisa.dma_copy(dst=w_out[i, p * P:(p + 1) * P, :], src=w)
                 nisa.dma_copy(dst=w_in[i, p * P:(p + 1) * P, :], src=w)
-        # one tile per program, read back from the stack the loop just mutated (see adamw_kernel)
-        nisa.dma_copy(dst=w_out[pid, :, :], src=w_in[pid * per, 0:P, :])
         return w_out
 
     adamw_step_nki = wrap_nki(adamw_kernel)
