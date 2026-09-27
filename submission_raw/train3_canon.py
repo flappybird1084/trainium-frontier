@@ -4075,6 +4075,17 @@ def sync_gradients(model: nn.Module, optimizer: MuonAdamW) -> None:
 # Checkpoint / scoring hook
 
 
+def forward_knobs() -> dict:
+    """Every env knob that changes the SCORED forward WITHOUT changing the parameter set, so strict=True cannot
+    catch a mismatch. Scoring is a separate process: prepare.py eval-public imports this file fresh and re-reads
+    os.environ, and the rotary tables are persistent=False buffers rebuilt in __init__ from these globals. A knob
+    that ADDS parameters (canon_*, mudd) already fails loudly on load_state_dict; these fail SILENTLY, scoring a
+    different model than was trained. Recorded in the checkpoint and asserted on load: an assert, not a rule."""
+    return {"rope_base": float(ROPE_BASE), "rope_frac": float(ROPE_FRAC), "key_offset": int(bool(KEY_OFFSET)),
+            "key_offset_div": int(KEY_OFFSET_DIV), "ve_t1": int(VE_T1), "ve_t2": int(VE_T2),
+            "layer_impl": str(LAYER_IMPL)}
+
+
 def save_checkpoint(path: Path, model: GPT, meta: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -4086,6 +4097,7 @@ def save_checkpoint(path: Path, model: GPT, meta: dict) -> None:
                         for k, v in model.state_dict().items()},
         "model_config": asdict(model.config),
         "meta": meta,
+        "forward_knobs": forward_knobs(),
     }
     if MUDD:
         # MUDD changes the SCORED forward, so the shape of the model the scorer rebuilds must not depend on the
@@ -4099,6 +4111,11 @@ def load_for_eval(checkpoint_path: str, device: torch.device) -> nn.Module:
     global COMPUTE_DTYPE, MUDD, MUDD_CHANNELS, MUDD_DIM, MUDD_MID, MUDD_NORM, MUDD_CAP, MUDD_SITES_ENV
     COMPUTE_DTYPE = compute_dtype_for(device)
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    _saved_knobs = payload.get("forward_knobs")     # .get + None guard keeps pre-v75 checkpoints loadable
+    if _saved_knobs is not None and _saved_knobs != forward_knobs():
+        _bad = {k: (v, forward_knobs().get(k)) for k, v in _saved_knobs.items() if v != forward_knobs().get(k)}
+        raise RuntimeError(f"scored forward would differ from the trained one (trained, now): {_bad}. "
+                           f"Pass the training arm's NEURON_COMPETITION_R1_* env to the scoring job.")
     _mudd = payload.get("mudd")
     if _mudd is not None:        # rebuild the mixers exactly as trained, without needing the env vars set here
         MUDD = True
