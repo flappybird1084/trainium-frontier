@@ -101,6 +101,12 @@ LOADER_CPU = os.environ.get("NEURON_COMPETITION_R1_LOADER_CPU", "0") != "0"
 # cascade, whose envelope is [0.9951, 1.00041] against our ~[0.86, 1.14], LOST here by +0.00062 - so tighter
 # orthogonalisation does not help, and looser may.
 NS_STEPS = int(os.environ.get("NEURON_COMPETITION_R1_NS_STEPS", "5"))
+# Value-embedding DEPTH SCHEDULE, never swept. Three tables (vte / vte_mid / vte2) are assigned by depth as
+# layers [0,t1) / [t1,t2) / [t2,n_layer), with t1 = n_layer//3 and t2 = n_layer - t1, i.e. an even 4/4/4 over 12
+# layers. The lineage this stack came from concentrates value embeddings at the FIRST and LAST layers rather than
+# spreading them evenly, so the edges-vs-middle split is a real hyperparameter that 635 ledger rows never touched.
+VE_T1 = int(os.environ.get("NEURON_COMPETITION_R1_VE_T1", "0"))    # 0 = keep n_layer//3
+VE_T2 = int(os.environ.get("NEURON_COMPETITION_R1_VE_T2", "0"))    # 0 = keep n_layer - t1
 NKI_STRICT = os.environ.get("NEURON_COMPETITION_R1_NKI_STRICT", "0") != "0"
 _FALLBACKS = []          # every silent degradation this run took
 
@@ -145,7 +151,7 @@ SCALAR_LR = 0.20 * 0.71 * _BATCH_LR
 WEIGHT_DECAY = 0.10
 WARMUP_STEPS = 50
 ROPE_FRAC = float(os.environ.get("NEURON_COMPETITION_R1_ROPE_FRAC", "0.5"))                 # half-truncate RoPE: only the higher half of the frequencies rotate (the rest stays positional-free)
-KEY_OFFSET = True               # stationary key dims D/4:D/2 come from the previous position (zeroed at document starts)
+KEY_OFFSET = os.environ.get("NEURON_COMPETITION_R1_KEY_OFFSET", "1") != "0"   # stationary key dims D/4:D/2 come from the previous position (zeroed at document starts)
 # The key-offset FRACTION has never been swept: 626 ledger rows cover KEY_OFFSET on/off, its implementation
 # (glue vs in-kernel) and a schedule, but every one of them uses hq = HD//4, chosen when the mechanism was
 # introduced. hq is a kernel PARAMETER, not a constant in the kernel body, so the dose costs only a recompile.
@@ -3139,8 +3145,8 @@ class GPT(nn.Module):
             ve1 = self.transformer.vte(idx).to(COMPUTE_DTYPE)
             ve_mid = self.transformer.vte_mid(idx).to(COMPUTE_DTYPE)
             ve2 = self.transformer.vte2(idx).to(COMPUTE_DTYPE)
-        t1 = self.config.n_layer // 3
-        t2 = self.config.n_layer - t1
+        t1 = VE_T1 if VE_T1 > 0 else self.config.n_layer // 3
+        t2 = VE_T2 if VE_T2 > 0 else self.config.n_layer - t1
 
         # document mask: causal within the document (documents start at BOS)
         dense_mask = None
