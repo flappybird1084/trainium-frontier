@@ -38,3 +38,4 @@ submit/
 
 # Local NKI simulator venv
 .venv-nki/
+ckpt/

@@ -138,3 +138,30 @@ not reach 0.9650, and the honest expectation from it is single-digit millisecond
   independent 300 s screens of the identical config: 673 steps / 1.101130 and 673 steps / 1.101177. The
   0.00025 number is cross-session; paired same-session arms can resolve much smaller effects than the ledger's
   warnings imply.
+
+## CORRECTION (2026-09-27): the "4% CPU duty cycle" argument above is wrong
+
+The retraction two sections up kills the hyperthread-sibling hypothesis with "host work is 18.3 ms inside a
+466 ms step = a **4% CPU duty cycle**". Measured directly against a live 8-rank run (`/proc/<pid>/stat`,
+`ps -o %cpu`):
+
+```
+8 rank processes, EVERY one at 96-101% CPU      (utime ~14000 ticks vs stime ~1800 -> ~89% USER time)
+main thread parked in futex_do_wait             -> the CPU is burned by a helper thread, not the main thread
+/sys/.../thread_siblings_list: 0,6  1,7  2,8  3,9  4,10  5,11
+Cpus_allowed_list = 0-11 for all 8 ranks        -> no affinity pinning by torchrun or the Neuron runtime
+```
+
+So the host is **saturated, not 4% busy**: eight continuously-busy threads on **6 physical cores**, which forces
+two physical cores to carry two ranks each. The duty-cycle arithmetic was measuring the wrong thing - `host=18.3`
+is the *loader* section of the step, not the process's CPU consumption.
+
+**This does not resurrect the lever, and the axis stays closed** - for the reasons that were always the real
+ones: (a) the `PACK=4` arithmetic (a 25% row cut to fix a 4% deficit costs the tokens it saves), and (b) 8 ranks
+on 6 cores is *forced*, so no pinning arrangement exists that removes the sharing, and `LNC=2`/`NPROC=4` (which
+would) is separately dead at **0.654 vs 0.485 s/step** (`Q_LNC2`). Tokenizer threads 32 -> 8 also left skew
+unchanged. Prize is bounded at ~18 ms ≈ −0.0012 with no known intervention.
+
+**What to take from it:** do not reuse "the host is only 4% busy" to dismiss any host-side mechanism. The host
+is pegged. The reason host latency does not matter is the *measured* one - `D_QDEPTH` found 311.6 ms of device
+work already queued when the host leaves to fetch a batch - not a duty-cycle estimate.
