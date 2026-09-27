@@ -109,7 +109,7 @@ NS_STEPS = int(os.environ.get("NEURON_COMPETITION_R1_NS_STEPS", "5"))
 # 424 ms step = -0.0008 bpb. NOT free, though: the residual ACCUMULATION across 12 layers becomes bf16,
 # and the residual is O(20) by layer 10, so this is a genuine precision trade and needs a quality gate,
 # not just a speed screen. Forcing the SCORED head to bf16 was separately measured at only +0.0000229.
-RESID_BF16 = os.environ.get("NEURON_COMPETITION_R1_RESID_BF16", "0") != "0"
+RESID_BF16 = int(os.environ.get("NEURON_COMPETITION_R1_RESID_BF16", "0"))   # 1 = narrow the sum, 2 = narrow the product
 # Value-embedding DEPTH SCHEDULE, never swept. Three tables (vte / vte_mid / vte2) are assigned by depth as
 # layers [0,t1) / [t1,t2) / [t2,n_layer), with t1 = n_layer//3 and t2 = n_layer - t1, i.e. an even 4/4/4 over 12
 # layers. The lineage this stack came from concentrates value embeddings at the FIRST and LAST layers rather than
@@ -3421,9 +3421,15 @@ class GPT(nn.Module):
             targets = targets.clone()
         if emb is not None:                       # training on Trainium: dense rows gathered outside the graph
             emb = {k: v.clone() for k, v in emb.items()}   # (clone: inputs saved for backward must not alias outputs)
-            x = emb["wte"] + self.bigram_lambda * emb["bte"]
-            if RESID_BF16:
-                x = x.to(COMPUTE_DTYPE)   # the multiply-add still runs in fp32; only the STORAGE narrows
+            if RESID_BF16 == 2:
+                # variant 2: narrow the PRODUCT before the add, so the sum is bf16 + bf16 and never widens.
+                # Variant 1 (narrow the sum) produced a graph neuronx-cc could not compile: INTERNAL_ERROR
+                # NCC_IMGN901 MacroGener... at trace time. Same dtype outcome, different graph shape.
+                x = emb["wte"] + (self.bigram_lambda * emb["bte"]).to(COMPUTE_DTYPE)
+            else:
+                x = emb["wte"] + self.bigram_lambda * emb["bte"]
+                if RESID_BF16:
+                    x = x.to(COMPUTE_DTYPE)   # multiply-add still fp32; only the STORAGE narrows
         else:
             x = self.transformer.wte(idx).to(COMPUTE_DTYPE)
             x = x + self.bigram_lambda * self.transformer.bte(bh).to(COMPUTE_DTYPE)
