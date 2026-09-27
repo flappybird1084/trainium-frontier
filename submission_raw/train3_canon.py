@@ -88,7 +88,24 @@ HEAD_DIM = N_EMBD // N_HEAD
 MLP_RATIO = 6                   # MLP hidden = 6x n_embd (was 4): Sep 9, -0.0056 at ratio 6 on the kernel line
 TOTAL_BATCH_SIZE = 131072       # tokens per optimizer step (one 16-row micro-step per worker on the 8-way launch)
 DEVICE_BATCH_ROWS = int(os.environ.get("NEURON_COMPETITION_R1_DEVICE_BATCH", "16"))  # dev knob: fit beside other GPU work
-_BATCH_LR = (TOTAL_BATCH_SIZE / 32768) ** 0.5   # sqrt-batch scaling of every learning rate relative to the 32k tuning
+# Every learning rate was swept ONE AT A TIME (EMBEDDING_LR x4.5, MATRIX_LR x0.7, SCALAR_LR, UNEMBEDDING_LR) and
+# each sits on a plateau. That does NOT imply the JOINT direction is flat: the constants were tuned at ~3300 steps
+# and we now run ~4400, and a coordinated move explores an axis no single-knob sweep touched. This scales all four
+# together, on top of the sqrt-batch factor.
+GLOBAL_LR = float(os.environ.get("NEURON_COMPETITION_R1_GLOBAL_LR", "1.0"))
+# Build the train loader on the HOST and do the H2D copy ourselves. Bit-identical math (same documents, same
+# packing, same order); only the device the loader writes into changes.
+LOADER_CPU = os.environ.get("NEURON_COMPETITION_R1_LOADER_CPU", "0") != "0"
+NKI_STRICT = os.environ.get("NEURON_COMPETITION_R1_NKI_STRICT", "0") != "0"
+_FALLBACKS = []          # every silent degradation this run took
+
+
+def note_fallback(what: str, exc) -> None:
+    """Record (and under NKI_STRICT, refuse) a fall-back onto a slower path."""
+    _FALLBACKS.append(f"{what}: {str(exc)[:110]}")
+    if NKI_STRICT:
+        raise RuntimeError(f"NKI_STRICT: refusing to continue on the slow path after {what}: {exc}")
+_BATCH_LR = (TOTAL_BATCH_SIZE / 32768) ** 0.5 * GLOBAL_LR
 NUM_STEPS = 100000              # never binds; the time budget does
 MAX_TRAIN_SECONDS = TRAIN_TIME_BUDGET_SECONDS
 CHECKPOINT_RESERVE_SECONDS = 5.0
@@ -3475,6 +3492,7 @@ class EmbedSidecar:
                     continue
                 except Exception as exc:
                     self.dense_off = True      # plans built two micro-steps out drop the dense path
+                    note_fallback("embed scatter x4", exc)
                     print0(f"scatter x4 unavailable ({str(exc)[:80]}); per-table path")
             for name in names:
                 g = emb[name].grad
@@ -3687,7 +3705,8 @@ class MuonAdamW(torch.optim.Optimizer):
                     continue
                 except Exception as exc:
                     self.use_nki = False
-                    print0(f"NKI AdamW kernel unavailable ({str(exc)[:80]}); using the PyTorch step")
+                    note_fallback("NKI AdamW -> PyTorch (WHOLE OPTIMIZER)", exc)
+                print0(f"NKI AdamW kernel unavailable ({str(exc)[:80]}); using the PyTorch step")
             p.mul_(1 - lr_t * group["weight_decay"])
             exp_avg.lerp_(grad, 1 - beta1)
             exp_avg_sq.lerp_(grad.square(), 1 - beta2)
@@ -3716,6 +3735,7 @@ class MuonAdamW(torch.optim.Optimizer):
                 return
             except Exception as exc:
                 self.use_nki = False
+                note_fallback("NKI Muon -> PyTorch (WHOLE OPTIMIZER)", exc)
                 print0(f"NKI Muon kernel unavailable ({str(exc)[:80]}); using the PyTorch step")
 
         mom_t = group["momentum_t"].to(momentum_buffer.dtype)
@@ -3913,11 +3933,13 @@ def main() -> None:
         try:
             build_layer_ops(model.config.n_head)  # the custom ops must exist before torch.compile traces the model
         except Exception as exc:                # unknown kernel API on the scoring box -> explicit layers (same math), never a crash
+            note_fallback("layer ops -> explicit layers", exc)
             print0(f"layer ops unavailable ({str(exc)[:120]}); using the explicit layers")
     if device_type == "neuron" and NKI_AVAILABLE:
         try:
             build_head_ops()                      # fused linear cross-entropy; explicit cross_entropy(head_logits) if it cannot be built
         except Exception as exc:
+            note_fallback("fused loss -> cross_entropy", exc)
             print0(f"fused loss unavailable ({str(exc)[:120]}); using cross_entropy(head_logits)")
     if COMPILE and device_type == "neuron":
         try:
@@ -3925,6 +3947,7 @@ def main() -> None:
             USE_STACK_FUNCTION = False
             print0("torch.compile enabled (backend=neuron)")
         except Exception as exc:
+            note_fallback("torch.compile -> eager", exc)
             print0(f"torch.compile unavailable ({str(exc)[:80]}); running eager")
             model = orig_model
 
@@ -3952,7 +3975,7 @@ def main() -> None:
         return
 
     assert device_batch_size % PACK == 0, f"device_batch_size={device_batch_size} must be a multiple of PACK={PACK}"
-    _remap = (PREFIX_AUX_W > 0) or (MTP_W1 > 0) or (MTP_W2 > 0)
+    _remap = (PREFIX_AUX_W > 0) or (MTP_W1 > 0) or (MTP_W2 > 0) or LOADER_CPU
     _loader_dev = torch.device("cpu") if _remap else device
     _raw_loader = make_dataloader(tokenizer, device_batch_size // PACK, SEQ_LEN * PACK, "train", _loader_dev)
 
@@ -4045,6 +4068,7 @@ def main() -> None:
                     continue
                 if step != 0 or model is orig_model:
                     raise
+                note_fallback("compiled path -> eager", exc)
                 print0(f"compiled path failed at step 0 ({str(exc)[:80]}); falling back to eager")
                 model = orig_model
                 USE_STACK_FUNCTION = True
@@ -4200,6 +4224,12 @@ def main() -> None:
 
     if rank == 0:
         print("---")
+        if _FALLBACKS:
+            print(f"!!! NKI_FALLBACKS:   {len(_FALLBACKS)} - THIS RUN DID NOT USE THE FUSED PATH, DO NOT COMPARE ITS STEP TIME")
+            for _fb in _FALLBACKS:
+                print(f"!!!   {_fb}")
+        else:
+            print("NKI_FALLBACKS:      0 (all fused kernels live)")
         print(f"checkpoint_path:    {checkpoint_path}")
         print(f"training_seconds:  {budget_elapsed_before_save:.1f}")
         print(f"budget_seconds:    {TRAIN_TIME_BUDGET_SECONDS}")

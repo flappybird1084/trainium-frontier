@@ -68,7 +68,12 @@ Check it before any Trainium-side work.
 
 ## Findings directory
 
-`findings/` holds non-instruction, project-related knowledge. **Start with the newest `findings/handoff-*.md`
+`findings/` holds non-instruction, project-related knowledge. **Start with `findings/session-2026-09-27.md`**
+(a RETRACTION that matters: C_PRE3's 7x step time was two silent NKI kernel fallbacks, NOT the cost of an
+architecture change, so "torch ops between the fused layers are unshippable" and the pricing-out of MUDD are both
+WITHDRAWN - and before believing any step-time regression, grep the log for `unavailable`/`falling back`. Also:
+MoE closed twice over, MTP +0.0051, two eval-side items closed EXACTLY offline, two recon recommendations already
+in `_muon_step`, and five architecture constants never swept as values). Then the newest `findings/handoff-*.md`
 (`handoff-2026-09-26.md`: v58=0.970383 is the submission and is STILL NOT UPLOADED — the portal has v52 and we are
 10th of 10 with top 10 advancing; the public leaderboard JSON needs no sign-in and the portal RE-TRAINS on its own
 hardware, so use a +0.0069 offset. THE GOVERNING FACT: dense capacity nets only ~-0.0024 per e-fold at fixed TIME,
