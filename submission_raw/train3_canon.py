@@ -86,7 +86,11 @@ N_EMBD = 512
 N_HEAD = 4
 HEAD_DIM = N_EMBD // N_HEAD
 MLP_RATIO = 6                   # MLP hidden = 6x n_embd (was 4): Sep 9, -0.0056 at ratio 6 on the kernel line
-TOTAL_BATCH_SIZE = 131072       # tokens per optimizer step (one 16-row micro-step per worker on the 8-way launch)
+TOTAL_BATCH_SIZE = int(os.environ.get("NEURON_COMPETITION_R1_TOTAL_BATCH", "131072"))   # tokens per optimizer step (one
+# 16-row micro-step per worker on the 8-way launch). DEV KNOB ONLY: a shipped value must be folded in as a literal.
+# Pair it with NEURON_COMPETITION_R1_DEVICE_BATCH = TOTAL / (1024 * 8) to keep ONE micro-step per worker; a smaller
+# DEVICE_BATCH turns the rest into gradient accumulation (a different experiment: it amortises only the optimizer
+# and collectives, not the fwd/bwd launch chain). Every LR follows via _BATCH_LR (sqrt), measured right at 2x.
 DEVICE_BATCH_ROWS = int(os.environ.get("NEURON_COMPETITION_R1_DEVICE_BATCH", "16"))  # dev knob: fit beside other GPU work
 # Every learning rate was swept ONE AT A TIME (EMBEDDING_LR x4.5, MATRIX_LR x0.7, SCALAR_LR, UNEMBEDDING_LR) and
 # each sits on a plateau. That does NOT imply the JOINT direction is flat: the constants were tuned at ~3300 steps
@@ -669,6 +673,66 @@ if NKI_AVAILABLE:
         return out
 
     @nki.jit
+    def adamw_lazy_kernel(p_in: nl.ndarray, g_in: nl.ndarray, m_in: nl.ndarray, v_in: nl.ndarray, scal: nl.ndarray,
+                          beta1: float = 0.8, beta2: float = 0.995, eps: float = 1e-10):
+        """LAZY_BTE: adamw_kernel restricted to the rows whose gradient is nonzero (lazy / sparse Adam). A row with an
+        all-zero gradient keeps p, m and v bit-exactly: its per-row decay factors become 1 and its per-row lr 0, so no
+        branch and no data-dependent selection (the mask is arithmetic on a (P, 1) column). Bias correction uses the
+        global step, as torch SparseAdam does. The only extra full-tile work is one row reduction of g*g."""
+        R, C = p_in.shape
+        out = nl.ndarray((1, C), dtype=p_in.dtype, buffer=nl.shared_hbm)
+        sc = nl.ndarray((P, 4), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=sc, src=scal)
+        per = (R // P) // nl.num_programs(0)
+        for ii in nl.affine_range(per):
+            i = nl.program_id(0) * per + ii
+            rows = slice(i * P, (i + 1) * P)
+            p = nl.ndarray((P, C), dtype=nl.float32, buffer=nl.sbuf)
+            g = nl.ndarray((P, C), dtype=nl.float32, buffer=nl.sbuf)
+            m = nl.ndarray((P, C), dtype=nl.float32, buffer=nl.sbuf)
+            v = nl.ndarray((P, C), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=p, src=p_in[rows, :])
+            nisa.dma_copy(dst=g, src=g_in[rows, :])
+            nisa.dma_copy(dst=m, src=m_in[rows, :])
+            nisa.dma_copy(dst=v, src=v_in[rows, :])
+            # mask = 1.0 where the row has any nonzero gradient element (max of g*g > 0), else 0.0. g*g is the tile the
+            # v update needs anyway, so the mask costs one row reduction. (A row whose every |g| < ~1e-19 squares to 0 and
+            # counts as untouched - 10+ orders of magnitude below a real bigram gradient.)
+            sq = nl.ndarray((P, C), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=sq, data1=g, data2=g, op=nl.multiply)
+            rmax = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_reduce(dst=rmax, op=nl.maximum, data=sq, axis=(1,))
+            mk = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=mk, data=rmax, op0=nl.greater, operand0=0.0)
+            # per-row factors: decay 1 - mk*lr*wd, beta1 1 - mk*(1-b1), beta2 1 - mk*(1-b2), lr mk*lr
+            dcy = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            b1r = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            b2r = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            lrr = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=dcy, data1=mk, data2=sc[:, 3:4], op=nl.multiply)
+            nisa.tensor_scalar(dst=dcy, data=dcy, op0=nl.multiply, operand0=-1.0, op1=nl.add, operand1=1.0)
+            nisa.tensor_scalar(dst=b1r, data=mk, op0=nl.multiply, operand0=beta1 - 1.0, op1=nl.add, operand1=1.0)
+            nisa.tensor_scalar(dst=b2r, data=mk, op0=nl.multiply, operand0=beta2 - 1.0, op1=nl.add, operand1=1.0)
+            nisa.tensor_tensor(dst=lrr, data1=mk, data2=sc[:, 0:1], op=nl.multiply)
+            nisa.tensor_scalar(dst=p, data=p, op0=nl.multiply, operand0=dcy)
+            tmp = nl.ndarray((P, C), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=tmp, data=g, op0=nl.multiply, operand0=1.0 - beta1)
+            nisa.scalar_tensor_tensor(dst=m, data=m, op0=nl.multiply, operand0=b1r, op1=nl.add, operand1=tmp)
+            nisa.tensor_scalar(dst=tmp, data=sq, op0=nl.multiply, operand0=1.0 - beta2)
+            nisa.scalar_tensor_tensor(dst=v, data=v, op0=nl.multiply, operand0=b2r, op1=nl.add, operand1=tmp)
+            den = nl.ndarray((P, C), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.activation(dst=den, op=nl.sqrt, data=v)
+            nisa.tensor_scalar(dst=den, data=den, op0=nl.multiply, operand0=sc[:, 2:3], op1=nl.add, operand1=eps)
+            nisa.reciprocal(dst=den, data=den)
+            nisa.scalar_tensor_tensor(dst=tmp, data=m, op0=nl.multiply, operand0=sc[:, 1:2], op1=nl.multiply, operand1=den)
+            nisa.scalar_tensor_tensor(dst=p, data=tmp, op0=nl.multiply, operand0=lrr, op1=nl.subtract, operand1=p, reverse1=True)
+            nisa.dma_copy(dst=p_in[rows, :], src=p)
+            nisa.dma_copy(dst=m_in[rows, :], src=m)
+            nisa.dma_copy(dst=v_in[rows, :], src=v)
+        nisa.dma_copy(dst=out, src=p_in[0:1, :])
+        return out
+
+    @nki.jit
     def muon_kernel(w_in: nl.ndarray, g_in: nl.ndarray, mom_in: nl.ndarray, sec_in: nl.ndarray, scal: nl.ndarray,
                     ns_steps: int = 5, beta2: float = 0.9):
         """One Muon step for a stack of (n, out, in) fp32 matrices, in place on w / momentum / second moment:
@@ -875,6 +939,7 @@ if NKI_AVAILABLE:
         return w_out
 
     adamw_step_nki = wrap_nki(adamw_kernel)
+    adamw_lazy_step_nki = wrap_nki(adamw_lazy_kernel)
     muon_step_nki = wrap_nki(muon_kernel)
     attention_fwd_nki = wrap_nki(attention_cte)
     attention_bwd_nki = wrap_nki(attention_bwd)
@@ -3562,6 +3627,21 @@ SCATTER_CHECK = os.environ.get("NEURON_COMPETITION_R1_SCATTER_CHECK", "1") != "0
 # accumulation error over 512 channels is 0.5% at 16 adds, 0.8% at 41 and 1.7% at 201. So the change costs ~1.5% of
 # relative gradient accuracy on a few hundred hot rows. That is what a gate has to justify against ~1% step time.
 BTE_BF16 = os.environ.get("NEURON_COMPETITION_R1_BTE_BF16", "0") != "0"
+# LAZY_BTE: lazy (sparse) AdamW for the bigram table only - a row whose reduced gradient is exactly zero this step
+# (no token in the global 131,072-token batch hashed to it; ~76% of rows per step, measured) keeps its parameter,
+# first and second moment unchanged, instead of drifting on its stale momentum and taking weight decay. Bias correction
+# keeps the global step (torch SparseAdam semantics). Optimizer-only: the model, forward and scored logits are untouched.
+# Off = the exact pre-flag code path (the tag below is never set, so the dispatch never takes the lazy branch).
+LAZY_BTE = os.environ.get("NEURON_COMPETITION_R1_LAZY_BTE", "0") != "0"
+
+
+def apply_lazy_bte(model: "GPT") -> None:
+    """Tag the bigram table for the lazy AdamW path. MUST run before setup_sharding, which copies the tag to the shard."""
+    if not LAZY_BTE:
+        return
+    model.transformer.bte.weight._lazy_rows = True
+    print0(f"LAZY_BTE: bigram table ({model.transformer.bte.weight.numel():,} elements) on lazy AdamW "
+           f"(rows with an all-zero gradient are not updated)")
 
 
 def apply_bte_bf16(model: "GPT") -> None:
@@ -3972,6 +4052,8 @@ class MuonAdamW(torch.optim.Optimizer):
                 # try/except that would otherwise disable the WHOLE NKI optimizer silently
                 pshard = p.data[rank * per:(rank + 1) * per].clone().float()
                 pshard.grad = torch.zeros_like(pshard)
+                if getattr(p, "_lazy_rows", False):
+                    pshard._lazy_rows = True
                 self.plan[p] = dict(pshard=pshard, gshard=pshard.grad)
 
     def reduce_gradients(self, model: nn.Module):
@@ -4091,7 +4173,10 @@ class MuonAdamW(torch.optim.Optimizer):
                         b1c, b2c = 1 - beta1 ** (state["step"] + 1), 1 - beta2 ** (state["step"] + 1)
                         lr = float(group["lr"])
                         scal = self._scal([lr, 1.0 / b1c, 1.0 / (b2c ** 0.5), lr * group["weight_decay"]], p.device)
-                    adamw_step_nki[NKI_GRID](p, grad.contiguous(), exp_avg, exp_avg_sq, scal, beta1=beta1, beta2=beta2, eps=group["eps"])
+                    if getattr(p, "_lazy_rows", False):
+                        adamw_lazy_step_nki[NKI_GRID](p, grad.contiguous(), exp_avg, exp_avg_sq, scal, beta1=beta1, beta2=beta2, eps=group["eps"])
+                    else:
+                        adamw_step_nki[NKI_GRID](p, grad.contiguous(), exp_avg, exp_avg_sq, scal, beta1=beta1, beta2=beta2, eps=group["eps"])
                     state["step"] += 1
                     continue
                 except Exception as exc:
@@ -4102,6 +4187,18 @@ class MuonAdamW(torch.optim.Optimizer):
                     # checkpoint was written - turning a graceful ~7x slowdown into no score at all. Its twin
                     # in _muon_step is correctly indented, which is how the asymmetry survived.
                     print0(f"NKI AdamW kernel unavailable ({str(exc)[:80]}); using the PyTorch step")
+            if getattr(p, "_lazy_rows", False):
+                # LAZY_BTE torch path (CUDA/CPU, or after an NKI fallback): the same per-row masking as adamw_lazy_kernel
+                mk = (grad.reshape(grad.shape[0], -1) != 0).any(dim=1).to(p.dtype).view(-1, *([1] * (p.dim() - 1)))
+                p.mul_(1 - lr_t * group["weight_decay"] * mk)
+                exp_avg.lerp_(grad, (1 - beta1) * mk)
+                exp_avg_sq.lerp_(grad.square(), (1 - beta2) * mk)
+                state["step"] += 1
+                bias1 = 1 - beta1 ** state["step"]
+                bias2 = 1 - beta2 ** state["step"]
+                update = exp_avg / bias1 / ((exp_avg_sq / bias2).sqrt() + group["eps"])
+                p.sub_(lr_t * mk * update)
+                continue
             p.mul_(1 - lr_t * group["weight_decay"])
             exp_avg.lerp_(grad, 1 - beta1)
             exp_avg_sq.lerp_(grad.square(), 1 - beta2)
@@ -4348,8 +4445,8 @@ def main() -> None:
     ddp, rank, _local_rank, world_size, device = init_runtime(device_type)
     global COMPUTE_DTYPE
     COMPUTE_DTYPE = compute_dtype_for(device)
-    # rows per worker: at most 4 per micro-step (a 12 GB LNC=1 core holds 4 rows of the compiled graph); the rest of the
-    # 131,072-token step is gradient accumulation
+    # rows per worker per micro-step: DEVICE_BATCH_ROWS (16 ships: one micro-step per worker at 131,072 tokens), capped at
+    # the worker's share of TOTAL_BATCH_SIZE; whatever TOTAL_BATCH_SIZE leaves over is gradient accumulation
     device_batch_size = max(1, min(DEVICE_BATCH_ROWS, (TOTAL_BATCH_SIZE // SEQ_LEN) // world_size))
 
     print0(f"device={device} dtype={COMPUTE_DTYPE} world_size={world_size}")
@@ -4400,6 +4497,7 @@ def main() -> None:
         synthetic_y = torch.zeros((device_batch_size, SEQ_LEN), dtype=torch.long).to(device)
         optimizer = model.setup_optimizer()
         apply_bte_bf16(orig_model)      # --compile-only warms the NEFF cache: it must trace what the real run traces
+        apply_lazy_bte(orig_model)
         model.zero_grad(set_to_none=True)
         for _ in range(grad_accum_steps):
             loss = model(synthetic_x, synthetic_y)
@@ -4455,6 +4553,7 @@ def main() -> None:
     # before setup_sharding clones the fp32 master out of p.data, before EmbedSidecar sizes its gradient buffers from
     # the table dtypes, and before the first forward traces the graph (so the run still pays exactly one compile)
     apply_bte_bf16(orig_model)
+    apply_lazy_bte(orig_model)
     optimizer.setup_sharding(world_size, rank)
     # embedding tables live outside the compiled graph (whose backward lowers their scatter-add as one-hot matmuls,
     # ~20% of the step): gather rows before the graph, scatter-add their gradients after it
