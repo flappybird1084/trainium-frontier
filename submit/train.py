@@ -39,6 +39,10 @@ Notes for review (how the loss relates to the logits the scorer sees):
     optimizer step is tail weight averaging (`p.lerp_(ema, EMA_BLEND)`), an average of the weights the run itself
     visited, applied before the checkpoint is written so that the checkpoint and any in-run evaluation agree. Nothing
     is fitted to, or read from, evaluation data anywhere in this file.
+  * The hashed bigram table is held in bf16 during training (`hold_bigram_bf16`) and written to the checkpoint as
+    fp32, which is exact, so `load_for_eval` rebuilds it as the fp32 `nn.Embedding` the model constructs, holding the
+    same values. Both paths read it only as looked-up rows in COMPUTE_DTYPE (bf16 on Trainium), so the scored forward
+    sees the rows training saw.
   * Inert code, disclosed so it is not mistaken for live behaviour: seven experimental training-side terms are still
     present with their weights fixed at zero - PREFIX_AUX_W, MTP_W1, MTP_W2, NEST_BETA and the three CANON_*_W. Each
     is guarded by a positive-value test at every site (`> 0`, and `> 1` for the three CANON_*_W), so the
@@ -322,7 +326,9 @@ if NKI_AVAILABLE:
             nisa.dma_copy(dst=ix, src=idx[t * _NKI_P:(t + 1) * _NKI_P, :])
             ixc = nl.ndarray((_NKI_P, 1), dtype=nl.uint32, buffer=nl.sbuf)
             nisa.tensor_scalar(dst=ixc, data=ix, op0=nl.minimum, operand0=R - 1)
-            rows = nl.ndarray((_NKI_P, C), dtype=nl.float32, buffer=nl.sbuf)
+            # the staging tile takes the table's dtype (fp32 for the four token tables, bf16 for the bigram table):
+            # an indirect DMA is kept to a same-dtype copy
+            rows = nl.ndarray((_NKI_P, C), dtype=table.dtype, buffer=nl.sbuf)
             nisa.dma_copy(dst=rows, src=table.ap(pattern=[[C, _NKI_P], [1, C]], vector_offset=ixc, indirect_dim=0))
             nisa.dma_copy(dst=out[t * _NKI_P:(t + 1) * _NKI_P, :], src=rows)
         return out
@@ -344,7 +350,9 @@ if NKI_AVAILABLE:
             nisa.dma_copy(dst=ix, src=idx[t * _NKI_P:(t + 1) * _NKI_P, :])
             ixc = nl.ndarray((_NKI_P, 1), dtype=nl.uint32, buffer=nl.sbuf)
             nisa.tensor_scalar(dst=ixc, data=ix, op0=nl.minimum, operand0=Rp - 1)
-            rows = nl.ndarray((_NKI_P, C), dtype=nl.float32, buffer=nl.sbuf)
+            # `table` is the gradient accumulator and dma_compute adds into it in place, so the staged rows take its
+            # dtype (fp32 for the four token tables, bf16 for the bigram table)
+            rows = nl.ndarray((_NKI_P, C), dtype=table.dtype, buffer=nl.sbuf)
             nisa.dma_copy(dst=rows, src=grad.ap(pattern=[[C, _NKI_P], [1, C]], vector_offset=pmc, indirect_dim=0))
             tgt = table.ap(pattern=[[C, _NKI_P], [1, C]], vector_offset=ixc, indirect_dim=0)
             nisa.dma_compute(dst=tgt, srcs=[tgt, rows], reduce_op=nl.add)
@@ -3232,8 +3240,9 @@ def _pad_plan(perm, sidx):
 
 class EmbedSidecar:
     """Embedding tables outside the compiled graph. gather(model, x) returns dense bf16 rows (leaf tensors) for the 5 tables
-    plus the host scatter plans; after backward, scatter(...) accumulates their .grad into fp32 table gradients with the
-    NKI scatter-add kernel (or torch index_add_ under sidecar_torch); attach() hands those to the parameters."""
+    plus the host scatter plans; after backward, scatter(...) accumulates their .grad into table gradients of the table's
+    own dtype (fp32; bf16 for the bigram table, see hold_bigram_bf16) with the NKI scatter-add kernel (or torch index_add_
+    under sidecar_torch); attach() hands those to the parameters."""
 
     def __init__(self, model, impl: str):
         self.model = model
@@ -3350,7 +3359,7 @@ class EmbedSidecar:
                         print0(f"scatter kernel failed ({str(exc)[:80]}); index_add_ fallback")
                 if not done:
                     R = self.tables[name].shape[0]
-                    self.gbuf[name][:R].index_add_(0, ind_t.view(-1).long(), g2.float())
+                    self.gbuf[name][:R].index_add_(0, ind_t.view(-1).long(), g2.to(self.gbuf[name].dtype))
 
     def attach(self):
         for name, w in self.tables.items():
@@ -3434,7 +3443,7 @@ class MuonAdamW(torch.optim.Optimizer):
                     continue
                 if group["kind"] == "muon" and per % (NKI_GRID[0] if NKI_AVAILABLE else 1) != 0:
                     continue
-                pshard = p.data[rank * per:(rank + 1) * per].clone()
+                pshard = p.data[rank * per:(rank + 1) * per].clone().float()   # fp32 master, also for the bf16 bigram table
                 pshard.grad = torch.zeros_like(pshard)
                 self.plan[p] = dict(pshard=pshard, gshard=pshard.grad)
 
@@ -3452,6 +3461,14 @@ class MuonAdamW(torch.optim.Optimizer):
                 if zpad is None:
                     zpad = plan["zpad"] = torch.zeros((plan["npad"] - plan["n"],) + tuple(p.shape[1:]), dtype=p.grad.dtype, device=p.device)
                 dist.reduce_scatter_tensor(plan["gpad"], torch.cat([p.grad, zpad]), op=dist.ReduceOp.AVG)
+            elif plan is not None and p.grad.dtype != plan["gshard"].dtype:
+                # the bigram table: bf16 gradient, fp32 shard. Reduce at the gradient's dtype (half the bytes, no
+                # full-size cast) and cast only the 1/world-size result up
+                gs = plan.get("gsmall")
+                if gs is None:
+                    gs = plan["gsmall"] = torch.empty_like(plan["gshard"], dtype=p.grad.dtype)
+                dist.reduce_scatter_tensor(gs, p.grad, op=dist.ReduceOp.AVG)
+                plan["gshard"].copy_(gs)
             elif plan is not None:
                 dist.reduce_scatter_tensor(plan["gshard"], p.grad, op=dist.ReduceOp.AVG)
             else:
@@ -3469,6 +3486,11 @@ class MuonAdamW(torch.optim.Optimizer):
                     spad[:plan["hi"] - plan["lo"]].copy_(plan["pshard"])
                 dist.all_gather_into_tensor(plan["fpad"], spad)
                 p.data.copy_(plan["fpad"][:plan["n"]])
+                continue
+            if p.data.dtype == torch.bfloat16:
+                # the bigram table: the collective writes the bf16 replica directly. The same values as the p16
+                # path below, which also rounds every gathered weight to bf16.
+                dist.all_gather_into_tensor(p.data, plan["pshard"].to(torch.bfloat16))
                 continue
             p16 = plan.get("p16")
             if p16 is None:
@@ -3668,10 +3690,26 @@ def sync_gradients(model: nn.Module, optimizer: MuonAdamW) -> None:
 
 
 
+def hold_bigram_bf16(model: GPT) -> None:
+    """Hold the 2^18 x 512 hashed bigram table in bf16 for training (it is 134.2M of the model's parameters). Must run
+    before setup_sharding, which clones each worker's fp32 master shard from p.data, and before EmbedSidecar, whose
+    gradient buffers take the table's dtype. Where the optimizer shards it (the 8-worker launch does) each worker
+    updates its fp32 shard and all_gathers it back into this replica as bf16; otherwise (a single process, say) the
+    optimizer updates the bf16 table directly. The forward reads the table only as looked-up rows in COMPUTE_DTYPE,
+    and save_checkpoint writes it back as fp32. It is outside the tail-EMA, which excludes every nn.Embedding from its
+    first group and admits only tables of at most EMA_TABLE_MAX elements to its second."""
+    w = model.transformer.bte.weight
+    assert w.numel() > EMA_TABLE_MAX, "the bigram table must stay outside the tail-EMA table group"
+    w.data = w.data.to(torch.bfloat16)
+
+
 def save_checkpoint(path: Path, model: GPT, meta: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "model_state": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+        # a bf16 tensor (the bigram table is the only one) is written as fp32, an exact widening, so load_for_eval
+        # rebuilds the model at its constructed dtypes holding the values training used
+        "model_state": {k: (v.detach().cpu().float() if v.dtype == torch.bfloat16 else v.detach().cpu())
+                        for k, v in model.state_dict().items()},
         "model_config": asdict(model.config),
         "meta": meta,
     }
@@ -3797,6 +3835,7 @@ def main() -> None:
         synthetic_x = torch.zeros((device_batch_size, SEQ_LEN), dtype=torch.int32).to(device)
         synthetic_y = torch.zeros((device_batch_size, SEQ_LEN), dtype=torch.long).to(device)
         optimizer = model.setup_optimizer()
+        hold_bigram_bf16(orig_model)
         model.zero_grad(set_to_none=True)
         for _ in range(grad_accum_steps):
             loss = model(synthetic_x, synthetic_y)
@@ -3847,6 +3886,7 @@ def main() -> None:
     train_loader = _packed()
     x, y, loader_state = next(train_loader)
     optimizer = model.setup_optimizer()
+    hold_bigram_bf16(orig_model)
     optimizer.setup_sharding(world_size, rank)
     sidecar = EmbedSidecar(orig_model, "sidecar" if (device.type == "neuron" and NKI_AVAILABLE) else "sidecar_torch")
     plan_ring = (None, None)
