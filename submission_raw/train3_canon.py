@@ -175,6 +175,10 @@ BTE_LR_MUL = float(os.environ.get("NEURON_COMPETITION_R1_BTE_LR_MUL", "1.0"))
 UNEMBEDDING_LR = 0.006 * 0.71 * _BATCH_LR
 MATRIX_LR = 0.025 * 0.71 * _BATCH_LR * 0.7   # x0.7: re-tuned for the ~3300-step regime of the kernel line (Sep 8 sweep)
 ATTN_SCALE = 0.1                # constant attention logit scale (instead of 1/sqrt(128) = 0.088): -0.0006 full, -0.0010 screen
+# Dev knob: attention logit scale used when head_dim != 128 (default: ATTN_SCALE * sqrt(128 / head_dim)). No effect at 128.
+ATTN_SCALE_WIDE = os.environ.get("NEURON_COMPETITION_R1_ATTN_SCALE_WIDE", "")
+def _attn_scale(hd):
+    return float(ATTN_SCALE_WIDE) if (ATTN_SCALE_WIDE and hd != 128) else ATTN_SCALE * math.sqrt(128 / hd)
 SCALAR_LR = 0.20 * 0.71 * _BATCH_LR
 WEIGHT_DECAY = 0.10
 WARMUP_STEPS = 50
@@ -3127,7 +3131,7 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = config.n_embd // config.n_head
         # ATTN_SCALE was tuned at head_dim 128; QK-normed logits grow as sqrt(head_dim), so other widths keep the same
         # logit temperature via sqrt(128 / head_dim). Exactly ATTN_SCALE at 128 (sqrt(1.0) == 1.0).
-        self.attn_scale = ATTN_SCALE * math.sqrt(128 / self.head_dim)
+        self.attn_scale = _attn_scale(self.head_dim)
         self.c_q = StackedLinear(registry, config.n_embd, config.n_embd)
         self.c_k = StackedLinear(registry, config.n_embd, config.n_embd)
         self.c_v = StackedLinear(registry, config.n_embd, config.n_embd)
@@ -3309,7 +3313,7 @@ def build_layer_ops(n_head: int):
                                                                torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
                                                                torch.Tensor, torch.Tensor, torch.Tensor]:
         NH = _LAYER_NH; T, D = x2.shape; HD = D // NH; b = start.shape[0]; t = T // b
-        scale = ATTN_SCALE * math.sqrt(128 / HD)    # == CausalSelfAttention.attn_scale; exactly ATTN_SCALE at HD 128
+        scale = _attn_scale(HD)    # == CausalSelfAttention.attn_scale; exactly ATTN_SCALE at HD 128
         # head-major kernels: q/k/v arrive as (b*NH, t, HD) with q pre-scaled; the attention output is read per head and the
         # token-major y2 comes back from post_kh -> no permute/reshape compiler copies between the kernels and attention
         # k arrives already key-offset (v26: normed key dims HD/4:HD/2 come from the previous position, zeroed at doc starts)
@@ -3332,7 +3336,7 @@ def build_layer_ops(n_head: int):
                   w2: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
                                              torch.Tensor, torch.Tensor, torch.Tensor]:
         NH = _LAYER_NH; T, D = x2.shape; HD = D // NH; b = start.shape[0]; t = T // b
-        scale = ATTN_SCALE * math.sqrt(128 / HD)    # == CausalSelfAttention.attn_scale; exactly ATTN_SCALE at HD 128
+        scale = _attn_scale(HD)    # == CausalSelfAttention.attn_scale; exactly ATTN_SCALE at HD 128
         d2 = dout2.to(bf).contiguous()
         h2 = nfwd[grid](x1, eps=eps)
         dh2, dW1p, dW2p = mlp_bwd_k[grid](h2, d2, preT, w1, w2)
