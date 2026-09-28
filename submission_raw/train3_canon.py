@@ -329,6 +329,26 @@ _KH_SLOTS = tuple(sorted({"q": 0, "k": 1, "v": 2}[c] for c in set(KH)))   # slot
 # paper, T moves at roughly half W's relative rate. The slow-gate lesson (E28a) applies with more force here: 16k
 # entries per matrix make Adam's per-element step ~40x larger in spectral norm, so the scalar LR (0.284) would be fatal.
 KH_LR = float(os.environ.get("NEURON_COMPETITION_R1_KH_LR", "0.0001"))
+# ATTN_GATE (2026-09-28; Qiu et al. 2025 "Gated Attention for LLMs", head-wise form as in modded-nanogpt's attn_gate):
+# head h's attention output is multiplied by g[t, h] = 2 * sigmoid(h_t[:k] @ W_g[:, h]) before the out-projection, where
+# h_t is the NORMED attention input (the same h the q/k/v projections read) and k = ATTN_GATE (0 = off, 1..128).
+# INIT: W_g = 0, so g == 2 * 0.5 == 1.0 EXACTLY at step 0: the gated model starts as today's model bit for bit and
+# the residual-branch scale every other constant was tuned against is unchanged; dg/dz = 0.5 there (sigmoid's steepest
+# point); the gate can still close a head per token (g -> 0, the paper's query-dependent sparsity) or open to 2.
+# OPTIMIZER: W_g is (n_layer, k, n_head) - 576 entries at k=12 - in the flat small-parameter AdamW group (no new
+# group, no new collective) at its own lr via the per-element multiplier KH uses, wd 0. NOT the scalar lr: the
+# slow-gate rule (train2 E28a/b: many zero-init gates at the scalar lr lost 0.025, a dedicated lr 10x lower
+# recovered it) - so ATTN_GATE_LR defaults to SCALAR_LR / 10. At that lr one Adam step moves z by ~lr*sqrt(k) ~ 0.1
+# (k=12), i.e. g by ~5% at init.
+# KERNELS: s = sigmoid(z) comes out of pre_attn_fwd_ko (one small matmul + one activation per 128-token tile on the h
+# tiles already there), post_attn_fwd_h gates the per-head y tiles before its out-projection (outT stays ungated for
+# the vendor backward), and the backward's dz @ W_g^T joins pre_attn_bwd_ko's dgrad chain in PSUM (dW_g from the
+# same h tiles). The two (T, D) glue passes (dz and dO = g * dy) live in layer_bwd_g. Separate custom ops
+# (tf_nki::layer_fwd_g / layer_bwd_g); with the flag off, the original ops and kernel instruction streams are untouched.
+# k is saved in model_config, so load_for_eval rebuilds the gated model without the env var.
+ATTN_GATE = int(os.environ.get("NEURON_COMPETITION_R1_ATTN_GATE", "0"))
+assert 0 <= ATTN_GATE <= 128, f"NEURON_COMPETITION_R1_ATTN_GATE={ATTN_GATE}: k must be in 0..128 (0 = off)"
+ATTN_GATE_LR = float(os.environ.get("NEURON_COMPETITION_R1_ATTN_GATE_LR", "0"))   # 0 = SCALAR_LR / 10
 FRAC_BY_STEPS = os.environ.get("NEURON_COMPETITION_R1_FRAC_BY_STEPS", "0") != "0"
 EMA_DECAY = 0.997               # tail-EMA of the weights over the last 15% of the budget (tau ~330; 0.9933 -> 0.997 = -0.0006 at 1800 s, S2_EMA0997), ...
 # EMA_START 0.85 -> 0.75: the averaging window and the blend are COUPLED, and the blend just moved a lot.
@@ -1961,7 +1981,10 @@ if NKI_AVAILABLE:
 
     @nki.jit
     def post_attn_fwd_h(y_in: nl.ndarray, wo: nl.ndarray, xm_in: nl.ndarray, w1: nl.ndarray, w2: nl.ndarray, eps: float = 1e-6, fq: int = 0,
-                        n_head: int = 4, t_len: int = 1024):
+                        n_head: int = 4, t_len: int = 1024, gs_in=None):
+        # ATTN_GATE: gs_in (T, n_head) fp32 = sigmoid(z) from pre_attn_fwd_ko; head h's output is multiplied by 2*gs[:, h]
+        # before the out-projection. y2_out then holds the GATED y (dWo's operand), outT stays UNGATED (the vendor
+        # backward's O). gs_in=None: the unchanged kernel.
         T, D = xm_in.shape
         H = w1.shape[0]
         HD = D // n_head
@@ -2035,7 +2058,16 @@ if NKI_AVAILABLE:
                 p0 = (gt - row * tpt) * _NKI_P
                 for hh in range(n_head):              # per-head aligned blocks from the attention layout
                     nisa.dma_copy(dst=yt[:, hh * HD:(hh + 1) * HD], src=y_in[row * n_head + hh, p0:p0 + _NKI_P, :])
-                nisa.dma_copy(dst=y2_out[t0 + tb * _NKI_P:t0 + (tb + 1) * _NKI_P, :], src=yt)
+                if gs_in is not None:                 # ATTN_GATE: ytg[:, head h] = y[:, head h] * s[:, h] * 2
+                    gtl = nl.ndarray((_NKI_P, n_head), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.dma_copy(dst=gtl, src=gs_in[t0 + tb * _NKI_P:t0 + (tb + 1) * _NKI_P, :])
+                    ytg = nl.ndarray((_NKI_P, D), dtype=nl.bfloat16, buffer=nl.sbuf)
+                    for hh in range(n_head):
+                        nisa.tensor_scalar(dst=ytg[:, hh * HD:(hh + 1) * HD], data=yt[:, hh * HD:(hh + 1) * HD], op0=nl.multiply,
+                                           operand0=gtl[:, hh:hh + 1], op1=nl.multiply, operand1=2.0)
+                    nisa.dma_copy(dst=y2_out[t0 + tb * _NKI_P:t0 + (tb + 1) * _NKI_P, :], src=ytg)
+                else:
+                    nisa.dma_copy(dst=y2_out[t0 + tb * _NKI_P:t0 + (tb + 1) * _NKI_P, :], src=yt)
                 if fq:
                     _fq8(yt)
                 # yT tiles [128 (i), 128 tokens] via transposes; a[t, :] = sum_i yT[i, t] WoT[i, :]
@@ -2045,7 +2077,14 @@ if NKI_AVAILABLE:
                     nisa.nc_transpose(dst=tps, data=yt[:, i * _NKI_P:(i + 1) * _NKI_P])
                     yTi = oTb[i][:, p0:p0 + _NKI_P]   # the [HD, 128 tokens] tile lands straight in head i's staging row
                     nisa.tensor_copy(dst=yTi, src=tps)
-                    nisa.nc_matmul(dst=aps, stationary=yTi, moving=WoT[i], accumulate=(i > 0))
+                    if gs_in is not None:             # ATTN_GATE: the out-projection contracts the GATED transpose
+                        tpg = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.psum)
+                        nisa.nc_transpose(dst=tpg, data=ytg[:, i * _NKI_P:(i + 1) * _NKI_P])
+                        yTg = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.sbuf)
+                        nisa.tensor_copy(dst=yTg, src=tpg)
+                        nisa.nc_matmul(dst=aps, stationary=yTg, moving=WoT[i], accumulate=(i > 0))
+                    else:
+                        nisa.nc_matmul(dst=aps, stationary=yTi, moving=WoT[i], accumulate=(i > 0))
                     if p0 + _NKI_P == t_len:          # row complete: ONE contiguous (128, t_len) store
                         if HD == _NKI_P:
                             nisa.dma_copy(dst=outT_out[row * n_head + i, :, :], src=oTb[i])
@@ -2107,9 +2146,11 @@ if NKI_AVAILABLE:
     @nki.jit
     def pre_attn_fwd_ko(x_in: nl.ndarray, x0_in: nl.ndarray, ve_in: nl.ndarray, wq: nl.ndarray, wk: nl.ndarray, wv: nl.ndarray,
                         cos_in: nl.ndarray, sin_in: nl.ndarray, scal: nl.ndarray, dstart_in: nl.ndarray, n_head: int = 4,
-                        eps: float = 1e-6, t_len: int = 1024, q_scale: float = 1.0, hq: int = 32):
+                        eps: float = 1e-6, t_len: int = 1024, q_scale: float = 1.0, hq: int = 32, wg_in=None):
         """pre_attn_fwd_h (see the vehicle) with the KEY_OFFSET shift applied to k_out inside the kernel (dstart_in (T, 1) fp32).
-        q_out/k_out/v_out (b*n_head, t_len, HD) bf16 (q pre-scaled, k offset), xm (T, D), rq/rk (n_head, T, HD) unshifted."""
+        q_out/k_out/v_out (b*n_head, t_len, HD) bf16 (q pre-scaled, k offset), xm (T, D), rq/rk (n_head, T, HD) unshifted.
+        ATTN_GATE: wg_in (128, n_head) fp32 = W_g zero-padded below row k -> 7th output s = sigmoid(h[:, :128] @ wg_in)
+        (T, n_head) fp32, h the normed attention input (the zero rows add exact zeros). wg_in=None: the unchanged kernel."""
         T, D = x_in.shape
         HD = D // n_head
         half = HD // 2
@@ -2124,6 +2165,12 @@ if NKI_AVAILABLE:
         tiles = T // _NKI_P
         sc = nl.ndarray((_NKI_P, 4), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=sc, src=scal)
+        if wg_in is not None:                         # ATTN_GATE: resident bf16 gate weight, gate output (T, n_head)
+            gs_out = nl.ndarray((T, n_head), dtype=nl.float32, buffer=nl.shared_hbm)
+            wgf = nl.ndarray((_NKI_P, n_head), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=wgf, src=wg_in)
+            wgb = nl.ndarray((_NKI_P, n_head), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=wgb, src=wgf)
         # key-offset shift matrices (0/1 bf16, built once): S[k, m] = 1 iff m == k + 1 ; E[k, m] = 1 iff k == _NKI_P-1 and m == 0
         ones = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.sbuf)
         nisa.memset(ones, 1.0)
@@ -2193,6 +2240,12 @@ if NKI_AVAILABLE:
                 hTi = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=hTi, src=tps)
                 hT.append(hTi)
+            if wg_in is not None:                     # ATTN_GATE: s = sigmoid(h[:, :128] @ wg) straight off PSUM
+                gps = nl.ndarray((_NKI_P, n_head), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(dst=gps, stationary=hT[0], moving=wgb)
+                sgt = nl.ndarray((_NKI_P, n_head), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.activation(dst=sgt, op=nl.sigmoid, data=gps)
+                nisa.dma_copy(dst=gs_out[t0:t0 + _NKI_P, :], src=sgt)
             qps = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.psum)
             kps = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.psum)
             vps = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.psum)
@@ -2280,6 +2333,8 @@ if NKI_AVAILABLE:
                 vb = nl.ndarray((_NKI_P, HD), dtype=nl.bfloat16, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=vb, src=v[:, c0:c0 + HD])
                 nisa.dma_copy(dst=v_out[row * n_head + hh, p0:p0 + _NKI_P, :], src=vb)
+        if wg_in is not None:
+            return q_out, k_out, v_out, xm_out, rq_out, rk_out, gs_out
         return q_out, k_out, v_out, xm_out, rq_out, rk_out
 
 
@@ -2287,9 +2342,12 @@ if NKI_AVAILABLE:
     def pre_attn_bwd_ko(dq_in: nl.ndarray, dk_in: nl.ndarray, dv_in: nl.ndarray, rq_in: nl.ndarray, rk_in: nl.ndarray,
                         xm_in: nl.ndarray, dx1_in: nl.ndarray, cos_in: nl.ndarray, sin_in: nl.ndarray, dstart_in: nl.ndarray,
                         wq: nl.ndarray, wk: nl.ndarray, wv: nl.ndarray, n_head: int = 4, eps: float = 1e-6,
-                        scale: float = 1.0, hq: int = 32):
+                        scale: float = 1.0, hq: int = 32, dz_in=None, wgT_in=None):
         """pre_attn_bwd (nki_pre_bwd.py) with the key-offset backward folded in: dstart_in (T, 1) fp32 replaces dksh_in;
-        g[p, hq:2hq] = dk[p+1, hq:2hq] * (1 - dstart[p+1]) (0 at the last position of a sequence row). Tiles run in reverse."""
+        g[p, hq:2hq] = dk[p+1, hq:2hq] * (1 - dstart[p+1]) (0 at the last position of a sequence row). Tiles run in reverse.
+        ATTN_GATE: dz_in (T, n_head) fp32 = dL/dz of the gate pre-activation, wgT_in (128, D) bf16 = W_g^T zero-padded
+        (row r < n_head = gate column r). dz @ W_g^T joins the dgrad chain in PSUM ahead of the rmsnorm backward, and a
+        6th output dwg (128, n_head) fp32 = h[:, :128]^T dz (rows >= k are dropped by the caller)."""
         T, D = xm_in.shape
         BH, t, HD = dq_in.shape
         half = HD // 2
@@ -2345,6 +2403,15 @@ if NKI_AVAILABLE:
         _wk = []
         _wv = []
         _wh = []
+        _wz = []
+        if dz_in is not None:                         # ATTN_GATE: resident W_g^T, dW_g accumulator, zero-padded dz tile
+            dwg_out = nl.ndarray((_NKI_P, n_head), dtype=nl.float32, buffer=nl.shared_hbm)
+            WgT = nl.ndarray((_NKI_P, D), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=WgT, src=wgT_in)
+            accg = nl.ndarray((_NKI_P, n_head), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(accg, 0.0)
+            dzpad = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.memset(dzpad, 0.0)
         for tbi in range(tiles):
             tb = tiles - 1 - tbi                      # reverse order: the carry comes from tile tb + 1 (already visited)
             t0 = tb * _NKI_P
@@ -2476,6 +2543,18 @@ if NKI_AVAILABLE:
                     else:
                         nisa.nc_matmul(dst=dh_ps, stationary=aT, moving=Wv[o], accumulate=(not first))
                     first = False
+            if dz_in is not None:                     # ATTN_GATE: dh[:, :k] += dz @ W_g^T (13th matmul of the chain)
+                dzf = nl.ndarray((_NKI_P, n_head), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=dzf, src=dz_in[t0:t0 + _NKI_P, :])
+                dzb = nl.ndarray((_NKI_P, n_head), dtype=nl.bfloat16, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=dzb, src=dzf)
+                nisa.tensor_copy(dst=dzpad[:, 0:n_head], src=dzf)
+                tzp = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.psum)
+                nisa.nc_transpose(dst=tzp, data=dzpad)
+                dzT = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=dzT, src=tzp)
+                nisa.nc_matmul(dst=dh_ps, stationary=dzT, moving=WgT, accumulate=True)
+                _wz.append(dzb)
             dh = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=dh, src=dh_ps)
             # ---- rmsnorm backward of xm: dxm = dx1 + rstd * (dh - xm * rstd^2 * mean(dh*xm))
@@ -2516,14 +2595,23 @@ if NKI_AVAILABLE:
                     for _i in range(len(_wq)):
                         nisa.nc_matmul(dst=wps3, stationary=_wv[_i][:, o * _NKI_P:(o + 1) * _NKI_P], moving=_wh[_i], accumulate=(_i > 0))
                     nisa.tensor_tensor(dst=accv[o], data1=accv[o], data2=wps3, op=nl.add)
+                if dz_in is not None:                 # ATTN_GATE: dW_g[:128] += sum over the group of h[:, :128]^T dz
+                    gwp = nl.ndarray((_NKI_P, n_head), dtype=nl.float32, buffer=nl.psum)
+                    for _i in range(len(_wz)):
+                        nisa.nc_matmul(dst=gwp, stationary=_wh[_i][:, 0:_NKI_P], moving=_wz[_i], accumulate=(_i > 0))
+                    nisa.tensor_tensor(dst=accg, data1=accg, data2=gwp, op=nl.add)
                 _wq = []
                 _wk = []
                 _wv = []
                 _wh = []
+                _wz = []
         for o in range(kt):
             nisa.dma_copy(dst=dwq_out[o * _NKI_P:(o + 1) * _NKI_P, :], src=accq[o])
             nisa.dma_copy(dst=dwk_out[o * _NKI_P:(o + 1) * _NKI_P, :], src=acck[o])
             nisa.dma_copy(dst=dwv_out[o * _NKI_P:(o + 1) * _NKI_P, :], src=accv[o])
+        if dz_in is not None:
+            nisa.dma_copy(dst=dwg_out, src=accg)
+            return dxm_out, gv_out, dwq_out, dwk_out, dwv_out, dwg_out
         return dxm_out, gv_out, dwq_out, dwk_out, dwv_out
 
     _HVC = 512   # vocab chunk width of the fused head kernels (2026-09-08, nki_head.py)
@@ -3040,6 +3128,14 @@ class GPTConfig:
     n_layer: int
     n_head: int
     n_embd: int
+    attn_gate: int = 0     # ATTN_GATE k (0 = off); dropped from the saved dict when 0 so flag-off checkpoints are unchanged
+
+
+def config_dict(config: "GPTConfig") -> dict:
+    d = asdict(config)
+    if not d.get("attn_gate"):
+        d.pop("attn_gate", None)
+    return d
 
 
 def norm(x: torch.Tensor) -> torch.Tensor:
@@ -3137,7 +3233,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = StackedLinear(registry, config.n_embd, config.n_embd)
         self.c_proj = StackedLinear(registry, config.n_embd, config.n_embd)
 
-    def forward(self, x, ve, cos, sin, sink, dense_mask=None, bounds=None, doc_start=None, khw=None):
+    def forward(self, x, ve, cos, sin, sink, dense_mask=None, bounds=None, doc_start=None, khw=None, gw=None):
         b, t, c = x.shape
         if khw is not None:      # KH: the folded (q, k, v) weights, None where that projection is not folded
             _lin = lambda m, w: m(x) if w is None else F.linear(x, w.to(dtype=x.dtype), None)
@@ -3174,6 +3270,9 @@ class CausalSelfAttention(nn.Module):
             p = torch.exp(scores - lse)
             gate = 1.0 - torch.sigmoid(sink.float().view(1, self.n_head, 1, 1) - lse)
             y = ((p @ v.float()) * gate).to(v.dtype)
+        if gw is not None:   # ATTN_GATE: head h scaled by 2 * sigmoid(x[:, :k] @ W_g[:, h]); x is the normed attention input
+            g = 2.0 * torch.sigmoid(x[..., :gw.shape[0]].float() @ gw.float())           # (b, t, n_head)
+            y = (y.float() * g.transpose(1, 2).unsqueeze(-1)).to(y.dtype)
         y = y.transpose(1, 2).contiguous().view(b, t, c)
         return self.c_proj(y)
 
@@ -3383,6 +3482,87 @@ def build_layer_ops(n_head: int):
                 dWq.to(wq.dtype), dWk.to(wk.dtype), dWv.to(wv.dtype), dWo.to(wo.dtype), dW1.to(w1.dtype), dW2.to(w2.dtype))
 
     torch.library.register_autograd("tf_nki::layer_fwd", backward, setup_context=setup_context)
+
+    # ---- ATTN_GATE: the same layer with the head-wise sigmoid gate (see ATTN_GATE). Separate ops so the ungated
+    # graph above is untouched. Extra input wg (128, NH) fp32 (W_g zero-padded below row k); extra saved output
+    # gs = sigmoid(z) (T, NH) fp32. The gated head output is y_g = 2 * gs * O, O the attention output.
+    @nki_op("tf_nki::layer_fwd_g", mutates_args={})
+    def layer_fwd_g(x2: torch.Tensor, x02: torch.Tensor, ve2: torch.Tensor, cos_full: torch.Tensor, sin_full: torch.Tensor,
+                    cos2d: torch.Tensor, sin2d: torch.Tensor, scal: torch.Tensor, sink: torch.Tensor, start: torch.Tensor,
+                    end: torch.Tensor, dstart: torch.Tensor, wq: torch.Tensor, wk: torch.Tensor, wv: torch.Tensor, wo: torch.Tensor,
+                    w1: torch.Tensor, w2: torch.Tensor, wg: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                                                                                  torch.Tensor, torch.Tensor, torch.Tensor,
+                                                                                  torch.Tensor, torch.Tensor, torch.Tensor,
+                                                                                  torch.Tensor, torch.Tensor, torch.Tensor,
+                                                                                  torch.Tensor, torch.Tensor]:
+        NH = _LAYER_NH; T, D = x2.shape; HD = D // NH; b = start.shape[0]; t = T // b
+        scale = _attn_scale(HD)
+        qh, kh, vh, xm, rq, rk, gs = pre_ko[grid](x2, x02, ve2, wq, wk, wv, cos_full, sin_full, scal, dstart.reshape(T, 1),
+                                                  n_head=NH, eps=eps, t_len=t, q_scale=scale, hq=HD // KEY_OFFSET_DIV,
+                                                  wg_in=wg.contiguous())
+        q4 = qh.view(b, NH, t, HD)
+        k4 = kh.view(b, NH, t, HD)
+        v4 = vh.view(b, NH, t, HD)
+        out, neg_max, recip = attn_fwd(q4, k4, v4, sink, start, end)
+        o, x1, preT, y2, outT = post_kh[grid](out.reshape(b * NH, t, HD), wo, xm, w1, w2, eps=eps, n_head=NH, t_len=t, gs_in=gs)
+        return o, xm, rq, rk, q4, k4, v4, outT, neg_max, recip, y2, x1, preT, gs
+
+    @nki_op("tf_nki::layer_bwd_g", mutates_args={})
+    def layer_bwd_g(dout2: torch.Tensor, x2: torch.Tensor, x02: torch.Tensor, ve2: torch.Tensor, xm: torch.Tensor, rq: torch.Tensor,
+                    rk: torch.Tensor, q4: torch.Tensor, k4: torch.Tensor, v4: torch.Tensor, outT: torch.Tensor, neg_max: torch.Tensor,
+                    recip: torch.Tensor, y2: torch.Tensor, x1: torch.Tensor, preT: torch.Tensor, cos2d: torch.Tensor,
+                    sin2d: torch.Tensor, sink: torch.Tensor, start: torch.Tensor, end: torch.Tensor, dstart: torch.Tensor,
+                    wq: torch.Tensor, wk: torch.Tensor, wv: torch.Tensor, wo: torch.Tensor, w1: torch.Tensor,
+                    w2: torch.Tensor, wg: torch.Tensor, gs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                                                                                   torch.Tensor, torch.Tensor, torch.Tensor,
+                                                                                   torch.Tensor, torch.Tensor, torch.Tensor,
+                                                                                   torch.Tensor]:
+        NH = _LAYER_NH; T, D = x2.shape; HD = D // NH; b = start.shape[0]; t = T // b
+        scale = _attn_scale(HD)
+        d2 = dout2.to(bf).contiguous()
+        h2 = nfwd[grid](x1, eps=eps)
+        dh2, dW1p, dW2p = mlp_bwd_k[grid](h2, d2, preT, w1, w2)
+        dx1 = d2 + nbwd[grid](x1, dh2.contiguous(), eps=eps)
+        dy2 = F.linear(dx1, wo.t())               # dL/dy_g (token-major); y2 holds y_g, so dWo is unchanged in form
+        dWo = dx1.t() @ y2
+        # y_g = 2 s O:  dL/dz = sum_d dy_g * O * 2 s (1 - s) = (1 - s) * sum_d dy_g * y_g   (no division by s)
+        #               dL/dO = 2 s * dy_g   (what the vendor backward consumes; outT is the UNGATED O)
+        dyg = dy2.float().view(T, NH, HD)
+        dz = ((dyg * y2.float().view(T, NH, HD)).sum(-1) * (1.0 - gs)).contiguous()
+        dyT4 = (dyg * (2.0 * gs).unsqueeze(-1)).to(q4.dtype).view(b, t, NH, HD).permute(0, 2, 3, 1).contiguous()
+        dq4, dk4, dv4, dsink = attn_bwd(q4, k4, v4, outT, dyT4, neg_max, recip, sink, start, end)
+        cos_full = cos2d.repeat(b, 1).contiguous(); sin_full = sin2d.repeat(b, 1).contiguous()
+        HQ = HD // KEY_OFFSET_DIV
+        wgT = F.pad(wg.t(), (0, D - wg.shape[0], 0, 128 - NH)).to(bf).contiguous()   # (128, D): row r = W_g[:, r]
+        dxm, gv2, dWq, dWk, dWv, dwg = pre_bwd_k[grid](dq4.reshape(b * NH, t, HD).contiguous(), dk4.reshape(b * NH, t, HD).contiguous(),
+                                                      dv4.reshape(b * NH, t, HD).contiguous(), rq.contiguous(), rk.contiguous(),
+                                                      xm.contiguous(), dx1.contiguous(), cos_full, sin_full, dstart.reshape(T, 1), wq, wk, wv,
+                                                      n_head=NH, eps=eps, scale=scale, hq=HQ, dz_in=dz, wgT_in=wgT)
+        return dxm, gv2, dWq, dWk, dWv, dWo, dW1p.sum(0), dW2p.sum(0), dsink, dwg
+
+    def setup_context_g(ctx, inputs, output):
+        x2, x02, ve2, cos_full, sin_full, cos2d, sin2d, scal, sink, start, end, dstart, wq, wk, wv, wo, w1, w2, wg = inputs
+        o, xm, rq, rk, q4, k4, v4, outT, neg_max, recip, y2, x1, preT, gs = output
+        ctx.save_for_backward(x2, x02, ve2, cos2d, sin2d, scal, sink, start, end, dstart, wq, wk, wv, wo, w1, w2, wg,
+                              xm, rq, rk, q4, k4, v4, outT, neg_max, recip, y2, x1, preT, gs)
+
+    def backward_g(ctx, dout2, *_unused):
+        (x2, x02, ve2, cos2d, sin2d, scal, sink, start, end, dstart, wq, wk, wv, wo, w1, w2, wg,
+         xm, rq, rk, q4, k4, v4, outT, neg_max, recip, y2, x1, preT, gs) = ctx.saved_tensors
+        dxm, gv2, dWq, dWk, dWv, dWo, dW1, dW2, dsink, dwg = torch.ops.tf_nki.layer_bwd_g(
+            dout2, x2, x02, ve2, xm, rq, rk, q4, k4, v4, outT, neg_max, recip, y2, x1, preT, cos2d, sin2d, sink, start, end,
+            dstart, wq, wk, wv, wo, w1, w2, wg, gs)
+        resid = scal[0:1, 0:1]; x0l = scal[0:1, 1:2]; vel = scal[0:1, 2:3]
+        dxf = dxm.float()
+        dx2 = (dxf * resid).to(x2.dtype); dx02 = (dxf * x0l).to(x02.dtype); dve2 = (gv2.float() * vel).to(ve2.dtype)
+        d_resid = (dxf * x2.float()).sum(); d_x0 = (dxf * x02.float()).sum(); d_ve = (gv2.float() * ve2.float()).sum()
+        row0 = torch.stack([d_resid, d_x0, d_ve, torch.zeros((), device=scal.device, dtype=torch.float32)]).view(1, 4)
+        dscal = torch.cat([row0, torch.zeros((127, 4), device=scal.device, dtype=torch.float32)], dim=0)
+        return (dx2, dx02, dve2, None, None, None, None, dscal, dsink.to(sink.dtype), None, None, None,
+                dWq.to(wq.dtype), dWk.to(wk.dtype), dWv.to(wv.dtype), dWo.to(wo.dtype), dW1.to(w1.dtype), dW2.to(w2.dtype),
+                dwg.to(wg.dtype))
+
+    torch.library.register_autograd("tf_nki::layer_fwd_g", backward_g, setup_context=setup_context_g)
     _LAYER_OPS = (torch.ops.tf_nki.layer_fwd, torch.ops.tf_nki.layer_bwd)
     print0("LAYER=op: tf_nki::layer_fwd/layer_bwd built (the Block op branch fires when sink/bounds/rope tables are present)")
     return _LAYER_OPS
@@ -3559,7 +3739,7 @@ class Block(nn.Module):
                 setattr(self, _nm, nn.Parameter(_p))
 
     def forward(self, x, x0, ve, cos, sin, resid_lambda, x0_lambda, ve_lambda, sink, dense_mask, bounds, doc_start=None,
-                rope_tabs=None, wviews=None, khw=None):
+                rope_tabs=None, wviews=None, khw=None, gw=None):
         if CANON_PRE_W > 1:      # residual-stream conv, ahead of BOTH paths
             x = canon_conv(x, self.canon_p, doc_start)
         if (LAYER_IMPL == "op" and not CANON_ON and _LAYER_OPS is not None and x.device.type == "neuron" and sink is not None
@@ -3584,14 +3764,19 @@ class Block(nn.Module):
             scal = torch.stack([resid_lambda.reshape(()), x0_lambda.reshape(()), ve_lambda.reshape(()),
                                 torch.zeros((), device=x.device)]).float().view(1, 4).expand(128, 4).contiguous()
             dstart = (doc_start.to(torch.float32) if doc_start is not None else torch.zeros((b, t), device=x.device)).contiguous()
-            outs = torch.ops.tf_nki.layer_fwd(x2, x02, ve2, cos_full, sin_full, cos2d, sin2d, scal, sink, bounds[0], bounds[1],
-                                              dstart, ws[0], ws[1], ws[2], ws[3], ws[4], ws[5])
+            if gw is None:
+                outs = torch.ops.tf_nki.layer_fwd(x2, x02, ve2, cos_full, sin_full, cos2d, sin2d, scal, sink, bounds[0], bounds[1],
+                                                  dstart, ws[0], ws[1], ws[2], ws[3], ws[4], ws[5])
+            else:     # ATTN_GATE: W_g zero-padded to 128 rows (the kernels contract all 128 dims of h; zero rows add exact 0)
+                wg_pad = F.pad(gw.float(), (0, 0, 0, 128 - gw.shape[0]))
+                outs = torch.ops.tf_nki.layer_fwd_g(x2, x02, ve2, cos_full, sin_full, cos2d, sin2d, scal, sink, bounds[0],
+                                                    bounds[1], dstart, ws[0], ws[1], ws[2], ws[3], ws[4], ws[5], wg_pad)
             return outs[0].view(b, t, D).to(x.dtype)
         x = resid_lambda * x + x0_lambda * x0
         _h = norm(x)
         if CANON_ATTN_W > 1:
             _h = canon_conv(_h, self.canon_a, doc_start)
-        x = x + self.attn(_h, ve_lambda * ve, cos, sin, sink, dense_mask, bounds, doc_start=doc_start, khw=khw)
+        x = x + self.attn(_h, ve_lambda * ve, cos, sin, sink, dense_mask, bounds, doc_start=doc_start, khw=khw, gw=gw)
         _h = norm(x)
         if CANON_MLP_W > 1:
             _h = canon_conv(_h, self.canon_m, doc_start)
@@ -3645,6 +3830,9 @@ class GPT(nn.Module):
             assert self.stacks[self._kh_key].shape[0] == 4 * L, "KH: the attention stack holds more than q/k/v/proj"
             hd = config.n_embd // H
             self.kh = nn.Parameter(torch.zeros(len(self._kh_slots), L, hd, hd))   # D = T - I, one per (projection, layer)
+        if config.attn_gate:
+            assert 0 < config.attn_gate <= min(128, config.n_embd), f"attn_gate={config.attn_gate}"
+            self.attn_gate = nn.Parameter(torch.zeros(L, config.attn_gate, H))   # W_g per layer; zero -> g == 1 exactly
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         self.skip_lambdas = nn.Parameter(torch.ones(config.n_layer // 2))
         self.bigram_lambda = nn.Parameter(torch.full((1,), 0.2))
@@ -3686,6 +3874,8 @@ class GPT(nn.Module):
         self.softcap_neg.fill_(LOGIT_SOFTCAP)
         if self._kh_slots:
             self.kh.zero_()                     # T = I: KH-on == KH-off at step 0
+        if self.config.attn_gate:
+            self.attn_gate.zero_()              # g = 2 * sigmoid(0) == 1.0: gated == ungated at step 0
         if MUDD:
             for _m in self.mudd.values():       # w2 / bs back to zero -> MUDD-on == MUDD-off at step 0
                 _m.reset_parameters()
@@ -3759,6 +3949,15 @@ class GPT(nn.Module):
             _sg["flat"] = True
             print0(f"KH live: slots={''.join('qkv'[s] for s in self._kh_slots)} D={tuple(self.kh.shape)} "
                    f"lr={KH_LR} (flat scalar group, x{KH_LR / SCALAR_LR:.5f}) wd=0")
+        if self.config.attn_gate:
+            # same mechanism as KH: the flat small-parameter group, per-element lr multiplier, wd 0 (see ATTN_GATE)
+            _sg = param_groups[2]
+            _ag_lr = ATTN_GATE_LR if ATTN_GATE_LR > 0 else SCALAR_LR / 10
+            _sg["lr_mul"] = list(_sg.get("lr_mul") or [1.0] * len(_sg["params"])) + [_ag_lr / SCALAR_LR]
+            _sg["params"].append(self.attn_gate)
+            _sg["flat"] = True
+            print0(f"ATTN_GATE live: k={self.config.attn_gate} W_g={tuple(self.attn_gate.shape)} lr={_ag_lr:.5f} "
+                   f"(flat scalar group, x{_ag_lr / SCALAR_LR:.5f}) wd=0 init=0 (g == 1 at step 0)")
         for key in sorted(self.stacks.keys()):
             param_groups.append(dict(kind="muon", params=[self.stacks[key]], lr=MATRIX_LR, momentum=_EFF_MUON_MOMENTUM, beta2=_EFF_MUON_BETA2, ns_steps=NS_STEPS, weight_decay=WEIGHT_DECAY))
         canon_params = [p for _n, p in self.named_parameters() if ".canon_" in _n]
@@ -3899,6 +4098,7 @@ class GPT(nn.Module):
         n_dec_start = self.config.n_layer - n_enc
         skips: list[torch.Tensor] = []
         bs = self.block_scalars
+        gws = torch.unbind(self.attn_gate) if self.config.attn_gate else None   # ATTN_GATE: (k, n_head) per layer
         h_mid = None                  # MUDD: output of block MUDD_MID, the one mid-depth source
         for i, block in enumerate(self.transformer.h):
             if i >= n_dec_start:
@@ -3917,7 +4117,7 @@ class GPT(nn.Module):
                     x = mixed[1]
             x = block(x, x0, ve_i, cos, sin, bs["resid"][i], bs["x0"][i], bs["ve"][i], bs["sink"][i], dense_mask, bounds,
                       doc_start=doc_start, rope_tabs=rope_tabs, wviews=wviews,
-                      khw=None if khws is None else khws[i])
+                      khw=None if khws is None else khws[i], gw=None if gws is None else gws[i])
             if MUDD and i == MUDD_MID:
                 h_mid = x
             if i < n_enc:
@@ -3938,7 +4138,8 @@ class GPT(nn.Module):
 
 
 def build_config() -> GPTConfig:
-    return GPTConfig(sequence_len=SEQ_LEN, vocab_size=TOKENIZER_VOCAB_SIZE, n_layer=DEPTH, n_head=N_HEAD, n_embd=N_EMBD)
+    return GPTConfig(sequence_len=SEQ_LEN, vocab_size=TOKENIZER_VOCAB_SIZE, n_layer=DEPTH, n_head=N_HEAD, n_embd=N_EMBD,
+                     attn_gate=ATTN_GATE)
 
 
 # -----------------------------------------------------------------------------
@@ -4818,7 +5019,7 @@ def save_checkpoint(path: Path, model: GPT, meta: dict) -> None:
         # no-op there.
         "model_state": {k: (v.detach().cpu().float() if v.dtype == torch.bfloat16 else v.detach().cpu())
                         for k, v in model.state_dict().items() if k != "kh"},   # KH: D is folded in (asserted below)
-        "model_config": asdict(model.config),
+        "model_config": config_dict(model.config),
         "meta": meta,
         "forward_knobs": forward_knobs(),
     }
@@ -4931,7 +5132,7 @@ def main() -> None:
     print0(f"device={device} dtype={COMPUTE_DTYPE} world_size={world_size}")
     tokenizer = ensure_tokenizer(build_if_missing=False)
     config = build_config()
-    print0(f"model_config={json.dumps(asdict(config))}")
+    print0(f"model_config={json.dumps(config_dict(config))}")
     model = GPT(config)
     model.init_weights()
     model.to(device)
