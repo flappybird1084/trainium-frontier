@@ -507,20 +507,40 @@ USE_STACK_FUNCTION = True       # eager: accumulate stack gradients through _Sta
 # ---- engine rebalance (2026-09-27). Vector is the single busiest engine over the step (67.9% union-busy against
 # Tensor 54.0 / Scalar 52.6 / GpSimd 21.0 / Sync 15.2), and inside mlp_bwd the Scalar and GpSimd engines are IDLE:
 # mlp_bwd issues no activation at all, and every elementwise op it has lands on Vector by the compiler's default.
-# ENG2 routes the two movable classes off Vector, bit-identically:
-#   * PSUM -> SBUF drains after each nc_transpose / matmul  -> Scalar   (GpSimd cannot address PSUM)
-#   * relu(pre)^2, both in mlp_bwd and post_attn_fwd_h       -> GpSimd  (both operands and dst are SBUF)
-# bf16 x bf16 -> fp32 -> bf16 is exact on every engine, so this changes no bit of the result.
-ENG2 = os.environ.get("NEURON_COMPETITION_R1_ENG2", "")          # csv: mlpbwd, postfwd (empty = off / unchanged)
+# ENG2 routes two INDEPENDENT classes off Vector. They are separate flags because they are separate bets:
+#   * PSUM -> SBUF drains after each nc_transpose / matmul  -> Scalar   (GpSimd cannot address PSUM at all)
+#     This is the measured lever. Only `tensor_copy` can move, and only between Vector and Scalar.
+#   * relu(pre)^2 and the SBUF casts/scales                 -> GpSimd  (legal: all operands SBUF)
+#     This is a SPECULATIVE bet AGAINST the evidence: over 1,966,366 profiled instructions, TENSOR_TENSOR was never
+#     once placed on an engine other than Vector, and GpSimd's 38.3 ms of busy time is DMA issue plus semaphores,
+#     not arithmetic. Expect a regression; keep it off unless a probe says otherwise, and never gate it together
+#     with the drains or the result cannot be attributed.
+# Bit-exactness is ASSERTED here, not proven: nki/nki_drain_probe.py checks it on device for the drains.
+ENG2 = os.environ.get("NEURON_COMPETITION_R1_ENG2", "")          # csv (empty = off / unchanged)
 _ENG2_SET = tuple(s.strip() for s in ENG2.split(",") if s.strip())
-_E2_MLPBWD = 1 if "mlpbwd" in _ENG2_SET else 0
-_E2_POSTFWD = 1 if "postfwd" in _ENG2_SET else 0
+# drains -> Scalar, per kernel. "mlpbwd" is kept as an alias for the old bundled meaning.
+_E2_MLPBWD_DRAIN = 1 if ("mlpbwddrain" in _ENG2_SET or "mlpbwd" in _ENG2_SET) else 0
 # post_attn_fwd_h already keeps Scalar busy (24 relu + the rmsnorm activation pair per chunk), so its PSUM drains stay
 # on Vector by default; "postfwddrain" moves them too, for the case where Vector is still the binding engine there.
+# The sign is EXPECTED to differ between forward and backward kernels - the forward graph is Scalar-dominated (~61%
+# busy) and the backward Vector-dominated - so this is per kernel, never a blanket change. Every live PSUM drain in
+# the LAYER=op path is now routed through _e2_drain: mlp_bwd 4, post_attn_fwd_h 5, pre_attn_bwd_ko 4, head_bwd 3,
+# pre_attn_fwd_ko 6 = 22 sites. (The other 6 live drains are in muon_kernel and head_fwd and are not wired up: the
+# optimizer's whole math phase is only 18.6 ms, so its ceiling is too small to be worth a flag.)
+_E2_PREBWD_DRAIN = 1 if "prebwddrain" in _ENG2_SET else 0
+_E2_HEADBWD_DRAIN = 1 if "headbwddrain" in _ENG2_SET else 0
+_E2_PREFWD_DRAIN = 1 if "prefwddrain" in _ENG2_SET else 0
 _E2_POSTFWD_DRAIN = 1 if "postfwddrain" in _ENG2_SET else 0
-# 1 = engine hint on nisa.tensor_copy; 2 = nisa.activation(op=nl.copy) (same engine, different ISA op, in case the
-# compiler rejects the hint on this NeuronCore revision).
-_E2_DRAIN_FORM = int(os.environ.get("NEURON_COMPETITION_R1_ENG2_DRAIN_FORM", "1"))
+# elementwise -> GpSimd, per kernel. SEPARATE from the drains on purpose.
+_E2_MLPBWD_SQ = 1 if ("mlpbwdsq" in _ENG2_SET or "mlpbwd" in _ENG2_SET) else 0
+_E2_POSTFWD = 1 if "postfwd" in _ENG2_SET else 0
+# Which engine a pinned drain goes to. The compiler's own choice is the UNSTABLE one (it moved 12% between two runs
+# of the same kernel while both pinned variants held to 0.6%), so "vector" is a real setting, not a no-op: it pins
+# what the compiler only usually picks. "activation" is the same Scalar placement expressed as a different ISA op,
+# kept as a fallback in case the engine hint is ignored on this NeuronCore revision.
+# Resolved to an int at module level so the kernels compare ints at trace time (a trace-time constant either way).
+_E2_DRAIN_ENG = {"scalar": 1, "vector": 2, "activation": 3}.get(
+    os.environ.get("NEURON_COMPETITION_R1_ENG2_DRAIN_ENGINE", "scalar"), 1)
 # ---- RoPE table hoist (2026-09-27). Block.forward and layer_bwd each rebuild cos_full/sin_full = cos2d.repeat(b, 1),
 # a (T, D) fp32 materialisation, once per layer per direction: 48 graph ops and ~1.6 GB of HBM writes per step for a
 # table that is periodic with period t_len. With ROPE_MOD the kernels take the (t_len, D) table and index t0 % t_len,
@@ -1114,7 +1134,7 @@ if NKI_AVAILABLE:
                 for i in range(kt):
                     tps = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.psum)
                     nisa.nc_transpose(dst=tps, data=h[:, t, i * _NKI_P:(i + 1) * _NKI_P])
-                    nisa.tensor_copy(dst=hT[:, t, i, :], src=tps)
+                    _e2_drain(hT[:, t, i, :], tps, _E2_HEADBWD_DRAIN)
                 nisa.dma_copy(dst=tgi[:, t:t + 1], src=tgt[t0:t0 + _NKI_P, :])
                 nisa.dma_copy(dst=g[:, t:t + 1], src=dl_in[t0:t0 + _NKI_P, :])
                 nisa.dma_copy(dst=nlse[:, t:t + 1], src=lse_in[t0:t0 + _NKI_P, :])
@@ -1191,7 +1211,7 @@ if NKI_AVAILABLE:
                         tps = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.psum)
                         nisa.nc_transpose(dst=tps, data=dz[:, j * _NKI_P:(j + 1) * _NKI_P])
                         dzT = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.sbuf)
-                        nisa.tensor_copy(dst=dzT, src=tps)
+                        _e2_drain(dzT, tps, _E2_HEADBWD_DRAIN)
                         nisa.nc_matmul(dst=dhps, stationary=dzT, moving=wc[:, j, :], accumulate=(j > 0))
                     nisa.tensor_tensor(dst=dh[:, t, :], data1=dh[:, t, :], data2=dhps, op=nl.add)
                     # dW_chunk[j] += dz[:, j]^T @ h[t]  (contract over the 128 tokens of this tile)
@@ -1201,7 +1221,7 @@ if NKI_AVAILABLE:
                     r0 = c * _HVC + j * _NKI_P
                     if hh == 0:
                         dwsb = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.sbuf)
-                        nisa.tensor_copy(dst=dwsb, src=dwps[j])
+                        _e2_drain(dwsb, dwps[j], _E2_HEADBWD_DRAIN)
                         nisa.dma_copy(dst=dw_out[r0:r0 + _NKI_P, :], src=dwsb)
                     else:
                         prev = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.sbuf)
@@ -1235,10 +1255,14 @@ if NKI_AVAILABLE:
     # ---- ENG2 engine-placement helpers. Module-level (like the kernels themselves) so the NKI tracer resolves them;
     # the `on` flags are trace-time Python ints, so an off build traces byte-identically to the unpatched kernel.
     def _e2_drain(dst, src, on: int):
-        """PSUM -> SBUF copy. on != 0 pins it to the Scalar engine instead of letting the compiler pick (it picks
-        Vector, which is the busiest engine on the step). GpSimd is not an option: it cannot address PSUM."""
-        if on and _E2_DRAIN_FORM == 2:
+        """PSUM -> SBUF copy. on == 0 leaves the compiler to pick; otherwise _E2_DRAIN_ENG picks. GpSimd is never an
+        option here - NKI's own validator rejects it ("tensor_copy src must be in ['sbuf'], got psum") - so the only
+        real choice is Vector vs Scalar. Note the compiler's default is NOT the same as pinning to Vector: the default
+        is unstable run to run, and that instability is itself part of what pinning buys."""
+        if on and _E2_DRAIN_ENG == 3:
             nisa.activation(dst=dst, op=nl.copy, data=src)
+        elif on and _E2_DRAIN_ENG == 2:
+            nisa.tensor_copy(dst=dst, src=src, engine=nisa.engine.vector)
         elif on:
             nisa.tensor_copy(dst=dst, src=src, engine=nisa.engine.scalar)
         else:
@@ -1705,7 +1729,7 @@ if NKI_AVAILABLE:
             for i in range(kt):
                 tps = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.psum)
                 nisa.nc_transpose(dst=tps, data=blk[:, i * _NKI_P:(i + 1) * _NKI_P])
-                nisa.tensor_copy(dst=WoT[i][:, o * _NKI_P:(o + 1) * _NKI_P], src=tps)
+                _e2_drain(WoT[i][:, o * _NKI_P:(o + 1) * _NKI_P], tps, _E2_POSTFWD_DRAIN)
         W1 = []
         for _j in range(kt):
             W1.append(nl.ndarray((_NKI_P, H), dtype=nl.bfloat16, buffer=nl.sbuf))
@@ -1715,7 +1739,7 @@ if NKI_AVAILABLE:
             for k in range(kt):
                 tps = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.psum)
                 nisa.nc_transpose(dst=tps, data=blk[:, k * _NKI_P:(k + 1) * _NKI_P])
-                nisa.tensor_copy(dst=W1[k][:, h * _NKI_P:(h + 1) * _NKI_P], src=tps)
+                _e2_drain(W1[k][:, h * _NKI_P:(h + 1) * _NKI_P], tps, _E2_POSTFWD_DRAIN)
         W2 = []
         for _j in range(ht):
             W2.append(nl.ndarray((_NKI_P, D), dtype=nl.bfloat16, buffer=nl.sbuf))
@@ -1725,7 +1749,7 @@ if NKI_AVAILABLE:
             for h in range(ht):
                 tps = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.psum)
                 nisa.nc_transpose(dst=tps, data=blk[:, h * _NKI_P:(h + 1) * _NKI_P])
-                nisa.tensor_copy(dst=W2[h][:, o * _NKI_P:(o + 1) * _NKI_P], src=tps)
+                _e2_drain(W2[h][:, o * _NKI_P:(o + 1) * _NKI_P], tps, _E2_POSTFWD_DRAIN)
         # per-head [HD, t_len] staging rows: the yT tiles the out-projection already builds ARE the transposed
         # attention output (kt == n_head and HD == _NKI_P), so outT costs one contiguous store per (row, head)
         oTb = []
@@ -1868,13 +1892,13 @@ if NKI_AVAILABLE:
             for i in range(kt):
                 tq = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.psum)
                 nisa.nc_transpose(dst=tq, data=bq[:, i * _NKI_P:(i + 1) * _NKI_P])
-                nisa.tensor_copy(dst=WqT[i][:, o * _NKI_P:(o + 1) * _NKI_P], src=tq)
+                _e2_drain(WqT[i][:, o * _NKI_P:(o + 1) * _NKI_P], tq, _E2_PREFWD_DRAIN)
                 tk = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.psum)
                 nisa.nc_transpose(dst=tk, data=bk[:, i * _NKI_P:(i + 1) * _NKI_P])
-                nisa.tensor_copy(dst=WkT[i][:, o * _NKI_P:(o + 1) * _NKI_P], src=tk)
+                _e2_drain(WkT[i][:, o * _NKI_P:(o + 1) * _NKI_P], tk, _E2_PREFWD_DRAIN)
                 tv = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.psum)
                 nisa.nc_transpose(dst=tv, data=bv[:, i * _NKI_P:(i + 1) * _NKI_P])
-                nisa.tensor_copy(dst=WvT[i][:, o * _NKI_P:(o + 1) * _NKI_P], src=tv)
+                _e2_drain(WvT[i][:, o * _NKI_P:(o + 1) * _NKI_P], tv, _E2_PREFWD_DRAIN)
         for tb in range(tiles):                       # static: the (row, position) of each tile is known at trace time
             t0 = tb * _NKI_P
             row = tb // tpt
@@ -1905,7 +1929,7 @@ if NKI_AVAILABLE:
                 tps = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.psum)
                 nisa.nc_transpose(dst=tps, data=h[:, i * _NKI_P:(i + 1) * _NKI_P])
                 hTi = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.sbuf)
-                nisa.tensor_copy(dst=hTi, src=tps)
+                _e2_drain(hTi, tps, _E2_PREFWD_DRAIN)
                 hT.append(hTi)
             qps = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.psum)
             kps = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.psum)
@@ -1917,8 +1941,8 @@ if NKI_AVAILABLE:
             q = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.sbuf)
             k = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.sbuf)
             v = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=q, src=qps)
-            nisa.tensor_copy(dst=k, src=kps)
+            _e2_drain(q, qps, _E2_PREFWD_DRAIN)
+            _e2_drain(k, kps, _E2_PREFWD_DRAIN)
             ve = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.sbuf)
             nisa.dma_copy(dst=ve, src=ve_in[t0:t0 + _NKI_P, :])
             nisa.scalar_tensor_tensor(dst=v, data=ve, op0=nl.multiply, operand0=sc[:, 2:3], op1=nl.add, operand1=vps)
@@ -2118,10 +2142,10 @@ if NKI_AVAILABLE:
                             ps2 = nl.ndarray((_NKI_P, hq), dtype=nl.float32, buffer=nl.psum)
                             nisa.nc_matmul(dst=ps2, stationary=Et, moving=dkprev[hh])
                             car = nl.ndarray((_NKI_P, hq), dtype=nl.float32, buffer=nl.sbuf)
-                            nisa.tensor_copy(dst=car, src=ps2)
+                            _e2_drain(car, ps2, _E2_PREBWD_DRAIN)
                             nisa.tensor_tensor(dst=g[:, hq:2 * hq], data1=ps, data2=car, op=nl.add)
                         else:
-                            nisa.tensor_copy(dst=g[:, hq:2 * hq], src=ps)
+                            _e2_drain(g[:, hq:2 * hq], ps, _E2_PREBWD_DRAIN)
                         nisa.tensor_copy(dst=dkprev[hh], src=dkm)
                     rb = nl.ndarray((_NKI_P, HD), dtype=nl.bfloat16, buffer=nl.sbuf)
                     if j == 0:
@@ -2184,7 +2208,7 @@ if NKI_AVAILABLE:
                     else:
                         nisa.nc_transpose(dst=tps, data=gvb[:, o * _NKI_P:(o + 1) * _NKI_P])
                     aT = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.sbuf)
-                    nisa.tensor_copy(dst=aT, src=tps)
+                    _e2_drain(aT, tps, _E2_PREBWD_DRAIN)
                     if src_idx == 0:
                         nisa.nc_matmul(dst=dh_ps, stationary=aT, moving=Wq[o], accumulate=(not first))
                     elif src_idx == 1:
@@ -2193,7 +2217,7 @@ if NKI_AVAILABLE:
                         nisa.nc_matmul(dst=dh_ps, stationary=aT, moving=Wv[o], accumulate=(not first))
                     first = False
             dh = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=dh, src=dh_ps)
+            _e2_drain(dh, dh_ps, _E2_PREBWD_DRAIN)
             # ---- rmsnorm backward of xm: dxm = dx1 + rstd * (dh - xm * rstd^2 * mean(dh*xm))
             nisa.tensor_tensor(dst=sq, data1=dh, data2=xm, op=nl.multiply)
             cm = nl.ndarray((_NKI_P, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -2412,7 +2436,7 @@ if NKI_AVAILABLE:
                 for o in range(kt):
                     tps = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.psum)
                     nisa.nc_transpose(dst=tps, data=d[:, o * _NKI_P:(o + 1) * _NKI_P])
-                    _e2_drain(dyT[o][:, tb * _NKI_P:(tb + 1) * _NKI_P], tps, _E2_MLPBWD)
+                    _e2_drain(dyT[o][:, tb * _NKI_P:(tb + 1) * _NKI_P], tps, _E2_MLPBWD_DRAIN)
             # dpreT[h] = 2 relu(preT[h]) * dhT[h],  dhT[h] = sum_o W2T[o][h]^T dyT[o]
             dpreT = []
             hT = []
@@ -2423,7 +2447,7 @@ if NKI_AVAILABLE:
                 relu = nl.ndarray((_NKI_P, _FMAX), dtype=nl.bfloat16, buffer=nl.sbuf)
                 nisa.dma_copy(dst=relu, src=pre_in[h * _NKI_P:(h + 1) * _NKI_P, t0:t0 + _FMAX])   # relu(pre), saved by the forward
                 hh = nl.ndarray((_NKI_P, _FMAX), dtype=nl.bfloat16, buffer=nl.sbuf)
-                _e2_sq(hh, relu, _E2_MLPBWD)                                            # h = relu^2
+                _e2_sq(hh, relu, _E2_MLPBWD_SQ)                                            # h = relu^2
                 hT.append(hh)
                 dp = nl.ndarray((_NKI_P, _FMAX), dtype=nl.bfloat16, buffer=nl.sbuf)
                 nisa.scalar_tensor_tensor(dst=dp, data=relu, op0=nl.multiply, operand0=2.0, op1=nl.multiply, operand1=dps)
@@ -2434,7 +2458,7 @@ if NKI_AVAILABLE:
                 for h in range(ht):
                     nisa.nc_matmul(dst=xps, stationary=dpreT[h][:, tb * _NKI_P:(tb + 1) * _NKI_P], moving=W1n[h], accumulate=(h > 0))
                 dxt = nl.ndarray((_NKI_P, D), dtype=nl.bfloat16, buffer=nl.sbuf)
-                _e2_drain(dxt, xps, _E2_MLPBWD)
+                _e2_drain(dxt, xps, _E2_MLPBWD_DRAIN)
                 nisa.dma_copy(dst=dx_out[t0 + tb * _NKI_P:t0 + (tb + 1) * _NKI_P, :], src=dxt)
             # weight gradients: per t-block build natural dpre[t-block] [128, H] and h[t-block] [128, H] by transposing blocks
             # The weight-gradient sums over token blocks are accumulated by the PE in PSUM, so each fp32 SBUF
@@ -2448,10 +2472,10 @@ if NKI_AVAILABLE:
                 for h in range(ht):
                     tps = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.psum)
                     nisa.nc_transpose(dst=tps, data=dpreT[h][:, tb * _NKI_P:(tb + 1) * _NKI_P])
-                    _e2_drain(dpn[:, h * _NKI_P:(h + 1) * _NKI_P], tps, _E2_MLPBWD)
+                    _e2_drain(dpn[:, h * _NKI_P:(h + 1) * _NKI_P], tps, _E2_MLPBWD_DRAIN)
                     tps2 = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.psum)
                     nisa.nc_transpose(dst=tps2, data=hT[h][:, tb * _NKI_P:(tb + 1) * _NKI_P])
-                    _e2_drain(hn[:, h * _NKI_P:(h + 1) * _NKI_P], tps2, _E2_MLPBWD)
+                    _e2_drain(hn[:, h * _NKI_P:(h + 1) * _NKI_P], tps2, _E2_MLPBWD_DRAIN)
                 dpn_l.append(dpn)
                 hn_l.append(hn)
             # dW1[h-tile, :] += sum over token blocks of dpre_nat[block][:, h-tile]^T x[block]
