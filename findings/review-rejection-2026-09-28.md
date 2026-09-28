@@ -74,3 +74,24 @@ module-level constants compare equal, which is what makes the 44-constant fold p
 Both causes were 26 versions of drift that no single change made look unreasonable. And `prepare.py`'s
 `check_submission()` does not test any of it — it also does not enforce the 262,144-byte limit that four of
 our versions silently exceeded.
+
+## The checker built from this (2026-09-28)
+
+`experimental/review_check.py` turns both causes into a gate. One command, ~2 s:
+
+```
+.venv/bin/python experimental/review_check.py submit/train.py      # defaults --ref to accepted v52
+.venv/bin/python experimental/review_check.py --backtest           # every submission_v*.py, ~75 s
+```
+
+It checks the 262,144-byte limit, diffs every `os.environ` read against v52 and says which ones reach
+the **scored forward**, and runs one structural rule in place of a keyword list: *a value read in the
+scored forward whose writers are all on one path* (this is what catches `_eval_logit_scale`, and also
+catches a renamed version of it that no grep would find). It then verifies the mechanically checkable
+claims in the "Notes for review" docstring against the AST - env-var count, `head_logits` call-site
+count, "no mode predicate", the claimed-inert constants and their guards, and the fused-check fail
+direction. Findings the **accepted** v52 also has are marked `carried` and do not count.
+
+Backtest: 0 new FAILs on v7/v33/v52 (all SCORED) and on v79; 2 on v12, 2 on v32, 3 on v78 (all
+REJECTED_BY_REVIEW); v73-v76 caught on size. v32's top finding is `self.training` in `Block.forward`,
+which is its actual rejection text.
