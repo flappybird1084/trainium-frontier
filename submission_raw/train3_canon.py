@@ -3987,6 +3987,91 @@ def apply_bte_bf16(model: "GPT") -> None:
     print0(f"BTE_BF16: bigram table held in bf16 ({bte.weight.numel():,} elements)")
 
 
+# COMM_BF16: extend BTE_BF16's mechanism to the other ZeRO-sharded parameters - the attention and MLP Muon stacks,
+# lm_head and the four token tables (83.9M of the 218.1M sharded elements). Their replicas become bf16 AFTER
+# setup_sharding has cloned the fp32 masters (so the master shards are the exact fp32 values of the flag-off run),
+# which (a) lets the parameter all_gather write the replica directly - the 12->16 padded MLP stacks' replica is a
+# view of the padded gather buffer - deleting every converting copy in gather_params, and (b) halves the gradient
+# reduce_scatter bytes with no full-size cast pass: the in-graph weights are cast to bf16 by the graph anyway, so
+# their fp32 gradients were already exact upcasts of bf16 values, and with a bf16 replica autograd emits the bf16
+# gradient directly. The token tables keep an fp32 scatter accumulator (hot ids take up to ~500 adds per micro-step)
+# and are rounded to bf16 once, at attach(). The one numeric change for the stacks and lm_head is that the 8-rank
+# reduction sums bf16 partials (see the startup CB_PROBE line for how the device actually accumulates).
+# Excluded: bte (BTE_BF16 owns it; use both flags together), a KH-folded stack (its fold runs in the stack's dtype),
+# every unsharded parameter. The replicas go back to fp32 right after the training loop, before the tail-EMA blend,
+# so the blend, the in-run eval and the checkpoint see exactly the flag-off values; the EMA buffers are fp32 clones.
+# Off (default) = the exact pre-flag code path; also a no-op at world_size 1.
+COMM_BF16 = os.environ.get("NEURON_COMPETITION_R1_COMM_BF16", "0") != "0"
+
+
+@torch.no_grad()
+def apply_comm_bf16(model: "GPT", optimizer: "MuonAdamW") -> list:
+    """Cast the planned replicas to bf16. MUST run after setup_sharding (fp32 masters), before EmbedSidecar (whose
+    token-table accumulators stay fp32 for tagged tables) and before the first forward (one trace, one compile)."""
+    if not COMM_BF16 or optimizer.world_size == 1 or not optimizer.plan:
+        return []
+    kh = model.stacks[model._kh_key] if model._kh_slots else None
+    allow = {id(p) for p in model.stacks.values() if p is not kh}
+    allow.add(id(model.lm_head.weight))
+    allow.update(id(model.transformer[n].weight) for n in ("wte", "vte", "vte_mid", "vte2"))
+    names = {id(p): n for n, p in model.named_parameters()}
+    done, skipped = [], []
+    for p, plan in optimizer.plan.items():
+        if id(p) not in allow or p.dtype != torch.float32:
+            skipped.append(names.get(id(p), "?"))
+            continue
+        if plan.get("pad"):
+            # gather_params' two bf16 buffers, pre-allocated here; the replica IS rows [:n] of the gather output
+            plan["spad"] = torch.zeros((plan["per"],) + tuple(p.shape[1:]), dtype=torch.bfloat16, device=p.device)
+            fpad = torch.zeros((plan["npad"],) + tuple(p.shape[1:]), dtype=torch.bfloat16, device=p.device)
+            fpad[:plan["n"]].copy_(p.data)
+            plan["fpad"] = fpad
+            plan["direct"] = True
+            p.data = fpad[:plan["n"]]
+        else:
+            p.data = p.data.to(torch.bfloat16)
+        p._comm_bf16 = True
+        done.append(p)
+    print0(f"COMM_BF16: {len(done)} sharded replicas held in bf16 ({sum(p.numel() for p in done):,} elements): "
+           + ", ".join(names[id(p)] for p in done) + " | left as is: " + (", ".join(skipped) or "none"))
+    comm_bf16_probe(optimizer.world_size, done[0].device if done else torch.device("cpu"))
+    return done
+
+
+@torch.no_grad()
+def comm_bf16_probe(world_size: int, device: torch.device) -> None:
+    """Startup-only diagnostic: does a bf16 AVG reduce_scatter accumulate in fp32 (one final rounding) or round
+    partial sums to bf16? Every rank regenerates every rank's bf16 input, so the exact fp64 answer rounded ONCE to
+    bf16 is known on every rank; `exact` is the fraction of this rank's outputs that match it (1.0000 = wide
+    accumulator; clearly below 1 = bf16 partial sums), `rel` the mean relative error against the fp64 mean."""
+    try:
+        n = 128 * 512
+        ins = [torch.randn(world_size * n, generator=torch.Generator().manual_seed(9100 + r)).to(torch.bfloat16)
+               for r in range(world_size)]
+        mean64 = torch.stack([t.double() for t in ins]).mean(0)
+        r = dist.get_rank()
+        ref = mean64[r * n:(r + 1) * n]
+        out = torch.empty(n, dtype=torch.bfloat16, device=device)
+        dist.reduce_scatter_tensor(out, ins[r].to(device), op=dist.ReduceOp.AVG)
+        got = out.double().cpu()
+        exact = (got == ref.to(torch.bfloat16).double()).double().mean().item()
+        rel = ((got - ref).abs() / ref.abs().clamp_min(1e-3)).mean().item()
+        print0(f"CB_PROBE bf16 reduce_scatter AVG over {world_size} ranks: exact-single-rounding {exact:.4f}, "
+               f"mean rel err {rel:.2e} (bf16 half-ulp ~2e-3)")
+    except Exception as exc:   # a diagnostic must never take the run down
+        print0(f"CB_PROBE unavailable ({str(exc)[:120]})")
+
+
+@torch.no_grad()
+def restore_comm_bf16(params: list) -> None:
+    """Replicas back to fp32 (exactly the flag-off replica values: fp32 copies of the gathered bf16 numbers)."""
+    for p in params:
+        if p.dtype == torch.bfloat16:
+            p.data = p.data.float()
+    if params:
+        print0(f"COMM_BF16: {len(params)} replicas restored to fp32 before the EMA blend and the checkpoint")
+
+
 def scatter_packed(idx, rows, bins=None, dense_k=None):
     """Host plan for embed_scatter_add_v2[_x4], replacing scatter_rounds' occurrence-rank rounds.
 
@@ -4165,7 +4250,10 @@ class EmbedSidecar:
         self.tables["bte"] = model.transformer.bte.weight
         self.kinds = {"tok": ["wte", "vte", "vte_mid", "vte2"], "bg": ["bte"]}
         # gradient buffers carry a 128-row tail that absorbs the scatter kernel's padding slots
-        self.gbuf = {k: torch.zeros((w.shape[0] + 128, w.shape[1]), dtype=w.dtype, device=w.device) for k, w in self.tables.items()}
+        # (COMM_BF16: a tagged bf16 token table keeps an fp32 accumulator; attach() rounds it once)
+        self.gbuf = {k: torch.zeros((w.shape[0] + 128, w.shape[1]),
+                                    dtype=torch.float32 if getattr(w, "_comm_bf16", False) else w.dtype,
+                                    device=w.device) for k, w in self.tables.items()}
         self.bigram_grad = True
 
     def start_step(self, bigram_grad: bool = True):
@@ -4287,7 +4375,8 @@ class EmbedSidecar:
 
     def attach(self):
         for name, w in self.tables.items():
-            w.grad = self.gbuf[name][:w.shape[0]] if (name != "bte" or self.bigram_grad) else None
+            g = self.gbuf[name][:w.shape[0]] if (name != "bte" or self.bigram_grad) else None
+            w.grad = g if (g is None or g.dtype == w.dtype) else g.to(w.dtype)   # COMM_BF16: one rounding
 
 
 class MuonAdamW(torch.optim.Optimizer):
@@ -4398,7 +4487,16 @@ class MuonAdamW(torch.optim.Optimizer):
                 zpad = plan.get("zpad")
                 if zpad is None:
                     zpad = plan["zpad"] = torch.zeros((plan["npad"] - plan["n"],) + tuple(p.shape[1:]), dtype=p.grad.dtype, device=p.device)
-                dist.reduce_scatter_tensor(plan["gpad"], torch.cat([p.grad, zpad]), op=dist.ReduceOp.AVG)
+                if p.grad.dtype != plan["gpad"].dtype:
+                    # COMM_BF16: the padded stack's gradient is bf16; reduce it at bf16 and cast only the 1/8-size
+                    # result into the fp32 gpad the fused Muon kernel reads
+                    g16 = plan.get("gpad16")
+                    if g16 is None:
+                        g16 = plan["gpad16"] = torch.empty_like(plan["gpad"], dtype=p.grad.dtype)
+                    dist.reduce_scatter_tensor(g16, torch.cat([p.grad, zpad]), op=dist.ReduceOp.AVG)
+                    plan["gpad"].copy_(g16)
+                else:
+                    dist.reduce_scatter_tensor(plan["gpad"], torch.cat([p.grad, zpad]), op=dist.ReduceOp.AVG)
             elif plan is not None and p.grad.dtype != plan["gshard"].dtype:
                 # BTE_BF16: bf16 gradient buffer, fp32 optimizer shard. Reduce at the GRADIENT's dtype (half the
                 # bytes, and no full-size cast pass - the cast pass is what made GRAD_BF16 a wash) and cast only
@@ -4426,7 +4524,8 @@ class MuonAdamW(torch.optim.Optimizer):
                 if plan["active"]:
                     spad[:plan["hi"] - plan["lo"]].copy_(plan["pshard"])
                 dist.all_gather_into_tensor(plan["fpad"], spad)   # every rank takes part (ranks with no matrices send zeros)
-                p.data.copy_(plan["fpad"][:plan["n"]])
+                if not plan.get("direct"):                        # COMM_BF16: p.data IS fpad[:n] already
+                    p.data.copy_(plan["fpad"][:plan["n"]])
                 continue
             if p.data.dtype == torch.bfloat16:
                 # BTE_BF16: the collective writes the replica directly - a ~805 MB/step converting copy (and a
@@ -4836,11 +4935,15 @@ def main() -> None:
         optimizer = model.setup_optimizer()
         apply_bte_bf16(orig_model)      # --compile-only warms the NEFF cache: it must trace what the real run traces
         apply_lazy_bte(orig_model)
+        if COMM_BF16:                   # the bf16 replicas need their fp32 masters first, and must precede the trace
+            optimizer.setup_sharding(world_size, rank)
+            apply_comm_bf16(orig_model, optimizer)
         model.zero_grad(set_to_none=True)
         for _ in range(grad_accum_steps):
             loss = model(synthetic_x, synthetic_y)
             (loss / grad_accum_steps).backward()
-        optimizer.setup_sharding(world_size, rank)
+        if not COMM_BF16:
+            optimizer.setup_sharding(world_size, rank)
         sync_gradients(model, optimizer)
         optimizer.refresh_scalars()
         optimizer.step()
@@ -4893,6 +4996,7 @@ def main() -> None:
     apply_bte_bf16(orig_model)
     apply_lazy_bte(orig_model)
     optimizer.setup_sharding(world_size, rank)
+    comm_bf16_params = apply_comm_bf16(orig_model, optimizer)   # after the fp32 masters exist, before sidecar + trace
     # embedding tables live outside the compiled graph (whose backward lowers their scatter-add as one-hot matmuls,
     # ~20% of the step): gather rows before the graph, scatter-add their gradients after it
     sidecar = EmbedSidecar(orig_model, "sidecar" if (device.type == "neuron" and NKI_AVAILABLE) else "sidecar_torch")
@@ -5013,11 +5117,11 @@ def main() -> None:
                 if ema_params is None:
                     tables = {id(m.weight) for m in orig_model.transformer.values() if isinstance(m, nn.Embedding)}
                     ema_pairs = [p for p in orig_model.parameters() if id(p) not in tables]
-                    ema_params = [p.detach().clone() for p in ema_pairs]
+                    ema_params = [p.detach().clone().float() for p in ema_pairs]   # .float(): COMM_BF16 replicas
                     _tabs = [(n, m.weight) for n, m in orig_model.transformer.items()
                              if isinstance(m, nn.Embedding) and m.weight.numel() <= EMA_TABLE_MAX]
                     ema_tab_pairs = [p for _n, p in _tabs]
-                    ema_tab_params = [p.detach().clone() for p in ema_tab_pairs]
+                    ema_tab_params = [p.detach().clone().float() for p in ema_tab_pairs]
                     print0(f"tail-EMA of the weights started at step {step}")
                     # print what was admitted AND what was excluded: the log must prove which path is live
                     print0("tail-EMA table group (blend " + f"{EMA_TABLE_BLEND}): "
@@ -5039,22 +5143,22 @@ def main() -> None:
                                   flush=True)
                             ema_names = ema_tab_names = None
                         elif EMA_DECAY_EXTRA:
-                            ema_extra = [[p.detach().clone() for p in ema_pairs] for _d in EMA_DECAY_EXTRA]
-                            ema_tab_extra = [[p.detach().clone() for p in ema_tab_pairs] for _d in EMA_DECAY_EXTRA]
+                            ema_extra = [[p.detach().clone().float() for p in ema_pairs] for _d in EMA_DECAY_EXTRA]
+                            ema_tab_extra = [[p.detach().clone().float() for p in ema_tab_pairs] for _d in EMA_DECAY_EXTRA]
                             print0(f"SAVE_EMA_PARTS: {len(EMA_DECAY_EXTRA)} extra EMA track(s) at decay "
                                    + ", ".join(f"{d} (tau {1.0 / max(1e-9, 1.0 - d):.0f} steps)"
                                                for d in EMA_DECAY_EXTRA))
                 else:
                     for e, p in zip(ema_params, ema_pairs):
-                        e.lerp_(p.detach(), 1.0 - _EFF_EMA_DECAY)
+                        e.lerp_(p.detach().float(), 1.0 - _EFF_EMA_DECAY)
                     for e, p in zip(ema_tab_params, ema_tab_pairs):
-                        e.lerp_(p.detach(), 1.0 - _EFF_EMA_DECAY)
+                        e.lerp_(p.detach().float(), 1.0 - _EFF_EMA_DECAY)
                     if ema_extra is not None:      # dev instrument only; never on a scored run
                         for _d, _es, _ets in zip(EMA_DECAY_EXTRA, ema_extra, ema_tab_extra):
                             for e, p in zip(_es, ema_pairs):
-                                e.lerp_(p.detach(), 1.0 - _d)
+                                e.lerp_(p.detach().float(), 1.0 - _d)
                             for e, p in zip(_ets, ema_tab_pairs):
-                                e.lerp_(p.detach(), 1.0 - _d)
+                                e.lerp_(p.detach().float(), 1.0 - _d)
 
         synchronize(device)
         record_step_boundary(step)
@@ -5124,6 +5228,7 @@ def main() -> None:
     # part of the instrument that has to happen inside the timed region; it is ~570 MB of D2H (~285 MB raw +
     # ~285 MB per average track) and cost T_V59 ~18 of 4240 steps. rank 0 only - every rank holds the same
     # consolidated weights here, and only rank 0 writes files.
+    restore_comm_bf16(comm_bf16_params)   # COMM_BF16: fp32 replicas before anything reads the final weights
     ema_parts = None
     if ema_params is not None and SAVE_EMA_PARTS and ema_names is not None and rank == 0:
         with torch.no_grad():
