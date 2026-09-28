@@ -83,7 +83,11 @@ PACK = 4   # v42: organizer-sanctioned packing - the loader builds best-fit rows
            # packer never fits a document longer than a row: 28% of the corpus was never trained on). Gate: -0.0043 vs PACK=1.
 DEPTH = 12
 N_EMBD = 512
-N_HEAD = 4
+# N_HEAD (2026-09-28, dev knob, default 4 = unchanged): 2 gives head_dim 256 on BOTH paths: the fused layer kernels
+# are simulator-verified at 4x128 and 2x256 (build_layer_ops refuses any other width; LAYER_IMPL=explicit takes any).
+# n_head is saved in model_config, so load_for_eval rebuilds the right shape without this env var.
+N_HEAD = int(os.environ.get("NEURON_COMPETITION_R1_N_HEAD", "4"))
+assert N_EMBD % N_HEAD == 0, f"N_HEAD={N_HEAD} must divide N_EMBD={N_EMBD}"
 HEAD_DIM = N_EMBD // N_HEAD
 MLP_RATIO = 6                   # MLP hidden = 6x n_embd (was 4): Sep 9, -0.0056 at ratio 6 on the kernel line
 TOTAL_BATCH_SIZE = int(os.environ.get("NEURON_COMPETITION_R1_TOTAL_BATCH", "131072"))   # tokens per optimizer step (one
@@ -154,9 +158,20 @@ BOS_ID = 8188                   # the fixed tokenizer's <|reserved_0|> (document
 # INPUT (doc_bounds(idx)), never from the targets.
 BOS_IGNORE = True
 SINK_INIT = math.log(float(os.environ.get("NEURON_COMPETITION_R1_SINK_INIT", "4.0")))       # softmax-denominator sink logit per (layer, head)
-BIGRAM_SIZE = 2 ** 18
+# BIGRAM_BITS (2026-09-28, dev knob, default 18 = unchanged): rows of the hashed bigram table = 2**BIGRAM_BITS. Both
+# hash sites take (product >> 13) & (rows - 1), i.e. the top 32-13 = 19 bits of the int32 product, so 19 is the ceiling
+# (20 would repeat the sign bit). The table shape is in the state dict, so a mismatched scoring env fails loudly.
+BIGRAM_BITS = int(os.environ.get("NEURON_COMPETITION_R1_BIGRAM_BITS", "18"))
+assert 1 <= BIGRAM_BITS <= 19, f"NEURON_COMPETITION_R1_BIGRAM_BITS={BIGRAM_BITS}: the >>13 hash has 19 usable bits"
+BIGRAM_SIZE = 2 ** BIGRAM_BITS
 
 EMBEDDING_LR = 0.30 * 0.71 * 2.0 * _BATCH_LR * 2.25   # v43: x4.5 (was x6.0 in v40-v42; two paired 1800 s gates on the PACK=4 base: -0.0012 each; 3.5 is +0.004 worse)   # embedding LR x6.0 of the 32k-tuned base (was x2.0): Sep 9 sweep on the kernel line
+# EMB_LR_MUL / BTE_LR_MUL (2026-09-28, dev knobs, default 1.0 = unchanged; x*1.0 is exact, so the default lr is the
+# same float). EMB_LR_MUL scales the whole embedding group (4 token tables + bigram table), i.e. EMBED_LR_SCALE
+# 4.5 -> 4.5*mul. BTE_LR_MUL != 1.0 moves the bigram table into its own AdamW group (same betas/eps/wd) at
+# EMBEDDING_LR*EMB_LR_MUL*BTE_LR_MUL; at 1.0 the group layout is untouched. Both are optimizer-only.
+EMB_LR_MUL = float(os.environ.get("NEURON_COMPETITION_R1_EMB_LR_MUL", "1.0"))
+BTE_LR_MUL = float(os.environ.get("NEURON_COMPETITION_R1_BTE_LR_MUL", "1.0"))
 UNEMBEDDING_LR = 0.006 * 0.71 * _BATCH_LR
 MATRIX_LR = 0.025 * 0.71 * _BATCH_LR * 0.7   # x0.7: re-tuned for the ~3300-step regime of the kernel line (Sep 8 sweep)
 ATTN_SCALE = 0.1                # constant attention logit scale (instead of 1/sqrt(128) = 0.088): -0.0006 full, -0.0010 screen
@@ -2027,8 +2042,13 @@ if NKI_AVAILABLE:
                     yTi = oTb[i][:, p0:p0 + _NKI_P]   # the [HD, 128 tokens] tile lands straight in head i's staging row
                     nisa.tensor_copy(dst=yTi, src=tps)
                     nisa.nc_matmul(dst=aps, stationary=yTi, moving=WoT[i], accumulate=(i > 0))
-                    if p0 + _NKI_P == t_len:          # row complete: ONE contiguous (HD, t_len) store
-                        nisa.dma_copy(dst=outT_out[row * n_head + i, :, :], src=oTb[i])
+                    if p0 + _NKI_P == t_len:          # row complete: ONE contiguous (128, t_len) store
+                        if HD == _NKI_P:
+                            nisa.dma_copy(dst=outT_out[row * n_head + i, :, :], src=oTb[i])
+                        else:   # N_HEAD=2 (HD 256): column block i is dims (i % 2)*128.. of head i // 2
+                            _hb = HD // _NKI_P
+                            _d0 = (i % _hb) * _NKI_P
+                            nisa.dma_copy(dst=outT_out[row * n_head + i // _hb, _d0:_d0 + _NKI_P, :], src=oTb[i])
                 xmt = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.dma_copy(dst=xmt, src=xm_in[t0 + tb * _NKI_P:t0 + (tb + 1) * _NKI_P, :])
                 x1 = x1_tiles[tb]
@@ -3105,6 +3125,9 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         self.n_head = config.n_head
         self.head_dim = config.n_embd // config.n_head
+        # ATTN_SCALE was tuned at head_dim 128; QK-normed logits grow as sqrt(head_dim), so other widths keep the same
+        # logit temperature via sqrt(128 / head_dim). Exactly ATTN_SCALE at 128 (sqrt(1.0) == 1.0).
+        self.attn_scale = ATTN_SCALE * math.sqrt(128 / self.head_dim)
         self.c_q = StackedLinear(registry, config.n_embd, config.n_embd)
         self.c_k = StackedLinear(registry, config.n_embd, config.n_embd)
         self.c_v = StackedLinear(registry, config.n_embd, config.n_embd)
@@ -3134,7 +3157,7 @@ class CausalSelfAttention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        scale = ATTN_SCALE
+        scale = self.attn_scale
         if bounds is not None:
             # Trainium: NKI flash attention (bounds = document mask; the kernel needs scale 1.0, so q is pre-scaled)
             y = torch.ops.r1.doc_attention_fwd((q * scale).to(q.dtype), k, v, sink, bounds[0], bounds[1])[0]
@@ -3238,6 +3261,9 @@ def build_layer_ops(n_head: int):
     global _LAYER_OPS, _LAYER_NH
     if _LAYER_OPS is not None:
         return _LAYER_OPS
+    if N_EMBD // int(n_head) not in (128, 256):   # simulator-verified head widths of the pre/post/bwd layer kernels (2026-09-28)
+        raise RuntimeError(f"layer ops support head_dim 128 or 256, got n_head={n_head} (head_dim {N_EMBD // int(n_head)}); "
+                           f"use LAYER_IMPL=explicit")
     _LAYER_NH = int(n_head)
     from torch_neuronx.nki_hop import wrap_nki, nki_op
     from nkilib.core.attention.attention_cte import attention_cte
@@ -3283,7 +3309,7 @@ def build_layer_ops(n_head: int):
                                                                torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
                                                                torch.Tensor, torch.Tensor, torch.Tensor]:
         NH = _LAYER_NH; T, D = x2.shape; HD = D // NH; b = start.shape[0]; t = T // b
-        scale = ATTN_SCALE
+        scale = ATTN_SCALE * math.sqrt(128 / HD)    # == CausalSelfAttention.attn_scale; exactly ATTN_SCALE at HD 128
         # head-major kernels: q/k/v arrive as (b*NH, t, HD) with q pre-scaled; the attention output is read per head and the
         # token-major y2 comes back from post_kh -> no permute/reshape compiler copies between the kernels and attention
         # k arrives already key-offset (v26: normed key dims HD/4:HD/2 come from the previous position, zeroed at doc starts)
@@ -3306,7 +3332,7 @@ def build_layer_ops(n_head: int):
                   w2: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
                                              torch.Tensor, torch.Tensor, torch.Tensor]:
         NH = _LAYER_NH; T, D = x2.shape; HD = D // NH; b = start.shape[0]; t = T // b
-        scale = ATTN_SCALE
+        scale = ATTN_SCALE * math.sqrt(128 / HD)    # == CausalSelfAttention.attn_scale; exactly ATTN_SCALE at HD 128
         d2 = dout2.to(bf).contiguous()
         h2 = nfwd[grid](x1, eps=eps)
         dh2, dW1p, dW2p = mlp_bwd_k[grid](h2, d2, preT, w1, w2)
@@ -3703,7 +3729,9 @@ class GPT(nn.Module):
     def setup_optimizer(self):
         scalar_params =[self.skip_lambdas, self.bigram_lambda, self.softcap_pos, self.softcap_neg]
         scalar_params.extend(self.block_scalars[k] for k in ("resid", "x0", "ve", "sink"))
-        embedding_params = [self.transformer[n].weight for n in ("wte", "vte", "vte_mid", "vte2", "bte")]
+        _bte_split = BTE_LR_MUL != 1.0
+        embedding_params = [self.transformer[n].weight for n in
+                            (("wte", "vte", "vte_mid", "vte2") if _bte_split else ("wte", "vte", "vte_mid", "vte2", "bte"))]
         lm_head_params = list(self.lm_head.parameters())
         dmodel_lr_scale = (self.config.n_embd / 768) ** -0.5
         param_groups = [
@@ -3713,7 +3741,7 @@ class GPT(nn.Module):
             # very beta to 0.999 lost +0.00025. Mechanism: our warmdown makes the weights improve fast near the end,
             # so any mechanism averaging over older state pays a bias cost that dominates its variance benefit.
             # This group has never been measured in either direction - 606 ledger rows, zero rows for its betas.
-            dict(kind="adamw", params=embedding_params, lr=EMBEDDING_LR * dmodel_lr_scale, betas=(0.8, 0.99), eps=1e-10, weight_decay=0.001),
+            dict(kind="adamw", params=embedding_params, lr=EMBEDDING_LR * dmodel_lr_scale * EMB_LR_MUL, betas=(0.8, 0.99), eps=1e-10, weight_decay=0.001),
             dict(kind="adamw", params=lm_head_params, lr=UNEMBEDDING_LR * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
             dict(kind="adamw", params=scalar_params, lr=SCALAR_LR, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0),
         ]
@@ -3743,6 +3771,16 @@ class GPT(nn.Module):
             param_groups.append(dict(kind="adamw", params=[p for _n, p in self.named_parameters() if _n.startswith("mudd.")],
                                      lr=SCALAR_LR * MUDD_LR_SCALE, betas=(0.9, 0.99), eps=1e-10, weight_decay=0.0,
                                      flat=True))
+        if _bte_split:   # appended last so every existing group keeps its index (KH reads param_groups[2])
+            param_groups.append(dict(kind="adamw", params=[self.transformer["bte"].weight],
+                                     lr=EMBEDDING_LR * dmodel_lr_scale * EMB_LR_MUL * BTE_LR_MUL, betas=(0.8, 0.99),
+                                     eps=1e-10, weight_decay=0.001))
+        if EMB_LR_MUL != 1.0 or _bte_split:
+            print0(f"EMB_LR_MUL={EMB_LR_MUL} BTE_LR_MUL={BTE_LR_MUL}: token tables lr "
+                   f"{EMBEDDING_LR * dmodel_lr_scale * EMB_LR_MUL:.4f}, bigram table lr "
+                   f"{EMBEDDING_LR * dmodel_lr_scale * EMB_LR_MUL * BTE_LR_MUL:.4f}")
+        if BIGRAM_BITS != 18:
+            print0(f"BIGRAM_BITS={BIGRAM_BITS}: bigram table {BIGRAM_SIZE:,} rows")
         opt = MuonAdamW(param_groups)
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
