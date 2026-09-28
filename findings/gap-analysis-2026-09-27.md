@@ -261,6 +261,26 @@ steps**, 1–2 days of head-kernel surgery (the fused head never materialises lo
 the 512-column tile loop with a per-token gather), and **no valid screen exists for it**. Not doable before
 2026-09-30. Recorded so it is not lost.
 
+**MEASURED 2026-09-28 — CLOSED on price, not on redundancy.** Offline, on the trained full-length `v72_final.pt`
+(no screen): freeze the model, learn only `B` (zero-init, `logits = softcap(z + B[x_t])`, bias INSIDE the cap) on
+fresh train tokens by gradient, score on public_val (2M tokens, same tokens both arms).
+`experimental/offline_outbigram_fit.py`. The loss is convex in `B`, so this is the ceiling of what the converged
+model leaves on the table for an exact current-token output bias:
+
+| train tokens for B | val_bpb delta |
+|---|---|
+| 20M / 40M / 80M (lr decayed) | +0.000001 / −0.00016 / −0.00029 |
+| 50M / 100M / 200M (lr decayed over 200M) | −0.00023 / −0.00045 / **−0.00059** |
+
+Extrapolated to a run's ~570M tokens: roughly **−0.0008**. Not zero — the model misses a little — but the
+cheapest honest device build (sidecar gather + scatter of a (16384, 8192) row block per core, +268 MB of grads
+through reduce_scatter/all_gather, AdamW on +67M) prices at ~+15–25 ms ≈ **+0.0012–0.0020**. An in-kernel
+scatter could cut that to ~10 ms but needs indirect DMA writes inside the compiled graph (tracer rules #9/#11).
+Net ≈ 0 at best. **Optimizer trap if reopened:** plain Adam at lr 3e-3 on `B` DIVERGED even with the model
+frozen (+0.023 at 20M tokens: Adam sign-amplifies the tiny dense `p` gradients on every column of a hit row);
+the embedding group runs at lr ≈ 2.35 and the head group at ≈ 0.010, both far above that. Only row-count-
+normalised SGD (`B[v] -= lr * mean_{t: x_t=v} dL/dz`) fit cleanly.
+
 ---
 
 ## 4. Q3 — the small vocab against a byte-normalised metric
