@@ -286,6 +286,22 @@ MUDD_CAP = float(os.environ.get("NEURON_COMPETITION_R1_MUDD_CAP", "30.0"))
 # O(1)); ours is O(20) by layer 10, so the mixer hidden is ~10x larger here and so are the coefficients. Costs ~10
 # extra (b, t, D) ops for the two sites, which is why it is not on by default now that the LR is right.
 MUDD_NORM = os.environ.get("NEURON_COMPETITION_R1_MUDD_NORM", "0") != "0"
+# KNOCKING-HEADS (arXiv 2510.23052), folded into the weights. KH names the projections that get one d_head x d_head
+# matrix T = I + D per layer, SHARED by every head of that layer ("v" = V only, "qkv" = all three; "" = off). Head h's
+# projection output becomes v_h T, i.e. W_eff[h] = T^T W[h] = W[h] + D^T W[h]: computed once per forward in torch,
+# before the layer loop, and fed to the UNCHANGED fused layer kernels. D is zero-initialised, so the flag is an exact
+# no-op at step 0 (W + 0 == W bit for bit on every backend, whatever the matmul precision). D trains in the flat
+# small-parameter AdamW group at its own lr (KH_LR, per-element multiplier; no weight decay, which on D is decay
+# toward T = I anyway). The tail-EMA averages D like every other parameter; after the blend the fold is written into
+# the stacks and D is zeroed, so the checkpoint holds W_eff only and the scored model is today's model exactly.
+KH = os.environ.get("NEURON_COMPETITION_R1_KH", "").strip().lower()
+assert set(KH) <= set("qkv"), f"NEURON_COMPETITION_R1_KH={KH!r}: use a subset of 'qkv'"
+_KH_SLOTS = tuple(sorted({"q": 0, "k": 1, "v": 2}[c] for c in set(KH)))   # slot within (c_q, c_k, c_v, c_proj)
+# KH_LR 1e-4, calibrated (CPU, real data, full lr): at 5e-4 AdamW moves D by ||dD||_2 ~ 0.022/step, ~4x the relative
+# spectral step Muon takes on W_v (0.0055/step); 1e-4 puts T's relative step at ~0.8x W_v's. Adam-trained, as in the
+# paper, T moves at roughly half W's relative rate. The slow-gate lesson (E28a) applies with more force here: 16k
+# entries per matrix make Adam's per-element step ~40x larger in spectral norm, so the scalar LR (0.284) would be fatal.
+KH_LR = float(os.environ.get("NEURON_COMPETITION_R1_KH_LR", "0.0001"))
 FRAC_BY_STEPS = os.environ.get("NEURON_COMPETITION_R1_FRAC_BY_STEPS", "0") != "0"
 EMA_DECAY = 0.997               # tail-EMA of the weights over the last 15% of the budget (tau ~330; 0.9933 -> 0.997 = -0.0006 at 1800 s, S2_EMA0997), ...
 # EMA_START 0.85 -> 0.75: the averaging window and the blend are COUPLED, and the blend just moved a lot.
@@ -2855,11 +2871,17 @@ class CausalSelfAttention(nn.Module):
         self.c_v = StackedLinear(registry, config.n_embd, config.n_embd)
         self.c_proj = StackedLinear(registry, config.n_embd, config.n_embd)
 
-    def forward(self, x, ve, cos, sin, sink, dense_mask=None, bounds=None, doc_start=None):
+    def forward(self, x, ve, cos, sin, sink, dense_mask=None, bounds=None, doc_start=None, khw=None):
         b, t, c = x.shape
-        q = self.c_q(x).view(b, t, self.n_head, self.head_dim)
-        k = self.c_k(x).view(b, t, self.n_head, self.head_dim)
-        v = (self.c_v(x) + ve).view(b, t, self.n_head, self.head_dim)
+        if khw is not None:      # KH: the folded (q, k, v) weights, None where that projection is not folded
+            _lin = lambda m, w: m(x) if w is None else F.linear(x, w.to(dtype=x.dtype), None)
+            q = _lin(self.c_q, khw[0]).view(b, t, self.n_head, self.head_dim)
+            k = _lin(self.c_k, khw[1]).view(b, t, self.n_head, self.head_dim)
+            v = (_lin(self.c_v, khw[2]) + ve).view(b, t, self.n_head, self.head_dim)
+        else:
+            q = self.c_q(x).view(b, t, self.n_head, self.head_dim)
+            k = self.c_k(x).view(b, t, self.n_head, self.head_dim)
+            v = (self.c_v(x) + ve).view(b, t, self.n_head, self.head_dim)
         q = norm(apply_rotary_emb(q, cos, sin))
         k = norm(apply_rotary_emb(k, cos, sin))
         if KEY_OFFSET:
@@ -3268,7 +3290,7 @@ class Block(nn.Module):
                 setattr(self, _nm, nn.Parameter(_p))
 
     def forward(self, x, x0, ve, cos, sin, resid_lambda, x0_lambda, ve_lambda, sink, dense_mask, bounds, doc_start=None,
-                rope_tabs=None, wviews=None):
+                rope_tabs=None, wviews=None, khw=None):
         if CANON_PRE_W > 1:      # residual-stream conv, ahead of BOTH paths
             x = canon_conv(x, self.canon_p, doc_start)
         if (LAYER_IMPL == "op" and not CANON_ON and _LAYER_OPS is not None and x.device.type == "neuron" and sink is not None
@@ -3286,7 +3308,9 @@ class Block(nn.Module):
             # full-stack add, 1.02e9 elements per step and 16.6 ms of VECTOR-EXCLUSIVE time in the backward.
             ws = ([lin._stack[lin.idx].to(bf16) for lin in _lins] if wviews is None
                   else [wviews[lin.key][lin.idx] for lin in _lins])
-            x2 = x.reshape(T, D).to(bf16).contiguous(); x02 = x0.reshape(T, D).to(bf16).contiguous()
+            if khw is not None and wviews is None:     # KH without the bf16 view-set (wviews already carries the fold)
+                ws = [w if kw is None else kw.to(bf16) for w, kw in zip(ws, tuple(khw) + (None,) * 3)]
+            x2 =x.reshape(T, D).to(bf16).contiguous(); x02 = x0.reshape(T, D).to(bf16).contiguous()
             ve2 = ve.reshape(T, D).to(bf16).contiguous()
             scal = torch.stack([resid_lambda.reshape(()), x0_lambda.reshape(()), ve_lambda.reshape(()),
                                 torch.zeros((), device=x.device)]).float().view(1, 4).expand(128, 4).contiguous()
@@ -3298,7 +3322,7 @@ class Block(nn.Module):
         _h = norm(x)
         if CANON_ATTN_W > 1:
             _h = canon_conv(_h, self.canon_a, doc_start)
-        x = x + self.attn(_h, ve_lambda * ve, cos, sin, sink, dense_mask, bounds, doc_start=doc_start)
+        x = x + self.attn(_h, ve_lambda * ve, cos, sin, sink, dense_mask, bounds, doc_start=doc_start, khw=khw)
         _h = norm(x)
         if CANON_MLP_W > 1:
             _h = canon_conv(_h, self.canon_m, doc_start)
@@ -3342,6 +3366,16 @@ class GPT(nn.Module):
             "ve": nn.Parameter(torch.full((L, 1), 0.5)),
             "sink": nn.Parameter(torch.full((L, H), SINK_INIT)),
         })
+        self._kh_slots = _KH_SLOTS
+        if self._kh_slots:
+            # the fold relies on the attention stack holding (c_q, c_k, c_v, c_proj) of layer i at rows 4i..4i+3
+            self._kh_key = self.transformer.h[0].attn.c_q.key
+            for i, blk in enumerate(self.transformer.h):
+                for j, lin in enumerate((blk.attn.c_q, blk.attn.c_k, blk.attn.c_v, blk.attn.c_proj)):
+                    assert lin.key == self._kh_key and lin.idx == 4 * i + j, "KH: unexpected attention stack layout"
+            assert self.stacks[self._kh_key].shape[0] == 4 * L, "KH: the attention stack holds more than q/k/v/proj"
+            hd = config.n_embd // H
+            self.kh = nn.Parameter(torch.zeros(len(self._kh_slots), L, hd, hd))   # D = T - I, one per (projection, layer)
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         self.skip_lambdas = nn.Parameter(torch.ones(config.n_layer // 2))
         self.bigram_lambda = nn.Parameter(torch.full((1,), 0.2))
@@ -3381,6 +3415,8 @@ class GPT(nn.Module):
         self.bigram_lambda.fill_(0.2)
         self.softcap_pos.fill_(LOGIT_SOFTCAP)
         self.softcap_neg.fill_(LOGIT_SOFTCAP)
+        if self._kh_slots:
+            self.kh.zero_()                     # T = I: KH-on == KH-off at step 0
         if MUDD:
             for _m in self.mudd.values():       # w2 / bs back to zero -> MUDD-on == MUDD-off at step 0
                 _m.reset_parameters()
@@ -3399,8 +3435,34 @@ class GPT(nn.Module):
         sin = table.sin().to(COMPUTE_DTYPE)[None, :, None, :]
         return cos, sin
 
+    def _kh_effective(self):
+        """KH: the attention stack as 4 slot tensors (L, C, C) = (q, k, v, proj), with W_eff = W + D^T W applied per
+        head to the folded slots. unbind (not per-slot indexing) so the backward is one stack, never a zeros_like of
+        the whole stack per slice."""
+        s = self.stacks[self._kh_key]
+        L, H = self.config.n_layer, self.config.n_head
+        C = s.shape[-1]
+        parts = list(torch.unbind(s.view(L, 4, C, C), dim=1))
+        for j, slot in enumerate(self._kh_slots):
+            w = parts[slot].view(L, H, C // H, C)                        # (layer, head, d_head, in)
+            d = self.kh[j].to(w.dtype).transpose(-1, -2).unsqueeze(1)     # D^T, shared by the H heads
+            parts[slot] = (w + torch.matmul(d, w)).view(L, C, C)
+        return parts
+
+    @torch.no_grad()
+    def kh_fold_(self) -> None:
+        """Write W_eff into the stack and zero D: afterwards the model computes the same function with T = I, which is
+        what the checkpoint stores (no D) and what load_for_eval rebuilds with KH off."""
+        if not self._kh_slots:
+            return
+        parts = self._kh_effective()
+        s4 = self.stacks[self._kh_key].view(self.config.n_layer, 4, *self.stacks[self._kh_key].shape[1:])
+        for slot in self._kh_slots:
+            s4[:, slot].copy_(parts[slot])
+        self.kh.zero_()
+
     def setup_optimizer(self):
-        scalar_params = [self.skip_lambdas, self.bigram_lambda, self.softcap_pos, self.softcap_neg]
+        scalar_params =[self.skip_lambdas, self.bigram_lambda, self.softcap_pos, self.softcap_neg]
         scalar_params.extend(self.block_scalars[k] for k in ("resid", "x0", "ve", "sink"))
         embedding_params = [self.transformer[n].weight for n in ("wte", "vte", "vte_mid", "vte2", "bte")]
         lm_head_params = list(self.lm_head.parameters())
@@ -3416,6 +3478,16 @@ class GPT(nn.Module):
             dict(kind="adamw", params=lm_head_params, lr=UNEMBEDDING_LR * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
             dict(kind="adamw", params=scalar_params, lr=SCALAR_LR, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if self._kh_slots:
+            # D rides the flat small-parameter group (its one all_reduce and one fused AdamW) instead of adding a
+            # group, a collective and ~10 eager launches; a per-element lr multiplier gives it KH_LR while every
+            # scalar keeps exactly SCALAR_LR (multiplier 1.0). flat=True because D is above the 4096 auto-detect.
+            _sg = param_groups[2]
+            _sg["lr_mul"] = [1.0] * len(_sg["params"]) + [KH_LR / SCALAR_LR]
+            _sg["params"].append(self.kh)
+            _sg["flat"] = True
+            print0(f"KH live: slots={''.join('qkv'[s] for s in self._kh_slots)} D={tuple(self.kh.shape)} "
+                   f"lr={KH_LR} (flat scalar group, x{KH_LR / SCALAR_LR:.5f}) wd=0")
         for key in sorted(self.stacks.keys()):
             param_groups.append(dict(kind="muon", params=[self.stacks[key]], lr=MATRIX_LR, momentum=_EFF_MUON_MOMENTUM, beta2=_EFF_MUON_BETA2, ns_steps=NS_STEPS, weight_decay=WEIGHT_DECAY))
         canon_params = [p for _n, p in self.named_parameters() if ".canon_" in _n]
@@ -3518,7 +3590,18 @@ class GPT(nn.Module):
         # one cast + one unbind per weight stack, kept as a LOCAL and threaded through the block calls so
         # nothing mutates module state inside the traced region
         wviews = ({k: torch.unbind(p.to(torch.bfloat16)) for k, p in self.stacks.items()}
-                  if (LAYER_IMPL == "op" and COMPUTE_DTYPE == torch.bfloat16) else None)
+                  if (LAYER_IMPL == "op" and COMPUTE_DTYPE == torch.bfloat16 and not self._kh_slots) else None)
+        khws = None
+        if self._kh_slots:
+            _parts = self._kh_effective()
+            if LAYER_IMPL == "op" and COMPUTE_DTYPE == torch.bfloat16:
+                # the same one-cast-one-unbind view-set, built from the folded slots; index 4i+j = layer i, slot j
+                _sl = [torch.unbind(p.to(torch.bfloat16)) for p in _parts]
+                wviews = {k: ([_sl[j][i] for i in range(self.config.n_layer) for j in range(4)] if k == self._kh_key
+                              else torch.unbind(p.to(torch.bfloat16))) for k, p in self.stacks.items()}
+            else:     # explicit layers (CUDA/CPU): per-layer folded (q, k, v) weights, None where not folded
+                _ul = [torch.unbind(p) if j in self._kh_slots else None for j, p in enumerate(_parts[:3])]
+                khws = [tuple(None if u is None else u[i] for u in _ul) for i in range(self.config.n_layer)]
         rope_tabs = (self.cos2d[:t], self.sin2d[:t]) if LAYER_IMPL == "op" else None
         if idx.device.type == "neuron" and NKI_AVAILABLE and not torch.compiler.is_compiling():
             bounds = doc_bounds(idx)          # eager Trainium: NKI kernels; compiled graph: the explicit path below
@@ -3552,7 +3635,8 @@ class GPT(nn.Module):
                 if MUDD_CHANNELS > 1:
                     x = mixed[1]
             x = block(x, x0, ve_i, cos, sin, bs["resid"][i], bs["x0"][i], bs["ve"][i], bs["sink"][i], dense_mask, bounds,
-                      doc_start=doc_start, rope_tabs=rope_tabs, wviews=wviews)
+                      doc_start=doc_start, rope_tabs=rope_tabs, wviews=wviews,
+                      khw=None if khws is None else khws[i])
             if MUDD and i == MUDD_MID:
                 h_mid = x
             if i < n_enc:
@@ -3996,6 +4080,9 @@ class MuonAdamW(torch.optim.Optimizer):
         if st is None:
             flat = torch.cat([p.detach().reshape(-1).float() for p in params])
             st = dict(sizes=[p.numel() for p in params], p=flat, m=torch.zeros_like(flat), v=torch.zeros_like(flat), step=0)
+            if group.get("lr_mul") is not None:     # KH: per-element lr multiplier (1.0 on every scalar)
+                _mul = {id(q): m for q, m in zip(group["params"], group["lr_mul"])}
+                st["mul"] = torch.cat([torch.full((p.numel(),), float(_mul[id(p)]), dtype=flat.dtype) for p in params]).to(flat.device)
             self._flat[id(group)] = st
         g = torch.cat([p.grad.reshape(-1).float() for p in params])
         if self.world_size > 1:
@@ -4007,7 +4094,10 @@ class MuonAdamW(torch.optim.Optimizer):
         st["step"] += 1
         bias1 = 1 - beta1 ** st["step"]
         bias2 = 1 - beta2 ** st["step"]
-        flat.sub_(lr_t * (m / bias1 / ((v / bias2).sqrt() + group["eps"])))
+        if "mul" in st:
+            flat.sub_((lr_t * st["mul"]) * (m / bias1 / ((v / bias2).sqrt() + group["eps"])))
+        else:
+            flat.sub_(lr_t * (m / bias1 / ((v / bias2).sqrt() + group["eps"])))
         off = 0
         for p, sz in zip(params, st["sizes"]):
             p.copy_(flat[off:off + sz].view_as(p).to(p.dtype))
@@ -4343,11 +4433,15 @@ def save_checkpoint(path: Path, model: GPT, meta: dict) -> None:
         # state_dict is bf16 - every parameter is fp32 and the rotary buffers are persistent=False - so this is a
         # no-op there.
         "model_state": {k: (v.detach().cpu().float() if v.dtype == torch.bfloat16 else v.detach().cpu())
-                        for k, v in model.state_dict().items()},
+                        for k, v in model.state_dict().items() if k != "kh"},   # KH: D is folded in (asserted below)
         "model_config": asdict(model.config),
         "meta": meta,
         "forward_knobs": forward_knobs(),
     }
+    if model._kh_slots:
+        # the stacks already hold W_eff (kh_fold_), so dropping D loses nothing - unless the fold was skipped
+        assert not bool(model.kh.detach().ne(0).any()), "KH: save_checkpoint before kh_fold_() would drop a live D"
+        payload["kh"] = dict(slots="".join("qkv"[s] for s in model._kh_slots), folded=True)
     if MUDD:
         # MUDD changes the SCORED forward, so the shape of the model the scorer rebuilds must not depend on the
         # scorer's environment. This key exists only when MUDD is on, so the flag-off payload is unchanged.
@@ -4357,8 +4451,9 @@ def save_checkpoint(path: Path, model: GPT, meta: dict) -> None:
 
 
 def load_for_eval(checkpoint_path: str, device: torch.device) -> nn.Module:
-    global COMPUTE_DTYPE, MUDD, MUDD_CHANNELS, MUDD_DIM, MUDD_MID, MUDD_NORM, MUDD_CAP, MUDD_SITES_ENV
+    global COMPUTE_DTYPE, MUDD, MUDD_CHANNELS, MUDD_DIM, MUDD_MID, MUDD_NORM, MUDD_CAP, MUDD_SITES_ENV, _KH_SLOTS
     COMPUTE_DTYPE = compute_dtype_for(device)
+    _KH_SLOTS = ()        # KH checkpoints store the folded W_eff: the scored model never has D, whatever the env says
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     _saved_knobs = payload.get("forward_knobs")     # .get + None guard keeps pre-v75 checkpoints loadable
     if _saved_knobs is not None and _saved_knobs != forward_knobs():
@@ -4817,6 +4912,11 @@ def main() -> None:
                 p.lerp_(e, EMA_TABLE_BLEND)
         print0(f"tail-EMA blended into the weights for the checkpoint and the evaluation "
                f"({len(ema_params)} tensors at {EMA_BLEND}, {len(ema_tab_params)} tables at {EMA_TABLE_BLEND})")
+    if orig_model._kh_slots:
+        # KH: fold the (blended) D into the (blended) stacks and zero D - the in-process eval and the checkpoint both
+        # see W_eff with T = I, i.e. exactly the model load_for_eval rebuilds with KH off
+        orig_model.kh_fold_()
+        print0("KH folded into the attention stack for the checkpoint and the evaluation")
     checkpoint_path = Path(args.out_dir) / "final.pt"
     budget_elapsed_before_save = time.monotonic() - budget_started
     if rank == 0:

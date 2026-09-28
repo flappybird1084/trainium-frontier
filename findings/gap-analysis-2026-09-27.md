@@ -221,6 +221,14 @@ rate already **0.29%**, so addressing is saturated, not scarce). **Width is load
 and note the sign reversal: the width cut read **−0.00206 at 600 steps** and **+0.0039 at 1800 s**, which is the
 cleanest example in the project of the anti-predictive screen.
 
+**Collision mass, measured 2026-09-28 (whole cached train set, 316 M tokens, 8.74 M distinct pairs, exact shipped
+hash incl. int32 wrap).** The "0.29%" above is an *in-context* rate and understates corpus-level sharing badly:
+36% of token mass sits in a row where other pairs own >50% of the row's traffic (mass-weighted foreign share 0.39;
+72% of mass belongs to its row's majority pair). But a second independent hash cannot fix it: mass dominated in
+**both** of two 2^18 tables is still **28%** (from 36%), because the dominated mass is the tail and at 33 types/row
+the tail is dominated wherever it lands. Summed 2 x 2^17 is worse than today (41% dominated in both). This is the
+mechanism behind `F_V34_BGS2`'s wash; multi-hash addressing (any k, linear combine) is closed.
+
 ### 3.3 The "smaller table, bigger transformer" trade, priced
 
 `S_B1FG` deleted half the table (134.2 M → 67.1 M) and **did not respend** the freed parameters. Respend them
