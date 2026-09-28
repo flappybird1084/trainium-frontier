@@ -105,6 +105,8 @@ forces 520 nearly-empty tiles. Alternatives, optimally packed into 128-distinct 
 | **+ dense top-32** | **11,755** | **15%** |
 | + dense top-64 | 10,432 | 14% |
 
+**[2026-09-28: SHIPPED in v70 (commit 0c534f9, gated -0.00088) as scatter_packed + SCATTER_DENSE_K=32; the live plan is 16,512 slots, ~0.8%% padding, capacity-bound at 128 tiles. Nothing left to win here. The 78.7%% figure below is the OLD scatter_rounds planner.]**
+
 **Bin-packing alone is nearly worthless** — the 520-multiplicity is the binding constraint. Bin-packing *plus*
 a dense path for the ~32 most frequent tokens is what collapses the plan. At the ~4.4 µs/tile implied by the
 measured 12.9 ms embed_scatter (601 tiles x 4 tables = 2,404 tile-tables), this deletes ~2,036 tile-tables =
