@@ -159,11 +159,14 @@ BOS_ID = 8188                   # the fixed tokenizer's <|reserved_0|> (document
 BOS_IGNORE = True
 SINK_INIT = math.log(float(os.environ.get("NEURON_COMPETITION_R1_SINK_INIT", "4.0")))       # softmax-denominator sink logit per (layer, head)
 # BIGRAM_BITS (2026-09-28, dev knob, default 18 = unchanged): rows of the hashed bigram table = 2**BIGRAM_BITS. Both
-# hash sites take (product >> 13) & (rows - 1), i.e. the top 32-13 = 19 bits of the int32 product, so 19 is the ceiling
-# (20 would repeat the sign bit). The table shape is in the state dict, so a mismatched scoring env fails loudly.
+# hash sites take (product >> BIGRAM_SHIFT) & (rows - 1). With the shift at 13 that is the top 32-13 = 19 bits of the
+# int32 product, so 19 is its ceiling (a 20-bit mask would repeat the sign bit). BITS=20 (2026-09-28) alone shifts by 12:
+# bits 12..31, all 20 of the product's high bits; BITS <= 19 keeps the >>13 hash, bit-identical to before. The table
+# shape is in the state dict and the shift is a function of it, so a mismatched scoring env fails loudly.
 BIGRAM_BITS = int(os.environ.get("NEURON_COMPETITION_R1_BIGRAM_BITS", "18"))
-assert 1 <= BIGRAM_BITS <= 19, f"NEURON_COMPETITION_R1_BIGRAM_BITS={BIGRAM_BITS}: the >>13 hash has 19 usable bits"
+assert 1 <= BIGRAM_BITS <= 20, f"NEURON_COMPETITION_R1_BIGRAM_BITS={BIGRAM_BITS}: the int32 hash has at most 20 usable bits"
 BIGRAM_SIZE = 2 ** BIGRAM_BITS
+BIGRAM_SHIFT = 12 if BIGRAM_BITS == 20 else 13
 
 EMBEDDING_LR = 0.30 * 0.71 * 2.0 * _BATCH_LR * 2.25   # v43: x4.5 (was x6.0 in v40-v42; two paired 1800 s gates on the PACK=4 base: -0.0012 each; 3.5 is +0.004 worse)   # embedding LR x6.0 of the 32k-tuned base (was x2.0): Sep 9 sweep on the kernel line
 # EMB_LR_MUL / BTE_LR_MUL (2026-09-28, dev knobs, default 1.0 = unchanged; x*1.0 is exact, so the default lr is the
@@ -4031,7 +4034,7 @@ class GPT(nn.Module):
         # hashed (previous, current) bigram table, int32 multiplicative hash
         prev = torch.cat([torch.full_like(idx[:, :1], BOS_ID), idx[:, :-1]], dim=1)
         pair = prev.to(torch.int32) * 8192 + idx.to(torch.int32)
-        bh = (((pair * -1640531527) >> 13) & (BIGRAM_SIZE - 1)).long()
+        bh = (((pair * -1640531527) >> BIGRAM_SHIFT) & (BIGRAM_SIZE - 1)).long()
 
         if targets is not None:
             idx = idx.clone()                 # compiled graph: inputs saved for backward must not alias each other
@@ -4517,7 +4520,7 @@ class EmbedSidecar:
             ids2 = ids_np.reshape(b, t)
             prev = np.concatenate([np.full((b, 1), BOS_ID, dtype=np.int64), ids2[:, :-1]], axis=1).reshape(-1)
             pair = (prev.astype(np.int32) * np.int32(8192)) + ids_np.astype(np.int32)
-            bh = bigram_bucket(((pair * np.int32(-1640531527)) >> 13).astype(np.int64))
+            bh = bigram_bucket(((pair * np.int32(-1640531527)) >> BIGRAM_SHIFT).astype(np.int64))
             keys["bg"] = bh
         plans = {}
         for kind, ind in keys.items():
