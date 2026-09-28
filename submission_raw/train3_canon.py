@@ -226,6 +226,14 @@ NEST_GAMMA = float(os.environ.get("NEURON_COMPETITION_R1_NEST_GAMMA", "0.99"))
 NEST_START = float(os.environ.get("NEURON_COMPETITION_R1_NEST_START", "0.16"))
 NEST_END = float(os.environ.get("NEURON_COMPETITION_R1_NEST_END", "0.75"))
 _NEST_B = [0.0]            # beta to bake in for the NEXT forward, set by the training loop each step
+# CAUTIOUS_MUON (Cautious Optimizers, Liang et al.): mask the FINAL Muon update u (after Polar Express and the
+# NorMuon row scaling) to the coordinates where u * grad > 0 (grad = this step's raw gradient, not the momentum),
+# rescaled per matrix by numel / (kept + 1). After, not before, orthogonalisation: the sign-agreement guarantee
+# (<u_masked, grad> >= 0) is a property of the applied update, and orthogonalisation reshuffles signs, so a mask on
+# its input guarantees nothing. States (momentum, NorMuon second moment) stay unmasked, as in the paper. The cautious
+# WEIGHT DECAY mask keeps its current definition (sign of the UNMASKED u times w), so this flag moves one thing.
+# Runs inside the fused kernel (muon_cautious_kernel, selected at module level); OFF = the original kernel untouched.
+CAUTIOUS_MUON = os.environ.get("NEURON_COMPETITION_R1_CAUTIOUS_MUON", "0") != "0"
 CANON_LR = float(os.environ.get("NEURON_COMPETITION_R1_CANON_LR", "0.02"))
 CANON_ON = CANON_ATTN_W > 1 or CANON_MLP_W > 1   # these two live INSIDE the fused layer op -> explicit path only
 # ---------------------------------------------------------------------------------------------------------------
@@ -954,9 +962,240 @@ if NKI_AVAILABLE:
                 nisa.dma_copy(dst=w_in[i, p * P:(p + 1) * P, :], src=w)
         return w_out
 
+    @nki.jit
+    def muon_cautious_kernel(w_in: nl.ndarray, g_in: nl.ndarray, mom_in: nl.ndarray, sec_in: nl.ndarray, scal: nl.ndarray,
+                    ns_steps: int = 5, beta2: float = 0.9):
+        """CAUTIOUS_MUON variant of muon_kernel (identical up to the update): the applied update is masked to the
+        coordinates where orth * grad > 0 and its lr rescaled per matrix by numel / (kept + 1); the weight-decay mask
+        still uses the unmasked update. Original docstring: One Muon step for a stack of (n, out, in) fp32 matrices, in place on w / momentum / second moment:
+        momentum + nesterov blend -> Polar Express orthogonalization (bf16, SBUF resident, both X and X^T kept so no
+        transposes are needed inside the iteration) -> second-moment scaling -> masked weight decay update.
+        scal[:, k] = momentum, lr, lr*wd. min(out, in) must be FMAX and max(out, in) a multiple of FMAX."""
+        n, o, i_ = w_in.shape
+        tall = o >= i_
+        m = o if tall else i_
+        k = i_ if tall else o
+        mt, kt, mc = m // P, k // P, m // FMAX
+        ot = o // P
+        w_out = nl.ndarray((n, o, i_), dtype=nl.float32, buffer=nl.shared_hbm)
+        sc = nl.ndarray((P, 4), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=sc, src=scal)
+        ones32 = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(ones32, 1.0)
+        per = n // nl.num_programs(0)
+        for ii in nl.affine_range(per):
+            i = nl.program_id(0) * per + ii
+            # momentum update and nesterov blend, natural layout, bf16 result
+            Gn = []
+            for _j in range(ot):
+                Gn.append(nl.ndarray((P, i_), dtype=nl.bfloat16, buffer=nl.sbuf))
+            one_m = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=one_m, data=sc[:, 0:1], op0=nl.multiply, operand0=-1.0, op1=nl.add, operand1=1.0)
+            for p in range(ot):
+                g = nl.ndarray((P, i_), dtype=nl.float32, buffer=nl.sbuf)
+                mo = nl.ndarray((P, i_), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=g, src=g_in[i, p * P:(p + 1) * P, :])
+                nisa.dma_copy(dst=mo, src=mom_in[i, p * P:(p + 1) * P, :])
+                t1 = nl.ndarray((P, i_), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_scalar(dst=t1, data=g, op0=nl.multiply, operand0=one_m)
+                nisa.scalar_tensor_tensor(dst=mo, data=mo, op0=nl.multiply, operand0=sc[:, 0:1], op1=nl.add, operand1=t1)
+                nisa.dma_copy(dst=mom_in[i, p * P:(p + 1) * P, :], src=mo)
+                nisa.scalar_tensor_tensor(dst=Gn[p], data=mo, op0=nl.multiply, operand0=sc[:, 0:1], op1=nl.add, operand1=t1)
+            # Frobenius prescale
+            sq = nl.ndarray((P, i_), dtype=nl.float32, buffer=nl.sbuf)
+            rowsum = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            part = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(rowsum, 0.0)
+            for p in range(ot):
+                nisa.tensor_tensor(dst=sq, data1=Gn[p], data2=Gn[p], op=nl.multiply)
+                nisa.tensor_reduce(dst=part, op=nl.add, data=sq, axis=(1,))
+                nisa.tensor_tensor(dst=rowsum, data1=rowsum, data2=part, op=nl.add)
+            tot_ps = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=tot_ps, stationary=ones32, moving=rowsum)
+            scale = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.activation(dst=scale, op=nl.sqrt, data=tot_ps)
+            nisa.tensor_scalar(dst=scale, data=scale, op0=nl.multiply, operand0=1.01, op1=nl.add, operand1=1e-6)
+            nisa.reciprocal(dst=scale, data=scale)
+            for p in range(ot):
+                nisa.tensor_scalar(dst=Gn[p], data=Gn[p], op0=nl.multiply, operand0=scale)
+            # tall frame: X (mt tiles of [P, k]) and Xt (kt tiles of [P, m]); one is Gn, the other its transpose
+            X = []
+            Xt = []
+            if tall:
+                X = Gn
+                for _j in range(kt):
+                    Xt.append(nl.ndarray((P, m), dtype=nl.bfloat16, buffer=nl.sbuf))
+                for p in range(mt):
+                    for c in range(kt):
+                        tps = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.psum)
+                        nisa.nc_transpose(dst=tps, data=X[p][:, c * P:(c + 1) * P])
+                        nisa.tensor_copy(dst=Xt[c][:, p * P:(p + 1) * P], src=tps)
+            else:
+                Xt = Gn
+                for _j in range(mt):
+                    X.append(nl.ndarray((P, k), dtype=nl.bfloat16, buffer=nl.sbuf))
+                for c in range(kt):
+                    for p in range(mt):
+                        tps = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.psum)
+                        nisa.nc_transpose(dst=tps, data=Xt[c][:, p * P:(p + 1) * P])
+                        nisa.tensor_copy(dst=X[p][:, c * P:(c + 1) * P], src=tps)
+            for it in range(ns_steps):
+                a = POLAR_EXPRESS_COEFFS[it][0]
+                b = POLAR_EXPRESS_COEFFS[it][1]
+                c = POLAR_EXPRESS_COEFFS[it][2]
+                A = []
+                for _j in range(kt):
+                    A.append(nl.ndarray((P, k), dtype=nl.bfloat16, buffer=nl.sbuf))
+                for r in range(kt):
+                    aps = nl.ndarray((P, k), dtype=nl.float32, buffer=nl.psum)
+                    for p in range(mt):
+                        nisa.nc_matmul(dst=aps, stationary=X[p][:, r * P:(r + 1) * P], moving=X[p], accumulate=(p > 0))
+                    nisa.tensor_copy(dst=A[r], src=aps)
+                B = []
+                for _j in range(kt):
+                    B.append(nl.ndarray((P, k), dtype=nl.bfloat16, buffer=nl.sbuf))
+                for r in range(kt):
+                    a2ps = nl.ndarray((P, k), dtype=nl.float32, buffer=nl.psum)
+                    for q in range(kt):
+                        nisa.nc_matmul(dst=a2ps, stationary=A[q][:, r * P:(r + 1) * P], moving=A[q], accumulate=(q > 0))
+                    bA = nl.ndarray((P, k), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_scalar(dst=bA, data=A[r], op0=nl.multiply, operand0=b)
+                    nisa.scalar_tensor_tensor(dst=B[r], data=a2ps, op0=nl.multiply, operand0=c, op1=nl.add, operand1=bA)
+                Xn = []
+                for _j in range(mt):
+                    Xn.append(nl.ndarray((P, k), dtype=nl.bfloat16, buffer=nl.sbuf))
+                for p in range(mt):
+                    xps = nl.ndarray((P, k), dtype=nl.float32, buffer=nl.psum)
+                    for r in range(kt):
+                        nisa.nc_matmul(dst=xps, stationary=Xt[r][:, p * P:(p + 1) * P], moving=B[r], accumulate=(r > 0))
+                    nisa.scalar_tensor_tensor(dst=Xn[p], data=X[p], op0=nl.multiply, operand0=a, op1=nl.add, operand1=xps)
+                Xtn = []
+                for _j in range(kt):
+                    Xtn.append(nl.ndarray((P, m), dtype=nl.bfloat16, buffer=nl.sbuf))
+                for r in range(kt):
+                    for ch in range(mc):
+                        tps2 = nl.ndarray((P, FMAX), dtype=nl.float32, buffer=nl.psum)
+                        for q in range(kt):
+                            nisa.nc_matmul(dst=tps2, stationary=B[q][:, r * P:(r + 1) * P],
+                                           moving=Xt[q][:, ch * FMAX:(ch + 1) * FMAX], accumulate=(q > 0))
+                        nisa.scalar_tensor_tensor(dst=Xtn[r][:, ch * FMAX:(ch + 1) * FMAX], data=Xt[r][:, ch * FMAX:(ch + 1) * FMAX],
+                                                  op0=nl.multiply, operand0=a, op1=nl.add, operand1=tps2)
+                X, Xt = Xn, Xtn
+            # second-moment scaling (per tall-frame row = reduction over the tall-frame free axis)
+            vmean = []
+            for _j in range(mt):
+                vmean.append(nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf))
+            vsum = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(vsum, 0.0)
+            sqk = nl.ndarray((P, k), dtype=nl.float32, buffer=nl.sbuf)
+            for p in range(mt):
+                nisa.tensor_tensor(dst=sqk, data1=X[p], data2=X[p], op=nl.multiply)
+                nisa.tensor_reduce(dst=vmean[p], op=nl.add, data=sqk, axis=(1,))
+                nisa.tensor_scalar(dst=vmean[p], data=vmean[p], op0=nl.multiply, operand0=1.0 / k)
+                nisa.tensor_tensor(dst=vsum, data1=vsum, data2=vmean[p], op=nl.add)
+            vn_ps = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=vn_ps, stationary=ones32, moving=vsum)
+            vnorm = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=vnorm, data=vn_ps, op0=nl.multiply, operand0=float(k))
+            nisa.activation(dst=vnorm, op=nl.sqrt, data=vnorm)
+            step = []
+            ssum = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(ssum, 0.0)
+            for p in range(mt):
+                sec = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+                if tall:
+                    nisa.dma_copy(dst=sec, src=sec_in[i, p * P:(p + 1) * P, :])
+                else:
+                    nisa.dma_copy(dst=sec, src=sec_in[i, :, p * P:(p + 1) * P].ap(pattern=[[1, P], [1, 1]], offset=0))
+                t2 = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_scalar(dst=t2, data=vmean[p], op0=nl.multiply, operand0=1.0 - beta2)
+                nisa.scalar_tensor_tensor(dst=sec, data=sec, op0=nl.multiply, operand0=beta2, op1=nl.add, operand1=t2)
+                if tall:
+                    nisa.dma_copy(dst=sec_in[i, p * P:(p + 1) * P, :], src=sec)
+                else:
+                    nisa.dma_copy(dst=sec_in[i, :, p * P:(p + 1) * P].ap(pattern=[[1, P], [1, 1]], offset=0), src=sec)
+                st = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_scalar(dst=st, data=sec, op0=nl.maximum, operand0=1e-10)
+                nisa.activation(dst=st, op=nl.rsqrt, data=st)
+                step.append(st)
+                sc2 = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(dst=sc2, data1=st, data2=st, op=nl.multiply)
+                nisa.scalar_tensor_tensor(dst=sc2, data=vmean[p], op0=nl.multiply, operand0=float(k), op1=nl.multiply, operand1=sc2)
+                nisa.tensor_tensor(dst=ssum, data1=ssum, data2=sc2, op=nl.add)
+            sn_ps = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=sn_ps, stationary=ones32, moving=ssum)
+            ratio = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.activation(dst=ratio, op=nl.sqrt, data=sn_ps)
+            nisa.tensor_scalar(dst=ratio, data=ratio, op0=nl.maximum, operand0=1e-10)
+            nisa.reciprocal(dst=ratio, data=ratio)
+            nisa.tensor_tensor(dst=ratio, data1=ratio, data2=vnorm, op=nl.multiply)
+            f_rows = []
+            for p in range(mt):
+                fr = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(dst=fr, data1=step[p], data2=ratio, op=nl.multiply)
+                f_rows.append(fr)
+            if not tall:   # wide: the factor varies along the natural free axis -> broadcast tile via a K=1 matmul
+                f_row = nl.ndarray((1, m), dtype=nl.float32, buffer=nl.sbuf)
+                for p in range(mt):
+                    tp = nl.ndarray((1, P), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_transpose(dst=tp, data=f_rows[p])
+                    nisa.tensor_copy(dst=f_row[:, p * P:(p + 1) * P], src=tp)
+                ones_row = nl.ndarray((1, P), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.memset(ones_row, 1.0)
+                Fb = nl.ndarray((P, m), dtype=nl.float32, buffer=nl.sbuf)
+                for ch in range(mc):
+                    fps = nl.ndarray((P, FMAX), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_matmul(dst=fps, stationary=ones_row, moving=f_row[:, ch * FMAX:(ch + 1) * FMAX])
+                    nisa.tensor_copy(dst=Fb[:, ch * FMAX:(ch + 1) * FMAX], src=fps)
+            # CAUTIOUS pass 1: cm = (orth * grad > 0). sign(orth * f) == sign(orth) because f > 0, so the orthogonalised
+            # bf16 tile stands in for the scaled update. kept count per matrix -> lrc = lr * numel / (kept + 1).
+            Gnat = X if tall else Xt
+            cm = []
+            csum = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(csum, 0.0)
+            cpart = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            for p in range(ot):
+                gr = nl.ndarray((P, i_), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=gr, src=g_in[i, p * P:(p + 1) * P, :])
+                agr = nl.ndarray((P, i_), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(dst=agr, data1=Gnat[p], data2=gr, op=nl.multiply)
+                cmt = nl.ndarray((P, i_), dtype=nl.bfloat16, buffer=nl.sbuf)
+                nisa.tensor_scalar(dst=cmt, data=agr, op0=nl.greater, operand0=0.0)
+                nisa.tensor_reduce(dst=cpart, op=nl.add, data=cmt, axis=(1,))
+                nisa.tensor_tensor(dst=csum, data1=csum, data2=cpart, op=nl.add)
+                cm.append(cmt)
+            cnt_ps = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=cnt_ps, stationary=ones32, moving=csum)
+            lrc = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=lrc, data=cnt_ps, op0=nl.add, operand0=1.0)
+            nisa.reciprocal(dst=lrc, data=lrc)
+            nisa.scalar_tensor_tensor(dst=lrc, data=lrc, op0=nl.multiply, operand0=float(o * i_), op1=nl.multiply, operand1=sc[:, 1:2])
+            # update in the natural frame: g = orth * f ; w -= lrc*g*cm + lr*wd*w*(g*w >= 0)
+            for p in range(ot):
+                w = nl.ndarray((P, i_), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=w, src=w_in[i, p * P:(p + 1) * P, :])
+                gg = nl.ndarray((P, i_), dtype=nl.float32, buffer=nl.sbuf)
+                if tall:
+                    nisa.tensor_scalar(dst=gg, data=Gnat[p], op0=nl.multiply, operand0=f_rows[p])
+                else:
+                    nisa.tensor_tensor(dst=gg, data1=Gnat[p], data2=Fb, op=nl.multiply)
+                prod = nl.ndarray((P, i_), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(dst=prod, data1=gg, data2=w, op=nl.multiply)
+                mask = nl.ndarray((P, i_), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_scalar(dst=mask, data=prod, op0=nl.greater_equal, operand0=0.0)
+                wdm = nl.ndarray((P, i_), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(dst=wdm, data1=w, data2=mask, op=nl.multiply)
+                nisa.tensor_scalar(dst=wdm, data=wdm, op0=nl.multiply, operand0=sc[:, 2:3])
+                nisa.tensor_tensor(dst=gg, data1=gg, data2=cm[p], op=nl.multiply)
+                nisa.scalar_tensor_tensor(dst=gg, data=gg, op0=nl.multiply, operand0=lrc, op1=nl.add, operand1=wdm)
+                nisa.tensor_tensor(dst=w, data1=w, data2=gg, op=nl.subtract)
+                nisa.dma_copy(dst=w_out[i, p * P:(p + 1) * P, :], src=w)
+                nisa.dma_copy(dst=w_in[i, p * P:(p + 1) * P, :], src=w)
+        return w_out
+
     adamw_step_nki = wrap_nki(adamw_kernel)
     adamw_lazy_step_nki = wrap_nki(adamw_lazy_kernel)
-    muon_step_nki = wrap_nki(muon_kernel)
+    muon_step_nki = wrap_nki(muon_cautious_kernel if CAUTIOUS_MUON else muon_kernel)
     attention_fwd_nki = wrap_nki(attention_cte)
     attention_bwd_nki = wrap_nki(attention_bwd)
 
@@ -4321,6 +4560,7 @@ class MuonAdamW(torch.optim.Optimizer):
                 print0(f"NKI Muon kernel unavailable ({str(exc)[:80]}); using the PyTorch step")
 
         mom_t = group["momentum_t"].to(momentum_buffer.dtype)
+        g_raw = g.float().clone() if CAUTIOUS_MUON else None   # this step's gradient (g is lerped in place below)
         momentum_buffer.lerp_(g, 1 - mom_t)
         g = g.lerp_(momentum_buffer, mom_t)
         x = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
@@ -4346,6 +4586,9 @@ class MuonAdamW(torch.optim.Optimizer):
         lr = group["lr_t"] * (max(1.0, shape[-2] / shape[-1]) ** 0.5)
         wd = group["weight_decay"]
         mask = (g * w) >= 0
+        if CAUTIOUS_MUON:   # same math as muon_cautious_kernel: WD mask above uses the UNMASKED update
+            cm = (x.float() * g_raw) > 0
+            g = g * cm * (cm[0].numel() / (cm.sum(dim=(-2, -1), keepdim=True).float() + 1.0))
         w.sub_(lr * g + lr * wd * w * mask)
 
     @torch.no_grad()
