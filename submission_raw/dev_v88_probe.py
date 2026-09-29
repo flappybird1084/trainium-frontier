@@ -3244,12 +3244,8 @@ class GPT(nn.Module):
         return z + bias.float().unsqueeze(-1) * (torch.arange(z.size(-1), device=z.device) == tau.unsqueeze(-1))
 
     def ngram_bias(self, bucket: torch.Tensor) -> torch.Tensor:
-        """theta[bucket] with no gather in the compiled graph: theta as 37 x 37 (zero-padded), bucket = 37 * row + col, a
-        one-hot product picks the row and a one-hot mask the column; bucket -1 (no match) gives exactly 0."""
-        r = torch.arange(37, device=bucket.device, dtype=bucket.dtype)
-        th = F.pad(self.ngram_theta.float(), (0, 37 * 37 - NG_NB)).view(37, 37)
-        a = (torch.div(bucket, 37, rounding_mode="floor").unsqueeze(-1) == r).float() @ th
-        return (a * (torch.remainder(bucket, 37).unsqueeze(-1) == r)).sum(-1)
+        """theta[bucket] as a one-hot product (no gather in the compiled graph); bucket -1 (no match) gives exactly 0."""
+        return (bucket.unsqueeze(-1) == torch.arange(NG_NB, device=bucket.device, dtype=bucket.dtype)).float() @ self.ngram_theta.float()
 
     def fused_linear_cross_entropy(self, x: torch.Tensor, targets: torch.Tensor, tau: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
         """cross_entropy(self.head_logits(x), targets) with ignore_index=-1 and mean reduction, computed by one NKI kernel
