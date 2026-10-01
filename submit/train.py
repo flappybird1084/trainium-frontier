@@ -1,8 +1,9 @@
 """NKI Frontier Round 1 submission (2026-09-07).
 
 GPT-style language model trained from scratch on the provided ClimbMix shards with the fixed tokenizer:
-12 layers x 512 wide, 4 heads, RMSNorm, RoPE, QK-norm, ReLU^2 MLP, learned logit softcap, U-net skips,
-value-embedding tables, a hashed bigram table, document-masked attention with a learned per-head sink, and a
+14 layers x 512 wide, 4 heads, RMSNorm, RoPE, QK-norm, ReLU^2 MLP, learned logit softcap, U-net skips,
+value-embedding tables, a hashed bigram table, document-masked attention with a learned per-head sink and a
+head-wise output gate, a train-split n-gram logit term counted during the run, and a
 Muon (Polar Express) + AdamW optimizer on a fixed 30-minute wall-clock budget.
 
 On Trainium the attention runs on the NKI flash-attention kernels shipped with the environment (with the
@@ -11,11 +12,11 @@ submission (a fused Muon step and a fused AdamW step). Off Trainium (or if a ker
 them falls back to the equivalent plain PyTorch code, so the math is identical on any device.
 
 Notes for review (how the loss relates to the logits the scorer sees):
-  * `GPT.head_logits(x)` is the single definition of this model's output logits (final RMSNorm, lm_head, asymmetric
-    softcap). `GPT.forward(idx)` returns exactly that, and `load_for_eval` returns the same module; that is what
+  * `GPT.head_logits(x, tau, bias)` is the single definition of this model's output logits (final RMSNorm, lm_head,
+    asymmetric softcap, plus the n-gram term below). `GPT.forward(idx)` returns exactly that, and `load_for_eval` returns the same module; that is what
     `evaluate_bpb` scores. Nothing is applied to the logits on one side of training and not the other: no scale, no
-    temperature, no offset, no vocabulary mask. Grep for `head_logits` - there are three call sites and no variants.
-  * `GPT.forward(idx, targets)` returns cross_entropy(head_logits(x), targets). On Trainium it uses
+    temperature, no offset, no vocabulary mask. Grep for `head_logits(` - there are three call sites and no variants.
+  * `GPT.forward(idx, targets)` returns cross_entropy(head_logits(x, tau, bias), targets). On Trainium it uses
     `GPT.fused_linear_cross_entropy`, a memory-saving implementation of that same expression (the (T, V) logits are
     produced 512 columns at a time inside one NKI kernel and consumed by an online log-sum-exp, the way "fused linear
     cross-entropy" / "cut cross-entropy" kernels do), so the fp32 logits never occupy HBM. Its backward recomputes the
@@ -43,6 +44,36 @@ Notes for review (how the loss relates to the logits the scorer sees):
     fp32, which is exact, so `load_for_eval` rebuilds it as the fp32 `nn.Embedding` the model constructs, holding the
     same values. Both paths read it only as looked-up rows in COMPUTE_DTYPE (bf16 on Trainium), so the scored forward
     sees the rows training saw.
+  * Head-wise gated attention is part of the architecture, with one formula on every path: each head's attention
+    output is multiplied by `2 * sigmoid(h[:, :ATTN_GATE] @ W_g)` before the out-projection, where h is the normed
+    attention input, ATTN_GATE = 12 is a literal, and W_g is the `attn_gate` parameter (n_layer, 12, n_head),
+    zero-initialised so the gate is exactly 1 at step 0. `CausalSelfAttention.forward` applies it in PyTorch; on
+    Trainium the fused layer op computes the same product inside pre_attn_fwd_ko (the sigmoid) and post_attn_fwd_h
+    (the multiply). W_g is saved and loaded like every other weight, so the scored forward gates exactly as training did.
+  * N-gram term, one formula on every path. `NgramTable.features(idx)` finds for each position the longest context
+    (orders 3,4,5,6,8,12,16, ending at that position, inside its own row) present in a count table of TRAINING text,
+    and returns that context's most frequent next token tau and an evidence bucket (order, log2 count, top-token
+    share, agreement of shorter orders). Orders 8, 12, 16 hash the context (not the next token) folded (`ng_fold`:
+    each token's bytes lowercased, outer whitespace stripped, digits as 0; built from the tokenizer). `head_logits` adds b = t1 + log(1 + e^t2 / p_tau) to the logit of tau, with
+    (t1, t2) = `ngram_theta[:, bucket]` (2 x 1,365 trained scalars) and p_tau the model's own softmax at tau (t1 = 0
+    is a linear mixture (1 - l) p + l e_tau, l / (1 - l) = e^t2); no match adds exactly 0. Position t reads only tokens <= t of its own row, so the forward stays a
+    pure, causal, row-independent function of the tokens. Training computes the same call on host from the batch (on a
+    thread, during the batch upload) and passes it in as `ng` (keeping the lookup out of the compiled graph); `forward`
+    makes the call itself otherwise.
+  * The table is counted inside this run from the provided train shards only (`ngram_build`, a helper process forked
+    at startup, host CPU, overlapping compilation and training). Nothing is precomputed or shipped, and no validation
+    data is read. The checkpoint stores the table counted from all train row groups (~8.8 GB) and `load_for_eval`
+    rebuilds it from the checkpoint alone. If counting fails the table is empty and the term is 0 everywhere.
+  * Leakage rule (cross-fitting), the same in training and evaluation: a row is only ever looked up in a table that
+    holds nothing of its own document. `make_dataloader` gives worker r the row groups r, r+W, ...; with W even each
+    worker reads one parity of row groups and trains against the table counted from the OTHER parity. Evaluation
+    rows come from the validation shard, which is not among the train shards, so the table counted from all train
+    row groups likewise holds nothing of theirs. Only the table's contents differ (half the train data, then all of
+    it), as the weights differ between steps; without the rule every training row would find itself in the table.
+    With an odd W no table is counted and the term is 0 in training and evaluation.
+  * The fused loss includes the term exactly: head_fwd also returns z at column tau, so p_tau = exp(z_tau - lse), b, and
+    logsumexp(z + b*e_tau) = lse + log1p(p_tau * expm1(b)) follow, and head_bwd takes the gradients of the loss, lse and z_tau.
+    `check_fused_head` runs with an n-gram column on 3/4 of its positions.
   * Inert code, disclosed so it is not mistaken for live behaviour: seven experimental training-side terms are still
     present with their weights fixed at zero - PREFIX_AUX_W, MTP_W1, MTP_W2, NEST_BETA and the three CANON_*_W. Each
     is guarded by a positive-value test at every site (`> 0`, and `> 1` for the three CANON_*_W), so the
@@ -61,11 +92,14 @@ Launch (8 workers; the file derives its per-worker batch from the world size):
 """
 
 import argparse
+import fcntl
 import gc
 import json
 import math
+import multiprocessing
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -75,8 +109,11 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+import pyarrow.parquet as pq
 
 from prepare import (
+    _row_groups_for_split,
     EVAL_TIMEOUT_SECONDS,
     TOKENIZER_VOCAB_SIZE,
     TRAIN_STARTUP_ALLOWANCE_CAP_SECONDS,
@@ -106,7 +143,7 @@ except Exception:
 
 SEQ_LEN = 1024
 PACK = 4
-DEPTH = 12
+DEPTH = 14
 N_EMBD = 512
 N_HEAD = 4
 HEAD_DIM = N_EMBD // N_HEAD
@@ -114,7 +151,7 @@ MLP_RATIO = 6
 TOTAL_BATCH_SIZE = 131072
 DEVICE_BATCH_ROWS = 16
 GLOBAL_LR = 1.0
-LOADER_CPU = False
+LOADER_CPU = True
 NS_STEPS = 5
 VE_T1 = 0
 VE_T2 = 0
@@ -130,7 +167,7 @@ def note_fallback(what: str, exc) -> None:
 _BATCH_LR = (TOTAL_BATCH_SIZE / 32768) ** 0.5 * GLOBAL_LR
 NUM_STEPS = 100000
 MAX_TRAIN_SECONDS = TRAIN_TIME_BUDGET_SECONDS
-CHECKPOINT_RESERVE_SECONDS = 5.0
+CHECKPOINT_RESERVE_SECONDS = 31.0     # the checkpoint carries the ~8.8 GB n-gram table
 WALL_CAP_SECONDS = 2900.0
 WALL_RESERVE_SECONDS = 90.0
 STARTUP_LAUNCH_MARGIN_SECONDS = 30.0
@@ -140,13 +177,25 @@ LOGIT_SOFTCAP = 11.0
 BOS_ID = 8188
 BOS_IGNORE = True
 SINK_INIT = math.log(4.0)
-BIGRAM_SIZE = 2 ** 18
+BIGRAM_SIZE = 2 ** 19               # rows of the hashed bigram table; the >>13 hash of the int32 pair product has 19 usable bits
+# n-gram term (see "Notes for review"): context orders, minimum context count kept, bucket bits per partition
+NG_ORDERS = (3, 4, 5, 6, 8, 12, 16)
+NG_MINC = (2, 2, 2, 1, 1, 1, 1)
+NG_KB = (15, 17, 17, 21, 21, 21, 21)
+NG_PARTS = 8
+NG_NB = len(NG_ORDERS) * 65 * 3     # evidence buckets: order x (13 count bins x 5 share bins) x 3 agreement levels
+NG_LR_MUL = 0.1
 
 EMBEDDING_LR = 0.30 * 0.71 * 2.0 * _BATCH_LR * 2.25
 UNEMBEDDING_LR = 0.006 * 0.71 * _BATCH_LR
 MATRIX_LR = 0.025 * 0.71 * _BATCH_LR * 0.7
 ATTN_SCALE = 0.1
 SCALAR_LR = 0.20 * 0.71 * _BATCH_LR
+# head-wise gated attention: head h's output is scaled by 2 * sigmoid(h_t[:ATTN_GATE] @ W_g[:, h]) before the
+# out-projection, h_t the normed attention input. W_g (n_layer, ATTN_GATE, n_head) starts at zero (gate == 1) and
+# trains in the scalar AdamW group at ATTN_GATE_LR.
+ATTN_GATE = 12
+ATTN_GATE_LR = SCALAR_LR / 10
 WEIGHT_DECAY = 0.10
 WARMUP_STEPS = 50
 ROPE_FRAC = 0.5
@@ -279,40 +328,6 @@ if NKI_AVAILABLE:
     NKI_GRID = (int(get_logical_neuron_cores()),)
 
     @nki.jit
-    def embed_gather(table: nl.ndarray, idx: nl.ndarray):
-        """out[i, :] = table[idx[i], :] (bf16 rows). idx (N, 1) uint32, N % 128 == 0; table (R, C) fp32 in HBM.
-        Indirect DMA (per-partition vector_offset) instead of the graph's one-hot matmul."""
-        N = idx.shape[0]
-        C = table.shape[1]
-        out = nl.ndarray((N, C), dtype=nl.bfloat16, buffer=nl.shared_hbm)
-        for t in nl.affine_range(N // P):
-            ix = nl.ndarray((P, 1), dtype=nl.uint32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=ix, src=idx[t * P:(t + 1) * P, :])
-            rows = nl.ndarray((P, C), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=rows, src=table.ap(pattern=[[C, P], [1, C]], vector_offset=ix, indirect_dim=0))
-            nisa.dma_copy(dst=out[t * P:(t + 1) * P, :], src=rows)
-        return out
-
-    @nki.jit
-    def embed_scatter_add(table: nl.ndarray, grad: nl.ndarray, perm: nl.ndarray, idx: nl.ndarray):
-        """table[idx[s], :] += grad[perm[s], :] for S slots (S % 128 == 0), in place on the fp32 HBM buffer (R+128 rows:
-        the tail takes the padding). Slots in one 128-tile carry distinct indices (host rounds); all indices in bounds."""
-        S = idx.shape[0]
-        C = table.shape[1]
-        out = nl.ndarray((1, C), dtype=table.dtype, buffer=nl.shared_hbm)
-        for t in nl.sequential_range(S // P):
-            pm = nl.ndarray((P, 1), dtype=nl.uint32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=pm, src=perm[t * P:(t + 1) * P, :])
-            ix = nl.ndarray((P, 1), dtype=nl.uint32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=ix, src=idx[t * P:(t + 1) * P, :])
-            rows = nl.ndarray((P, C), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=rows, src=grad.ap(pattern=[[C, P], [1, C]], vector_offset=pm, indirect_dim=0))
-            tgt = table.ap(pattern=[[C, P], [1, C]], vector_offset=ix, indirect_dim=0)
-            nisa.dma_compute(dst=tgt, srcs=[tgt, rows], reduce_op=nl.add)
-        nisa.dma_copy(dst=out, src=table[0:1, :])
-        return out
-
-    @nki.jit
     def embed_gather_v2(table: nl.ndarray, idx: nl.ndarray):
         """embed_gather with every index tile clamped to R-1 through a compute op before it drives the indirect DMA
         (lever E hardening: a stray index reads the last row instead of faulting; the DGE now waits on the index DMA
@@ -363,10 +378,9 @@ if NKI_AVAILABLE:
     def embed_scatter_add_v2_x4(t0: nl.ndarray, t1: nl.ndarray, t2: nl.ndarray, t3: nl.ndarray, g0: nl.ndarray,
                                 g1: nl.ndarray, g2: nl.ndarray, g3: nl.ndarray, perm: nl.ndarray, idx: nl.ndarray):
         """embed_scatter_add_v2 for the four token tables in ONE launch. They are gathered with the same indices,
-        so a single launch per round serves all four and the perm/idx loads and clamps are done once instead of
-        four times: ~150 rounds x 4 tables = ~600 launches per micro-step becomes ~150. The scatter is
-        launch-bound (~21.5 ms of the step), and this is bit-identical to four separate embed_scatter_add_v2
-        calls (verified in the NKI simulator against torch.index_add_ on all four tables)."""
+        so a single launch per plan chunk serves all four and the perm/idx loads and clamps are done once instead
+        of four times: four launches per chunk become one. This is bit-identical to four separate
+        embed_scatter_add_v2 calls (verified in the NKI simulator against torch.index_add_ on all four tables)."""
         S = idx.shape[0]
         Rp = t0.shape[0]
         N = g0.shape[0]
@@ -685,7 +699,7 @@ if NKI_AVAILABLE:
     _HVC = 512
 
     @nki.jit
-    def head_fwd(x_in: nl.ndarray, wT: nl.ndarray, tgt: nl.ndarray, scal: nl.ndarray, eps: float = 0.0078125):
+    def head_fwd(x_in: nl.ndarray, wT: nl.ndarray, tgt: nl.ndarray, scal: nl.ndarray, tau: nl.ndarray, eps: float = 0.0078125):
         T, D = x_in.shape
         V = wT.shape[1]
         kt = D // _NKI_P
@@ -694,6 +708,7 @@ if NKI_AVAILABLE:
         lse_out = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.shared_hbm)
         h_out = nl.ndarray((T, D), dtype=x_in.dtype, buffer=nl.shared_hbm)
         rstd_out = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.shared_hbm)
+        zt_out = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.shared_hbm)
         nprog = nl.num_programs(0)
         tiles = T // _NKI_P
         per = tiles // nprog
@@ -740,10 +755,16 @@ if NKI_AVAILABLE:
             nisa.dma_copy(dst=tgi, src=tgt[t0:t0 + _NKI_P, :])
             tg = nl.ndarray((_NKI_P, 1), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=tg, src=tgi)
+            tai = nl.ndarray((_NKI_P, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=tai, src=tau[t0:t0 + _NKI_P, :])
+            ta = nl.ndarray((_NKI_P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=ta, src=tai)
             s = nl.ndarray((_NKI_P, 1), dtype=nl.float32, buffer=nl.sbuf)
             tl = nl.ndarray((_NKI_P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            zt = nl.ndarray((_NKI_P, 1), dtype=nl.float32, buffer=nl.sbuf)
             nisa.memset(s, 0.0)
             nisa.memset(tl, 0.0)
+            nisa.memset(zt, 0.0)
             for c in range(nchunk):
                 zps = nl.ndarray((_NKI_P, _HVC), dtype=nl.float32, buffer=nl.psum)
                 for i in range(kt):
@@ -770,6 +791,13 @@ if NKI_AVAILABLE:
                 part = nl.ndarray((_NKI_P, 1), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_reduce(dst=part, op=nl.add, data=sel, axis=(1,))
                 nisa.tensor_tensor(dst=tl, data1=tl, data2=part, op=nl.add)
+                tac = nl.ndarray((_NKI_P, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_scalar(dst=tac, data=ta, op0=nl.subtract, operand0=float(c * _HVC))
+                sel2 = nl.ndarray((_NKI_P, _HVC), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.scalar_tensor_tensor(dst=sel2, data=col, op0=nl.equal, operand0=tac, op1=nl.multiply, operand1=zc)
+                part2 = nl.ndarray((_NKI_P, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_reduce(dst=part2, op=nl.add, data=sel2, axis=(1,))
+                nisa.tensor_tensor(dst=zt, data1=zt, data2=part2, op=nl.add)
                 e = nl.ndarray((_NKI_P, _HVC), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.activation(dst=e, op=nl.exp, data=zc, bias=negcap)
                 es = nl.ndarray((_NKI_P, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -785,12 +813,15 @@ if NKI_AVAILABLE:
             nisa.tensor_tensor(dst=lossr, data1=lse, data2=tl, op=nl.subtract)
             nisa.tensor_tensor(dst=lossr, data1=lossr, data2=valid, op=nl.multiply)
             nisa.dma_copy(dst=loss_out[t0:t0 + _NKI_P, :], src=lossr)
-        return loss_out, lse_out, h_out, rstd_out
+            nisa.dma_copy(dst=zt_out[t0:t0 + _NKI_P, :], src=zt)
+        return loss_out, lse_out, h_out, rstd_out, zt_out
 
     @nki.jit
     def head_bwd(h_in: nl.ndarray, rstd_in: nl.ndarray, lse_in: nl.ndarray, dl_in: nl.ndarray, w: nl.ndarray, wT: nl.ndarray,
-                 tgt: nl.ndarray, scal: nl.ndarray):
-        """Backward of head_fwd. h (T, D) bf16 (normed input), rstd/lse/dl (T, 1) fp32 (dl = upstream grad of the per-row loss),
+                 tgt: nl.ndarray, scal: nl.ndarray, tau: nl.ndarray, dlse_in: nl.ndarray, dzt_in: nl.ndarray):
+        """Backward of head_fwd for all three of its value outputs: dl, dlse, dzt (T, 1) fp32 are the upstream grads of
+        the per-row loss, lse and zt, so dz = (dl + dlse) * softmax - dl * [col == tgt] + dzt * [col == tau].
+        h (T, D) bf16 (normed input), rstd/lse (T, 1) fp32,
         w (V, D) bf16, wT (D, V) bf16, tgt (T, 1) int32, scal as in the forward. Returns dx (T, D) bf16 and dW (V, D) fp32.
         Token halves of TH rows are the outer loop; inside, vocab chunks (dW chunk accumulates in PSUM over the half's token
         tiles) and token tiles (z recomputed, dh accumulated in SBUF fp32); the rmsnorm backward closes each half."""
@@ -827,6 +858,10 @@ if NKI_AVAILABLE:
             nlse = nl.ndarray((_NKI_P, th_tiles), dtype=nl.float32, buffer=nl.sbuf)
             tgi = nl.ndarray((_NKI_P, th_tiles), dtype=nl.int32, buffer=nl.sbuf)
             tg = nl.ndarray((_NKI_P, th_tiles), dtype=nl.float32, buffer=nl.sbuf)
+            g1 = nl.ndarray((_NKI_P, th_tiles), dtype=nl.float32, buffer=nl.sbuf)
+            g3 = nl.ndarray((_NKI_P, th_tiles), dtype=nl.float32, buffer=nl.sbuf)
+            tai = nl.ndarray((_NKI_P, th_tiles), dtype=nl.int32, buffer=nl.sbuf)
+            ta = nl.ndarray((_NKI_P, th_tiles), dtype=nl.float32, buffer=nl.sbuf)
             nisa.memset(dh, 0.0)
             for t in range(th_tiles):
                 t0 = base + t * _NKI_P
@@ -838,10 +873,17 @@ if NKI_AVAILABLE:
                 nisa.dma_copy(dst=tgi[:, t:t + 1], src=tgt[t0:t0 + _NKI_P, :])
                 nisa.dma_copy(dst=g[:, t:t + 1], src=dl_in[t0:t0 + _NKI_P, :])
                 nisa.dma_copy(dst=nlse[:, t:t + 1], src=lse_in[t0:t0 + _NKI_P, :])
+                nisa.dma_copy(dst=g1[:, t:t + 1], src=dlse_in[t0:t0 + _NKI_P, :])
+                nisa.dma_copy(dst=g3[:, t:t + 1], src=dzt_in[t0:t0 + _NKI_P, :])
+                nisa.dma_copy(dst=tai[:, t:t + 1], src=tau[t0:t0 + _NKI_P, :])
             nisa.tensor_copy(dst=tg, src=tgi)
+            nisa.tensor_copy(dst=ta, src=tai)
             valid = nl.ndarray((_NKI_P, th_tiles), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_scalar(dst=valid, data=tg, op0=nl.greater_equal, operand0=0.0)
             nisa.tensor_tensor(dst=g, data1=g, data2=valid, op=nl.multiply)
+            nisa.tensor_tensor(dst=g1, data1=g1, data2=valid, op=nl.multiply)
+            nisa.tensor_tensor(dst=g1, data1=g1, data2=g, op=nl.add)
+            nisa.tensor_tensor(dst=g3, data1=g3, data2=valid, op=nl.multiply)
             nisa.tensor_scalar(dst=nlse, data=nlse, op0=nl.multiply, operand0=-1.0)
             for c in range(nchunk):
                 wc = nl.ndarray((_NKI_P, kt, D), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -878,9 +920,12 @@ if NKI_AVAILABLE:
                     pr = nl.ndarray((_NKI_P, _HVC), dtype=nl.float32, buffer=nl.sbuf)
                     nisa.activation(dst=pr, op=nl.exp, data=zc, bias=nlse[:, t:t + 1])
                     eqm = nl.ndarray((_NKI_P, _HVC), dtype=nl.float32, buffer=nl.sbuf)
-                    nisa.tensor_scalar(dst=eqm, data=cm, op0=nl.equal, operand0=tg[:, t:t + 1])
-                    nisa.tensor_tensor(dst=pr, data1=pr, data2=eqm, op=nl.subtract)
-                    nisa.tensor_scalar(dst=pr, data=pr, op0=nl.multiply, operand0=g[:, t:t + 1])
+                    nisa.tensor_scalar(dst=eqm, data=cm, op0=nl.equal, operand0=tg[:, t:t + 1], op1=nl.multiply, operand1=g[:, t:t + 1])
+                    eq2 = nl.ndarray((_NKI_P, _HVC), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_scalar(dst=eq2, data=cm, op0=nl.equal, operand0=ta[:, t:t + 1], op1=nl.multiply, operand1=g3[:, t:t + 1])
+                    pr2 = nl.ndarray((_NKI_P, _HVC), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.scalar_tensor_tensor(dst=pr2, data=pr, op0=nl.multiply, operand0=g1[:, t:t + 1], op1=nl.add, operand1=eq2)
+                    nisa.tensor_tensor(dst=pr, data1=pr2, data2=eqm, op=nl.subtract)
                     dzf = nl.ndarray((_NKI_P, _HVC), dtype=nl.float32, buffer=nl.sbuf)
                     nisa.tensor_tensor(dst=dzf, data1=pr, data2=deriv, op=nl.multiply)
                     dz = nl.ndarray((_NKI_P, _HVC), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -1326,7 +1371,10 @@ if NKI_AVAILABLE:
 
     @nki.jit
     def post_attn_fwd_h(y_in: nl.ndarray, wo: nl.ndarray, xm_in: nl.ndarray, w1: nl.ndarray, w2: nl.ndarray, eps: float = 1e-6, fq: int = 0,
-                        n_head: int = 4, t_len: int = 1024):
+                        n_head: int = 4, t_len: int = 1024, gs_in=None):
+        # ATTN_GATE: gs_in (T, n_head) fp32 = sigmoid(z) from pre_attn_fwd_ko; head h's output is multiplied by 2*gs[:, h]
+        # before the out-projection. y2_out then holds the GATED y (dWo's operand), outT stays UNGATED (the vendor
+        # backward's O). gs_in=None: the ungated kernel.
         T, D = xm_in.shape
         H = w1.shape[0]
         HD = D // n_head
@@ -1396,7 +1444,16 @@ if NKI_AVAILABLE:
                 p0 = (gt - row * tpt) * _NKI_P
                 for hh in range(n_head):
                     nisa.dma_copy(dst=yt[:, hh * HD:(hh + 1) * HD], src=y_in[row * n_head + hh, p0:p0 + _NKI_P, :])
-                nisa.dma_copy(dst=y2_out[t0 + tb * _NKI_P:t0 + (tb + 1) * _NKI_P, :], src=yt)
+                if gs_in is not None:                 # ATTN_GATE: ytg[:, head h] = y[:, head h] * s[:, h] * 2
+                    gtl = nl.ndarray((_NKI_P, n_head), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.dma_copy(dst=gtl, src=gs_in[t0 + tb * _NKI_P:t0 + (tb + 1) * _NKI_P, :])
+                    ytg = nl.ndarray((_NKI_P, D), dtype=nl.bfloat16, buffer=nl.sbuf)
+                    for hh in range(n_head):
+                        nisa.tensor_scalar(dst=ytg[:, hh * HD:(hh + 1) * HD], data=yt[:, hh * HD:(hh + 1) * HD], op0=nl.multiply,
+                                           operand0=gtl[:, hh:hh + 1], op1=nl.multiply, operand1=2.0)
+                    nisa.dma_copy(dst=y2_out[t0 + tb * _NKI_P:t0 + (tb + 1) * _NKI_P, :], src=ytg)
+                else:
+                    nisa.dma_copy(dst=y2_out[t0 + tb * _NKI_P:t0 + (tb + 1) * _NKI_P, :], src=yt)
                 if fq:
                     _fq8(yt)
                 aps = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.psum)
@@ -1405,7 +1462,14 @@ if NKI_AVAILABLE:
                     nisa.nc_transpose(dst=tps, data=yt[:, i * _NKI_P:(i + 1) * _NKI_P])
                     yTi = oTb[i][:, p0:p0 + _NKI_P]
                     nisa.tensor_copy(dst=yTi, src=tps)
-                    nisa.nc_matmul(dst=aps, stationary=yTi, moving=WoT[i], accumulate=(i > 0))
+                    if gs_in is not None:             # ATTN_GATE: the out-projection contracts the GATED transpose
+                        tpg = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.psum)
+                        nisa.nc_transpose(dst=tpg, data=ytg[:, i * _NKI_P:(i + 1) * _NKI_P])
+                        yTg = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.sbuf)
+                        nisa.tensor_copy(dst=yTg, src=tpg)
+                        nisa.nc_matmul(dst=aps, stationary=yTg, moving=WoT[i], accumulate=(i > 0))
+                    else:
+                        nisa.nc_matmul(dst=aps, stationary=yTi, moving=WoT[i], accumulate=(i > 0))
                     if p0 + _NKI_P == t_len:
                         nisa.dma_copy(dst=outT_out[row * n_head + i, :, :], src=oTb[i])
                 xmt = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.sbuf)
@@ -1454,9 +1518,11 @@ if NKI_AVAILABLE:
     @nki.jit
     def pre_attn_fwd_ko(x_in: nl.ndarray, x0_in: nl.ndarray, ve_in: nl.ndarray, wq: nl.ndarray, wk: nl.ndarray, wv: nl.ndarray,
                         cos_in: nl.ndarray, sin_in: nl.ndarray, scal: nl.ndarray, dstart_in: nl.ndarray, n_head: int = 4,
-                        eps: float = 1e-6, t_len: int = 1024, q_scale: float = 1.0, hq: int = 32):
+                        eps: float = 1e-6, t_len: int = 1024, q_scale: float = 1.0, hq: int = 32, wg_in=None):
         """pre_attn_fwd_h (see the vehicle) with the KEY_OFFSET shift applied to k_out inside the kernel (dstart_in (T, 1) fp32).
-        q_out/k_out/v_out (b*n_head, t_len, HD) bf16 (q pre-scaled, k offset), xm (T, D), rq/rk (n_head, T, HD) unshifted."""
+        q_out/k_out/v_out (b*n_head, t_len, HD) bf16 (q pre-scaled, k offset), xm (T, D), rq/rk (n_head, T, HD) unshifted.
+        ATTN_GATE: wg_in (128, n_head) fp32 = W_g zero-padded below row k -> 7th output s = sigmoid(h[:, :128] @ wg_in)
+        (T, n_head) fp32, h the normed attention input (the zero rows add exact zeros). wg_in=None: the ungated kernel."""
         T, D = x_in.shape
         HD = D // n_head
         half = HD // 2
@@ -1471,6 +1537,12 @@ if NKI_AVAILABLE:
         tiles = T // _NKI_P
         sc = nl.ndarray((_NKI_P, 4), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=sc, src=scal)
+        if wg_in is not None:                         # ATTN_GATE: resident bf16 gate weight, gate output (T, n_head)
+            gs_out = nl.ndarray((T, n_head), dtype=nl.float32, buffer=nl.shared_hbm)
+            wgf = nl.ndarray((_NKI_P, n_head), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=wgf, src=wg_in)
+            wgb = nl.ndarray((_NKI_P, n_head), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=wgb, src=wgf)
         ones = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.sbuf)
         nisa.memset(ones, 1.0)
         Sm = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -1535,6 +1607,12 @@ if NKI_AVAILABLE:
                 hTi = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=hTi, src=tps)
                 hT.append(hTi)
+            if wg_in is not None:                     # ATTN_GATE: s = sigmoid(h[:, :128] @ wg) straight off PSUM
+                gps = nl.ndarray((_NKI_P, n_head), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(dst=gps, stationary=hT[0], moving=wgb)
+                sgt = nl.ndarray((_NKI_P, n_head), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.activation(dst=sgt, op=nl.sigmoid, data=gps)
+                nisa.dma_copy(dst=gs_out[t0:t0 + _NKI_P, :], src=sgt)
             qps = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.psum)
             kps = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.psum)
             vps = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.psum)
@@ -1616,6 +1694,8 @@ if NKI_AVAILABLE:
                 vb = nl.ndarray((_NKI_P, HD), dtype=nl.bfloat16, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=vb, src=v[:, c0:c0 + HD])
                 nisa.dma_copy(dst=v_out[row * n_head + hh, p0:p0 + _NKI_P, :], src=vb)
+        if wg_in is not None:
+            return q_out, k_out, v_out, xm_out, rq_out, rk_out, gs_out
         return q_out, k_out, v_out, xm_out, rq_out, rk_out
 
 
@@ -1623,9 +1703,12 @@ if NKI_AVAILABLE:
     def pre_attn_bwd_ko(dq_in: nl.ndarray, dk_in: nl.ndarray, dv_in: nl.ndarray, rq_in: nl.ndarray, rk_in: nl.ndarray,
                         xm_in: nl.ndarray, dx1_in: nl.ndarray, cos_in: nl.ndarray, sin_in: nl.ndarray, dstart_in: nl.ndarray,
                         wq: nl.ndarray, wk: nl.ndarray, wv: nl.ndarray, n_head: int = 4, eps: float = 1e-6,
-                        scale: float = 1.0, hq: int = 32):
+                        scale: float = 1.0, hq: int = 32, dz_in=None, wgT_in=None):
         """pre_attn_bwd (nki_pre_bwd.py) with the key-offset backward folded in: dstart_in (T, 1) fp32 replaces dksh_in;
-        g[p, hq:2hq] = dk[p+1, hq:2hq] * (1 - dstart[p+1]) (0 at the last position of a sequence row). Tiles run in reverse."""
+        g[p, hq:2hq] = dk[p+1, hq:2hq] * (1 - dstart[p+1]) (0 at the last position of a sequence row). Tiles run in reverse.
+        ATTN_GATE: dz_in (T, n_head) fp32 = dL/dz of the gate pre-activation, wgT_in (128, D) bf16 = W_g^T zero-padded
+        (row r < n_head = gate column r). dz @ W_g^T joins the dgrad chain in PSUM ahead of the rmsnorm backward, and a
+        6th output dwg (128, n_head) fp32 = h[:, :128]^T dz (rows >= k are dropped by the caller)."""
         T, D = xm_in.shape
         BH, t, HD = dq_in.shape
         half = HD // 2
@@ -1678,6 +1761,15 @@ if NKI_AVAILABLE:
         _wk = []
         _wv = []
         _wh = []
+        _wz = []
+        if dz_in is not None:                         # ATTN_GATE: resident W_g^T, dW_g accumulator, zero-padded dz tile
+            dwg_out = nl.ndarray((_NKI_P, n_head), dtype=nl.float32, buffer=nl.shared_hbm)
+            WgT = nl.ndarray((_NKI_P, D), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=WgT, src=wgT_in)
+            accg = nl.ndarray((_NKI_P, n_head), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(accg, 0.0)
+            dzpad = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.memset(dzpad, 0.0)
         for tbi in range(tiles):
             tb = tiles - 1 - tbi
             t0 = tb * _NKI_P
@@ -1798,6 +1890,18 @@ if NKI_AVAILABLE:
                     else:
                         nisa.nc_matmul(dst=dh_ps, stationary=aT, moving=Wv[o], accumulate=(not first))
                     first = False
+            if dz_in is not None:                     # ATTN_GATE: dh[:, :k] += dz @ W_g^T (13th matmul of the chain)
+                dzf = nl.ndarray((_NKI_P, n_head), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=dzf, src=dz_in[t0:t0 + _NKI_P, :])
+                dzb = nl.ndarray((_NKI_P, n_head), dtype=nl.bfloat16, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=dzb, src=dzf)
+                nisa.tensor_copy(dst=dzpad[:, 0:n_head], src=dzf)
+                tzp = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.psum)
+                nisa.nc_transpose(dst=tzp, data=dzpad)
+                dzT = nl.ndarray((_NKI_P, _NKI_P), dtype=nl.bfloat16, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=dzT, src=tzp)
+                nisa.nc_matmul(dst=dh_ps, stationary=dzT, moving=WgT, accumulate=True)
+                _wz.append(dzb)
             dh = nl.ndarray((_NKI_P, D), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=dh, src=dh_ps)
             nisa.tensor_tensor(dst=sq, data1=dh, data2=xm, op=nl.multiply)
@@ -1834,54 +1938,26 @@ if NKI_AVAILABLE:
                     for _i in range(len(_wq)):
                         nisa.nc_matmul(dst=wps3, stationary=_wv[_i][:, o * _NKI_P:(o + 1) * _NKI_P], moving=_wh[_i], accumulate=(_i > 0))
                     nisa.tensor_tensor(dst=accv[o], data1=accv[o], data2=wps3, op=nl.add)
+                if dz_in is not None:                 # ATTN_GATE: dW_g[:128] += sum over the group of h[:, :128]^T dz
+                    gwp = nl.ndarray((_NKI_P, n_head), dtype=nl.float32, buffer=nl.psum)
+                    for _i in range(len(_wz)):
+                        nisa.nc_matmul(dst=gwp, stationary=_wh[_i][:, 0:_NKI_P], moving=_wz[_i], accumulate=(_i > 0))
+                    nisa.tensor_tensor(dst=accg, data1=accg, data2=gwp, op=nl.add)
                 _wq = []
                 _wk = []
                 _wv = []
                 _wh = []
+                _wz = []
         for o in range(kt):
             nisa.dma_copy(dst=dwq_out[o * _NKI_P:(o + 1) * _NKI_P, :], src=accq[o])
             nisa.dma_copy(dst=dwk_out[o * _NKI_P:(o + 1) * _NKI_P, :], src=acck[o])
             nisa.dma_copy(dst=dwv_out[o * _NKI_P:(o + 1) * _NKI_P, :], src=accv[o])
+        if dz_in is not None:
+            nisa.dma_copy(dst=dwg_out, src=accg)
+            return dxm_out, gv_out, dwq_out, dwk_out, dwv_out, dwg_out
         return dxm_out, gv_out, dwq_out, dwk_out, dwv_out
 
     _HVC = 512
-
-    @nki.jit
-    def rope_kernel(x_in: nl.ndarray, cos_in: nl.ndarray, sin_in: nl.ndarray, n_head: int, sign: float = 1.0) -> nl.ndarray:
-        rows, hd = x_in.shape
-        t, d2 = cos_in.shape
-        d = hd // n_head
-        out = nl.ndarray((rows, hd), dtype=x_in.dtype, buffer=nl.shared_hbm)
-        tiles = rows // _NKI_P
-        tpt = t // _NKI_P
-        nprog = nl.num_programs(0)
-        per = tiles // nprog
-        for ii in nl.affine_range(per):
-            i = nl.program_id(0) * per + ii
-            ti = i % tpt
-            x = nl.ndarray((_NKI_P, hd), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=x, src=x_in[i * _NKI_P:(i + 1) * _NKI_P, :])
-            cs = nl.ndarray((_NKI_P, d2), dtype=nl.float32, buffer=nl.sbuf)
-            sn = nl.ndarray((_NKI_P, d2), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=cs, src=cos_in[ti * _NKI_P:(ti + 1) * _NKI_P, :])
-            nisa.dma_copy(dst=sn, src=sin_in[ti * _NKI_P:(ti + 1) * _NKI_P, :])
-            if sign < 0:
-                nisa.tensor_scalar(dst=sn, data=sn, op0=nl.multiply, operand0=-1.0)
-            o = nl.ndarray((_NKI_P, hd), dtype=nl.float32, buffer=nl.sbuf)
-            t1 = nl.ndarray((_NKI_P, d2), dtype=nl.float32, buffer=nl.sbuf)
-            t2 = nl.ndarray((_NKI_P, d2), dtype=nl.float32, buffer=nl.sbuf)
-            for h in range(n_head):
-                a = h * d
-                x1 = x[:, a:a + d2]
-                x2 = x[:, a + d2:a + d]
-                nisa.tensor_tensor(dst=t1, data1=x1, data2=cs, op=nl.multiply)
-                nisa.tensor_tensor(dst=t2, data1=x2, data2=sn, op=nl.multiply)
-                nisa.tensor_tensor(dst=o[:, a:a + d2], data1=t1, data2=t2, op=nl.add)
-                nisa.tensor_tensor(dst=t1, data1=x2, data2=cs, op=nl.multiply)
-                nisa.tensor_tensor(dst=t2, data1=x1, data2=sn, op=nl.multiply)
-                nisa.tensor_tensor(dst=o[:, a + d2:a + d], data1=t1, data2=t2, op=nl.subtract)
-            nisa.dma_copy(dst=out[i * _NKI_P:(i + 1) * _NKI_P, :], src=o)
-        return out
 
     @nki.jit
     def mlp_fwd(x_in: nl.ndarray, w1: nl.ndarray, w2: nl.ndarray):
@@ -2414,7 +2490,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = StackedLinear(registry, config.n_embd, config.n_embd)
         self.c_proj = StackedLinear(registry, config.n_embd, config.n_embd)
 
-    def forward(self, x, ve, cos, sin, sink, dense_mask=None, bounds=None, doc_start=None):
+    def forward(self, x, ve, cos, sin, sink, gw, dense_mask=None, bounds=None, doc_start=None):
         b, t, c = x.shape
         q = self.c_q(x).view(b, t, self.n_head, self.head_dim)
         k = self.c_k(x).view(b, t, self.n_head, self.head_dim)
@@ -2440,6 +2516,9 @@ class CausalSelfAttention(nn.Module):
             p = torch.exp(scores - lse)
             gate = 1.0 - torch.sigmoid(sink.float().view(1, self.n_head, 1, 1) - lse)
             y = ((p @ v.float()) * gate).to(v.dtype)
+        # ATTN_GATE: head h scaled by 2 * sigmoid(x[:, :k] @ W_g[:, h]); x is the normed attention input
+        g = 2.0 * torch.sigmoid(x[..., :gw.shape[0]].float() @ gw.float())           # (b, t, n_head)
+        y = (y.float() * g.transpose(1, 2).unsqueeze(-1)).to(y.dtype)
         y = y.transpose(1, 2).contiguous().view(b, t, c)
         return self.c_proj(y)
 
@@ -2469,24 +2548,6 @@ def build_nki_norm():
 
     _NKI_NORM = (wrap_nki(rmsnorm_fwd), wrap_nki(rmsnorm_bwd), (int(get_logical_neuron_cores()),))
     return _NKI_NORM
-
-
-_NKI_ROPE = None
-
-
-def build_nki_rope():
-    """Fused split-half RoPE (dev copy: nki_rope.py): one launch per q/k instead of ~9 eager ops; backward = same rotation
-    with -sin. Eager Neuron only (a kernel inside a compiled graph partitions the NEFF, S_NKI3 2026-09-06)."""
-    global _NKI_ROPE
-    if _NKI_ROPE is not None:
-        return _NKI_ROPE
-    if not NKI_AVAILABLE:
-        raise RuntimeError("NKI is not available on this device")
-    from torch_neuronx.nki_hop import wrap_nki
-    from torch_neuronx.utils import get_logical_neuron_cores
-
-    _NKI_ROPE = (wrap_nki(rope_kernel), (int(get_logical_neuron_cores()),))
-    return _NKI_ROPE
 
 
 _NKI_MLP = None
@@ -2563,23 +2624,28 @@ def build_layer_ops(n_head: int):
         dq, dk, dv = (r.transpose(-2, -1).contiguous() for r in res[:3])
         return dq, dk, dv, res[3].float().sum(dim=0)
 
+    # ATTN_GATE: extra input wg (128, NH) fp32 (W_g zero-padded below row ATTN_GATE); extra saved output
+    # gs = sigmoid(z) (T, NH) fp32. The gated head output is y_g = 2 * gs * O, O the attention output.
     @nki_op("tf_nki::layer_fwd", mutates_args={})
     def layer_fwd(x2: torch.Tensor, x02: torch.Tensor, ve2: torch.Tensor, cos_full: torch.Tensor, sin_full: torch.Tensor,
                   cos2d: torch.Tensor, sin2d: torch.Tensor, scal: torch.Tensor, sink: torch.Tensor, start: torch.Tensor,
                   end: torch.Tensor, dstart: torch.Tensor, wq: torch.Tensor, wk: torch.Tensor, wv: torch.Tensor, wo: torch.Tensor,
-                  w1: torch.Tensor, w2: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-                                                               torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-                                                               torch.Tensor, torch.Tensor, torch.Tensor]:
+                  w1: torch.Tensor, w2: torch.Tensor, wg: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                                                                                torch.Tensor, torch.Tensor, torch.Tensor,
+                                                                                torch.Tensor, torch.Tensor, torch.Tensor,
+                                                                                torch.Tensor, torch.Tensor, torch.Tensor,
+                                                                                torch.Tensor, torch.Tensor]:
         NH = _LAYER_NH; T, D = x2.shape; HD = D // NH; b = start.shape[0]; t = T // b
         scale = ATTN_SCALE
-        qh, kh, vh, xm, rq, rk = pre_ko[grid](x2, x02, ve2, wq, wk, wv, cos_full, sin_full, scal, dstart.reshape(T, 1),
-                                              n_head=NH, eps=eps, t_len=t, q_scale=scale, hq=HD // KEY_OFFSET_DIV)
+        qh, kh, vh, xm, rq, rk, gs = pre_ko[grid](x2, x02, ve2, wq, wk, wv, cos_full, sin_full, scal, dstart.reshape(T, 1),
+                                                  n_head=NH, eps=eps, t_len=t, q_scale=scale, hq=HD // KEY_OFFSET_DIV,
+                                                  wg_in=wg.contiguous())
         q4 = qh.view(b, NH, t, HD)
         k4 = kh.view(b, NH, t, HD)
         v4 = vh.view(b, NH, t, HD)
         out, neg_max, recip = attn_fwd(q4, k4, v4, sink, start, end)
-        o, x1, preT, y2, outT = post_kh[grid](out.reshape(b * NH, t, HD), wo, xm, w1, w2, eps=eps, n_head=NH, t_len=t)
-        return o, xm, rq, rk, q4, k4, v4, outT, neg_max, recip, y2, x1, preT
+        o, x1, preT, y2, outT = post_kh[grid](out.reshape(b * NH, t, HD), wo, xm, w1, w2, eps=eps, n_head=NH, t_len=t, gs_in=gs)
+        return o, xm, rq, rk, q4, k4, v4, outT, neg_max, recip, y2, x1, preT, gs
 
     @nki_op("tf_nki::layer_bwd", mutates_args={})
     def layer_bwd(dout2: torch.Tensor, x2: torch.Tensor, x02: torch.Tensor, ve2: torch.Tensor, xm: torch.Tensor, rq: torch.Tensor,
@@ -2587,38 +2653,45 @@ def build_layer_ops(n_head: int):
                   recip: torch.Tensor, y2: torch.Tensor, x1: torch.Tensor, preT: torch.Tensor, cos2d: torch.Tensor,
                   sin2d: torch.Tensor, sink: torch.Tensor, start: torch.Tensor, end: torch.Tensor, dstart: torch.Tensor,
                   wq: torch.Tensor, wk: torch.Tensor, wv: torch.Tensor, wo: torch.Tensor, w1: torch.Tensor,
-                  w2: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-                                             torch.Tensor, torch.Tensor, torch.Tensor]:
+                  w2: torch.Tensor, wg: torch.Tensor, gs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                                                                                 torch.Tensor, torch.Tensor, torch.Tensor,
+                                                                                 torch.Tensor, torch.Tensor, torch.Tensor,
+                                                                                 torch.Tensor]:
         NH = _LAYER_NH; T, D = x2.shape; HD = D // NH; b = start.shape[0]; t = T // b
         scale = ATTN_SCALE
         d2 = dout2.to(bf).contiguous()
         h2 = nfwd[grid](x1, eps=eps)
         dh2, dW1p, dW2p = mlp_bwd_k[grid](h2, d2, preT, w1, w2)
         dx1 = d2 + nbwd[grid](x1, dh2.contiguous(), eps=eps)
-        dy2 = F.linear(dx1, wo.t())
+        dy2 = F.linear(dx1, wo.t())               # dL/dy_g (token-major); y2 holds y_g, so dWo is unchanged in form
         dWo = dx1.t() @ y2
-        dyT4 = dy2.to(q4.dtype).view(b, t, NH, HD).permute(0, 2, 3, 1).contiguous()
+        # y_g = 2 s O:  dL/dz = sum_d dy_g * O * 2 s (1 - s) = (1 - s) * sum_d dy_g * y_g   (no division by s)
+        #               dL/dO = 2 s * dy_g   (what the vendor backward consumes; outT is the UNGATED O)
+        dyg = dy2.float().view(T, NH, HD)
+        dz = ((dyg * y2.float().view(T, NH, HD)).sum(-1) * (1.0 - gs)).contiguous()
+        dyT4 = (dyg * (2.0 * gs).unsqueeze(-1)).to(q4.dtype).view(b, t, NH, HD).permute(0, 2, 3, 1).contiguous()
         dq4, dk4, dv4, dsink = attn_bwd(q4, k4, v4, outT, dyT4, neg_max, recip, sink, start, end)
         cos_full = cos2d.repeat(b, 1).contiguous(); sin_full = sin2d.repeat(b, 1).contiguous()
         HQ = HD // KEY_OFFSET_DIV
-        dxm, gv2, dWq, dWk, dWv = pre_bwd_k[grid](dq4.reshape(b * NH, t, HD).contiguous(), dk4.reshape(b * NH, t, HD).contiguous(),
-                                                 dv4.reshape(b * NH, t, HD).contiguous(), rq.contiguous(), rk.contiguous(),
-                                                 xm.contiguous(), dx1.contiguous(), cos_full, sin_full, dstart.reshape(T, 1), wq, wk, wv,
-                                                 n_head=NH, eps=eps, scale=scale, hq=HQ)
-        return dxm, gv2, dWq, dWk, dWv, dWo, dW1p.sum(0), dW2p.sum(0), dsink
+        wgT = F.pad(wg.t(), (0, D - wg.shape[0], 0, 128 - NH)).to(bf).contiguous()   # (128, D): row r = W_g[:, r]
+        dxm, gv2, dWq, dWk, dWv, dwg = pre_bwd_k[grid](dq4.reshape(b * NH, t, HD).contiguous(), dk4.reshape(b * NH, t, HD).contiguous(),
+                                                      dv4.reshape(b * NH, t, HD).contiguous(), rq.contiguous(), rk.contiguous(),
+                                                      xm.contiguous(), dx1.contiguous(), cos_full, sin_full, dstart.reshape(T, 1), wq, wk, wv,
+                                                      n_head=NH, eps=eps, scale=scale, hq=HQ, dz_in=dz, wgT_in=wgT)
+        return dxm, gv2, dWq, dWk, dWv, dWo, dW1p.sum(0), dW2p.sum(0), dsink, dwg
 
     def setup_context(ctx, inputs, output):
-        x2, x02, ve2, cos_full, sin_full, cos2d, sin2d, scal, sink, start, end, dstart, wq, wk, wv, wo, w1, w2 = inputs
-        o, xm, rq, rk, q4, k4, v4, outT, neg_max, recip, y2, x1, preT = output
-        ctx.save_for_backward(x2, x02, ve2, cos2d, sin2d, scal, sink, start, end, dstart, wq, wk, wv, wo, w1, w2,
-                              xm, rq, rk, q4, k4, v4, outT, neg_max, recip, y2, x1, preT)
+        x2, x02, ve2, cos_full, sin_full, cos2d, sin2d, scal, sink, start, end, dstart, wq, wk, wv, wo, w1, w2, wg = inputs
+        o, xm, rq, rk, q4, k4, v4, outT, neg_max, recip, y2, x1, preT, gs = output
+        ctx.save_for_backward(x2, x02, ve2, cos2d, sin2d, scal, sink, start, end, dstart, wq, wk, wv, wo, w1, w2, wg,
+                              xm, rq, rk, q4, k4, v4, outT, neg_max, recip, y2, x1, preT, gs)
 
     def backward(ctx, dout2, *_unused):
-        (x2, x02, ve2, cos2d, sin2d, scal, sink, start, end, dstart, wq, wk, wv, wo, w1, w2,
-         xm, rq, rk, q4, k4, v4, outT, neg_max, recip, y2, x1, preT) = ctx.saved_tensors
-        dxm, gv2, dWq, dWk, dWv, dWo, dW1, dW2, dsink = torch.ops.tf_nki.layer_bwd(
+        (x2, x02, ve2, cos2d, sin2d, scal, sink, start, end, dstart, wq, wk, wv, wo, w1, w2, wg,
+         xm, rq, rk, q4, k4, v4, outT, neg_max, recip, y2, x1, preT, gs) = ctx.saved_tensors
+        dxm, gv2, dWq, dWk, dWv, dWo, dW1, dW2, dsink, dwg = torch.ops.tf_nki.layer_bwd(
             dout2, x2, x02, ve2, xm, rq, rk, q4, k4, v4, outT, neg_max, recip, y2, x1, preT, cos2d, sin2d, sink, start, end,
-            dstart, wq, wk, wv, wo, w1, w2)
+            dstart, wq, wk, wv, wo, w1, w2, wg, gs)
         resid = scal[0:1, 0:1]; x0l = scal[0:1, 1:2]; vel = scal[0:1, 2:3]
         dxf = dxm.float()
         dx2 = (dxf * resid).to(x2.dtype); dx02 = (dxf * x0l).to(x02.dtype); dve2 = (gv2.float() * vel).to(ve2.dtype)
@@ -2626,7 +2699,8 @@ def build_layer_ops(n_head: int):
         row0 = torch.stack([d_resid, d_x0, d_ve, torch.zeros((), device=scal.device, dtype=torch.float32)]).view(1, 4)
         dscal = torch.cat([row0, torch.zeros((127, 4), device=scal.device, dtype=torch.float32)], dim=0)
         return (dx2, dx02, dve2, None, None, None, None, dscal, dsink.to(sink.dtype), None, None, None,
-                dWq.to(wq.dtype), dWk.to(wk.dtype), dWv.to(wv.dtype), dWo.to(wo.dtype), dW1.to(w1.dtype), dW2.to(w2.dtype))
+                dWq.to(wq.dtype), dWk.to(wk.dtype), dWv.to(wv.dtype), dWo.to(wo.dtype), dW1.to(w1.dtype), dW2.to(w2.dtype),
+                dwg.to(wg.dtype))
 
     torch.library.register_autograd("tf_nki::layer_fwd", backward, setup_context=setup_context)
     _LAYER_OPS = (torch.ops.tf_nki.layer_fwd, torch.ops.tf_nki.layer_bwd)
@@ -2647,30 +2721,33 @@ def build_head_ops():
     kf, kb = wrap_nki(head_fwd), wrap_nki(head_bwd)
 
     @nki_op("tf_nki::head_fwd", mutates_args={})
-    def hfwd(x2: torch.Tensor, wT: torch.Tensor, tgt: torch.Tensor, scal: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        loss, lse, h, rstd = kf[grid](x2, wT, tgt, scal)
-        return loss, lse, h, rstd
+    def hfwd(x2: torch.Tensor, wT: torch.Tensor, tgt: torch.Tensor, scal: torch.Tensor,
+             tau: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        loss, lse, h, rstd, zt = kf[grid](x2, wT, tgt, scal, tau)
+        return loss, lse, h, rstd, zt
 
     @nki_op("tf_nki::head_bwd", mutates_args={})
     def hbwd(h: torch.Tensor, rstd: torch.Tensor, lse: torch.Tensor, dl: torch.Tensor, w: torch.Tensor, wT: torch.Tensor,
-             tgt: torch.Tensor, scal: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        dx, dw, dcap = kb[grid](h, rstd, lse, dl, w, wT, tgt, scal)
+             tgt: torch.Tensor, scal: torch.Tensor, tau: torch.Tensor, dlse: torch.Tensor,
+             dzt: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        dx, dw, dcap = kb[grid](h, rstd, lse, dl, w, wT, tgt, scal, tau, dlse, dzt)
         return dx, dw, dcap
 
     def setup_context(ctx, inputs, output):
-        x2, wT, tgt, scal = inputs
-        loss, lse, h, rstd = output
-        ctx.save_for_backward(wT, tgt, scal, lse, h, rstd)
+        x2, wT, tgt, scal, tau = inputs
+        loss, lse, h, rstd, zt = output
+        ctx.save_for_backward(wT, tgt, scal, lse, h, rstd, tau)
         ctx.x_dtype = x2.dtype
 
-    def backward(ctx, dloss, _dlse, _dh, _drstd):
-        wT, tgt, scal, lse, h, rstd = ctx.saved_tensors
+    def backward(ctx, dloss, dlse, _dh, _drstd, dzt):
+        wT, tgt, scal, lse, h, rstd, tau = ctx.saved_tensors
         w = wT.t().contiguous()
-        dx, dw, dcap = torch.ops.tf_nki.head_bwd(h, rstd, lse, dloss.float().contiguous(), w, wT, tgt, scal)
+        g = [torch.zeros_like(lse) if d is None else d.float().contiguous() for d in (dloss, dlse, dzt)]
+        dx, dw, dcap = torch.ops.tf_nki.head_bwd(h, rstd, lse, g[0], w, wT, tgt, scal, tau, g[1], g[2])
         dcap = dcap.sum(0)
         row0 = torch.stack([dcap[0], dcap[1], torch.zeros((), device=scal.device), torch.zeros((), device=scal.device)]).view(1, 4)
         dscal = torch.cat([row0, torch.zeros((127, 4), device=scal.device, dtype=torch.float32)], dim=0)
-        return dx.to(ctx.x_dtype), dw.t().to(wT.dtype), None, dscal
+        return dx.to(ctx.x_dtype), dw.t().to(wT.dtype), None, dscal, None
 
     torch.library.register_autograd("tf_nki::head_fwd", backward, setup_context=setup_context)
     _HEAD_OPS = (torch.ops.tf_nki.head_fwd, torch.ops.tf_nki.head_bwd)
@@ -2680,7 +2757,7 @@ FUSED_LOSS_TOL = 0.02                 # relative bound on |fused - reference|; b
 FUSED_HEAD_CHECK_STEP = 50            # the head check needs a TRAINED head (see check_fused_head)
 
 
-def check_fused_loss(model: "GPT", x: torch.Tensor, y: torch.Tensor, emb) -> None:
+def check_fused_loss(model: "GPT", x: torch.Tensor, y: torch.Tensor, emb, ng) -> None:
     """Evaluate the training loss both ways on one real batch - the fused NKI kernel and cross_entropy(head_logits(x), y)
     in plain PyTorch - print both, and disable the fused path if they disagree. Runs once, at step 0.
 
@@ -2697,7 +2774,7 @@ def check_fused_loss(model: "GPT", x: torch.Tensor, y: torch.Tensor, emb) -> Non
         return
     with torch.no_grad():
         try:
-            fused = model(x, y, emb=emb)
+            fused = model(x, y, emb=emb, ng=ng)
         except Exception as exc:
             model._fused_loss_ok = False
             note_fallback("fused loss -> cross_entropy(head_logits) (the fused path raised in its own check)", exc)
@@ -2705,7 +2782,7 @@ def check_fused_loss(model: "GPT", x: torch.Tensor, y: torch.Tensor, emb) -> Non
             return
         model._fused_loss_ok = False
         try:
-            explicit = model(x, y, emb=emb)
+            explicit = model(x, y, emb=emb, ng=ng)
         except Exception as exc:
             model._fused_loss_ok = True
             print0(f"fused-loss check: the REFERENCE path raised ({str(exc)[:160]}); the fused path is KEPT, UNCHECKED")
@@ -2720,7 +2797,7 @@ def check_fused_loss(model: "GPT", x: torch.Tensor, y: torch.Tensor, emb) -> Non
 
 def check_fused_head(model: "GPT", rows: int, seq_len: int, device: torch.device) -> None:
     """The check with teeth: compare `GPT.fused_linear_cross_entropy(h, t)` against
-    `F.cross_entropy(GPT.head_logits(h), t)` on a TRAINED head and a hidden state built to saturate the softcap.
+    `F.cross_entropy(GPT.head_logits(h, tau, bias), t)` on a TRAINED head and a hidden state built to saturate the softcap.
 
     Three deliberate choices, each fixing a blind spot of the step-0 check above:
       * it runs at step FUSED_HEAD_CHECK_STEP, not at step 0, so `lm_head` has been trained and the logits are large
@@ -2743,8 +2820,11 @@ def check_fused_head(model: "GPT", rows: int, seq_len: int, device: torch.device
             (rows * seq_len, W.shape[1]), generator=g, dtype=torch.float32).to(device).to(COMPUTE_DTYPE)
         h = h.reshape(rows, seq_len, W.shape[1])
         tgt = torch.where(torch.arange(seq_len, device=device).view(1, -1) % 8 == 0, -1, tgt)
-        fused = model.fused_linear_cross_entropy(h, tgt)
-        logits = model.head_logits(h)
+        u = torch.rand((rows, seq_len), generator=g)       # an n-gram column on 3/4 of positions, on the target for half
+        tau = torch.where(u < 0.5, tgt.cpu().clamp_min(0), torch.randint(0, V, (rows, seq_len), generator=g)).to(device)
+        bias = torch.stack([torch.where(u < 0.75, 6.0 * u - 3, 0.0), torch.where(u < 0.75, 4 * u - 2, -1e4)], -1).to(device)
+        fused = model.fused_linear_cross_entropy(h, tgt, tau, bias)
+        logits = model.head_logits(h, tau, bias)
         ref = F.cross_entropy(logits.reshape(-1, logits.size(-1)), tgt.reshape(-1), ignore_index=-1)
         cap = logits.abs().max().item()
         diff = (fused - ref).abs().item()
@@ -2811,7 +2891,7 @@ class Block(nn.Module):
                 _p[0] = 1.0
                 setattr(self, _nm, nn.Parameter(_p))
 
-    def forward(self, x, x0, ve, cos, sin, resid_lambda, x0_lambda, ve_lambda, sink, dense_mask, bounds, doc_start=None,
+    def forward(self, x, x0, ve, cos, sin, resid_lambda, x0_lambda, ve_lambda, sink, gw, dense_mask, bounds, doc_start=None,
                 rope_tabs=None, wviews=None):
         if CANON_PRE_W > 1:
             x = canon_conv(x, self.canon_p, doc_start)
@@ -2830,19 +2910,225 @@ class Block(nn.Module):
             scal = torch.stack([resid_lambda.reshape(()), x0_lambda.reshape(()), ve_lambda.reshape(()),
                                 torch.zeros((), device=x.device)]).float().view(1, 4).expand(128, 4).contiguous()
             dstart = (doc_start.to(torch.float32) if doc_start is not None else torch.zeros((b, t), device=x.device)).contiguous()
+            wg_pad = F.pad(gw.float(), (0, 0, 0, 128 - gw.shape[0]))   # W_g zero-padded to 128 rows (zero rows add exact 0)
             outs = torch.ops.tf_nki.layer_fwd(x2, x02, ve2, cos_full, sin_full, cos2d, sin2d, scal, sink, bounds[0], bounds[1],
-                                              dstart, ws[0], ws[1], ws[2], ws[3], ws[4], ws[5])
+                                              dstart, ws[0], ws[1], ws[2], ws[3], ws[4], ws[5], wg_pad)
             return outs[0].view(b, t, D).to(x.dtype)
         x = resid_lambda * x + x0_lambda * x0
         _h = norm(x)
         if CANON_ATTN_W > 1:
             _h = canon_conv(_h, self.canon_a, doc_start)
-        x = x + self.attn(_h, ve_lambda * ve, cos, sin, sink, dense_mask, bounds, doc_start=doc_start)
+        x = x + self.attn(_h, ve_lambda * ve, cos, sin, sink, gw, dense_mask, bounds, doc_start=doc_start)
         _h = norm(x)
         if CANON_MLP_W > 1:
             _h = canon_conv(_h, self.canon_m, doc_start)
         x = x + self.mlp(_h)
         return x
+
+
+_U = np.uint64
+_NG_M1, _NG_M2, _NG_LO = _U(0x9E3779B97F4A7C15), _U(0xBF58476D1CE4E5B9), _U(8191)
+_NG_FIELDS = (("off", np.int32), ("fp", np.int32), ("tok", np.int16), ("by", np.uint8))
+
+
+def ng_key(h):
+    """51-bit context key: a splitmix finish of the rolling hash of the context tokens."""
+    z = (h ^ (h >> _U(31))) * _NG_M2
+    return (z ^ (z >> _U(29))) >> _U(13)
+
+
+def ng_fold():
+    """Token -> class of its bytes lowercased, stripped, digits as 0."""
+    tok, d = ensure_tokenizer(), {}
+    tr = bytes.maketrans(b"123456789", b"0" * 9)
+    return np.array([d.setdefault(tok.enc.decode_single_token_bytes(i).translate(tr).lower().strip(), len(d))
+                     for i in range(tok.get_vocab_size())], np.uint16)
+
+
+def ng_table(k, minc: int, kb: int):
+    """Sorted (context key << 13 | next token) -> one sub-table: per context with count >= minc, its most frequent next
+    token and an evidence byte (min(floor(log2 count), 12) * 5 + share-of-top bin), bucketed by the top kb key bits."""
+    f = np.empty(len(k), bool); f[:1] = True; np.not_equal(k[1:], k[:-1], out=f[1:])
+    s = np.flatnonzero(f); del f
+    uk = k[s]; c = np.diff(np.append(s, len(k))).astype(np.uint32); del s
+    ctx = uk >> _U(13); f = np.empty(len(uk), bool); f[:1] = True; np.not_equal(ctx[1:], ctx[:-1], out=f[1:])
+    s = np.flatnonzero(f); del f
+    tot = np.add.reduceat(c, s) if len(s) else c[:0]
+    uk &= _NG_LO; c = c.astype(np.uint64); c <<= _U(13); c |= uk; del uk
+    best = np.maximum.reduceat(c, s) if len(s) else c[:0]; del c
+    keep = tot >= minc
+    ctx, tot, best = ctx[s][keep], tot[keep], best[keep]; del s
+    by = np.minimum(np.log2(np.maximum(tot, 1)).astype(np.int64), 12) * 5 + np.digitize((best >> _U(13)) / np.maximum(tot, 1), [0.3, 0.5, 0.7, 0.9])
+    cnt = np.bincount((ctx >> _U(51 - kb)).astype(np.int64), minlength=1 << kb)
+    return (np.concatenate([[0], np.cumsum(cnt)]).astype(np.uint32), ((ctx >> _U(max(0, 19 - kb))) & _U(0xFFFFFFFF)).astype(np.uint32),
+            (best & _NG_LO).astype(np.uint16), by.astype(np.uint8))
+
+
+def ng_count(streams, p: int):
+    """For each order: the partition-p sub-tables of token streams s0 and s1 and of their union.
+    Partition p: 3 f1 + f2 = p mod NG_PARTS, f1 f2 the last two context tokens folded; every position has 15 tokens
+    of context."""
+    fm = ng_fold()
+    idx = [(np.flatnonzero((fm[s[14:-1]] * 3 + fm[s[13:-2]]) % NG_PARTS == p) + 15).astype(np.int32) for s in streams]
+    h = [np.zeros((2, len(i)), np.uint64) for i in idx]
+    for n in range(2, 17):
+        for j in range(2):
+            c = streams[j][idx[j] - (n - 1)]
+            h[j] = h[j] * _NG_M1 + np.stack([c, fm[c]]).astype(np.uint64) + _U(1)
+        if n in NG_ORDERS:
+            oi = NG_ORDERS.index(n)
+            ks = [np.sort((ng_key(h[j][int(n >= 8)]) << _U(13)) | streams[j][idx[j]].astype(np.uint64)) for j in range(2)]
+            tabs = [ng_table(k, NG_MINC[oi], NG_KB[oi]) for k in ks]
+            u = np.concatenate(ks); del ks
+            u.sort(kind="stable")
+            tabs.append(ng_table(u, NG_MINC[oi], NG_KB[oi])); del u
+            yield oi, tabs
+            del tabs
+
+
+def _ng_save(path: Path, a) -> None:
+    np.save(path.with_suffix(".part.npy"), a)
+    os.replace(path.with_suffix(".part.npy"), path)
+
+
+def _ng_wait(paths) -> None:
+    while not all(q.exists() for q in paths):
+        time.sleep(0.5)
+
+
+def ngram_build(rank: int, world: int, tmp: Path) -> None:
+    """The n-gram counter, run in a helper process forked at startup: host CPU only, it never touches the accelerator.
+    Tokenizes this worker's train row groups (the same `_row_groups_for_split` assignment the train loader uses), waits
+    for every worker's tokens, then counts partitions rank, rank+world, ... of three streams: s0 = the row groups of the
+    even workers, s1 = the odd workers', s2 = both. Files only; the training process polls for the done markers."""
+    try:
+        tok = ensure_tokenizer(build_if_missing=False)
+        ids = []
+        for path, rg in _row_groups_for_split("train", rank, world):
+            rows = pq.ParquetFile(path).read_row_group(rg).column("text").to_pylist()
+            ids.extend(np.array(d, np.uint16) for d in tok.encode(rows, prepend=tok.get_bos_token_id(), num_threads=4))
+        _ng_save(tmp / f"t{rank}.npy", np.concatenate(ids))
+        del ids
+        names = [tmp / f"t{r}.npy" for r in range(world)]
+        _ng_wait(names)
+        if rank < 2:
+            _ng_save(tmp / f"f{rank}.npy", np.concatenate([np.load(n, mmap_mode="r") for n in names[rank::2]]))
+        _ng_wait([tmp / "f0.npy", tmp / "f1.npy"])
+        streams = [np.load(tmp / f"f{f}.npy", mmap_mode="r") for f in (0, 1)]
+        with open(tmp / f"lock{rank % 4}", "a") as lock:      # at most 4 workers count at once (host memory)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            for p in range(rank, NG_PARTS, world):
+                for oi, tabs in ng_count(streams, p):
+                    for si in range(3):
+                        for (nm, _dt), a in zip(_NG_FIELDS, tabs[si]):
+                            np.save(tmp / f"s{si}o{oi}p{p}{nm}.npy", a)
+                (tmp / f"done{p}").touch()
+    except BaseException as exc:
+        (tmp / "error").write_text(repr(exc))
+
+
+def ng_logit(bias, lpt):
+    """The n-gram logit on column tau: t1 + log(1 + exp(t2 - log p_tau)), bias = (t1, t2)."""
+    return bias[..., 0] + torch.log1p(torch.exp(bias[..., 1] - lpt))
+
+
+class NgramTable:
+    """Read-only n-gram lookup. parts[order][partition] = (bucket offsets, key fingerprints, top token, evidence byte)."""
+
+    def __init__(self, parts=None):
+        self.parts = parts
+        self.fm = ng_fold() if parts else None
+        self.iters = [[int(np.diff(q[0]).max(initial=0)).bit_length() for q in o] for o in parts] if parts else None
+
+    @classmethod
+    def load(cls, tmp: Path, si: int) -> "NgramTable":
+        return cls([[tuple(np.load(tmp / f"s{si}o{oi}p{p}{nm}.npy", mmap_mode="r") for nm, _dt in _NG_FIELDS)
+                     for p in range(NG_PARTS)] for oi in range(len(NG_ORDERS))])
+
+    def state(self):
+        if not self.parts:
+            return None
+        st = {}
+        for oi, o in enumerate(self.parts):
+            for k, (nm, dt) in enumerate(_NG_FIELDS):
+                st[f"{oi}{nm}"] = torch.from_numpy(np.concatenate([q[k] for q in o]).view(dt))
+            st[f"{oi}n"] = torch.tensor([[len(q[0]), len(q[1])] for q in o], dtype=torch.int64)
+        return st
+
+    @classmethod
+    def from_state(cls, st) -> "NgramTable":
+        if not st:
+            return cls()
+        parts = []
+        for oi in range(len(NG_ORDERS)):
+            n = st[f"{oi}n"].numpy()
+            arrs = [np.split(st[f"{oi}{nm}"].numpy().view(np.dtype(dt).str.replace("i", "u")), np.cumsum(n[:, min(k, 1)])[:-1])
+                    for k, (nm, dt) in enumerate(_NG_FIELDS)]
+            parts.append([tuple(a[p] for a in arrs) for p in range(NG_PARTS)])
+        return cls(parts)
+
+    def _find(self, oi, key, part, ok):
+        kb = NG_KB[oi]
+        fq = ((key >> _U(max(0, 19 - kb))) & _U(0xFFFFFFFF)).astype(np.uint32)
+        bq = (key >> _U(51 - kb)).astype(np.int64)
+        tok = np.full(len(key), -1, np.int32)
+        by = np.zeros(len(key), np.int32)
+        for p in range(NG_PARTS):
+            off, fp, tk, byt = self.parts[oi][p]
+            sel = np.flatnonzero(ok & (part == p))
+            if len(sel) == 0 or len(fp) == 0:
+                continue
+            q = fq[sel]
+            lo = off[bq[sel]].astype(np.int64)
+            end = off[bq[sel] + 1].astype(np.int64)
+            hi = end
+            for _ in range(self.iters[oi][p]):
+                mid = (lo + hi) >> 1
+                go = (mid < hi) & (fp[np.minimum(mid, len(fp) - 1)] < q)
+                lo, hi = np.where(go, mid + 1, lo), np.where(go, hi, mid)
+            j = np.minimum(lo, len(fp) - 1)
+            hit = (lo < end) & (fp[j] == q)
+            tok[sel[hit]] = tk[j[hit]]
+            by[sel[hit]] = byt[j[hit]]
+        return tok, by
+
+    def features(self, x) -> np.ndarray:
+        """(2, b, t) int32 for token rows x (b, t): [0] the top next token of the longest context of x[r, :t+1] found in
+        the table, [1] its evidence bucket in [0, NG_NB), or -1 where no order matches. Rows are independent and position
+        t reads only x[r, t-14 .. t], so this is causal and deterministic."""
+        x = np.asarray(x, np.int64)
+        b, t = x.shape
+        out = np.zeros((2, b, t), np.int32)
+        out[1] = -1
+        if not self.parts:
+            return out
+        xs = np.stack([x, self.fm[x]])
+        h = np.zeros(xs.shape, np.uint64)
+        pos = np.arange(t)
+        tk, by = [], []
+        for n in range(2, 17):
+            prev = np.zeros_like(xs)
+            prev[:, :, n - 2:] = xs[:, :, :t - (n - 2)]
+            h = h * _NG_M1 + prev.astype(np.uint64) + _U(1)
+            if n == 3:
+                part = ((xs[1] * 3 + prev[1]) % NG_PARTS).reshape(-1)
+            if n in NG_ORDERS:
+                ok = np.broadcast_to(pos >= n - 2, (b, t)).reshape(-1)
+                a, c = self._find(NG_ORDERS.index(n), ng_key(h[int(n >= 8)]).reshape(-1), part, ok)
+                tk.append(a)
+                by.append(c)
+        tau, bkt = out[0].reshape(-1), out[1].reshape(-1)
+        top = np.full(b * t, -1)
+        for oi in reversed(range(len(tk))):
+            new = (top < 0) & (tk[oi] >= 0)
+            top[new] = oi
+            tau[new] = tk[oi][new]
+            bkt[new] = oi * 65 + by[oi][new]
+        agree = np.zeros(b * t, np.int32)
+        for oi in range(len(tk)):
+            agree += (oi < top) & (tk[oi] == tau)
+        bkt[:] = np.where(top >= 0, bkt * 3 + np.minimum(agree, 2), -1)
+        return out
 
 
 class GPT(nn.Module):
@@ -2870,11 +3156,14 @@ class GPT(nn.Module):
             "ve": nn.Parameter(torch.full((L, 1), 0.5)),
             "sink": nn.Parameter(torch.full((L, H), SINK_INIT)),
         })
+        self.attn_gate = nn.Parameter(torch.zeros(L, ATTN_GATE, H))   # W_g per layer; zero -> g == 1 exactly
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         self.skip_lambdas = nn.Parameter(torch.ones(config.n_layer // 2))
         self.bigram_lambda = nn.Parameter(torch.full((1,), 0.2))
         self.softcap_pos = nn.Parameter(torch.full((1,), LOGIT_SOFTCAP))
         self.softcap_neg = nn.Parameter(torch.full((1,), LOGIT_SOFTCAP))
+        self.ngram_theta = nn.Parameter(torch.zeros(2, NG_NB))    # (t1, t2) per n-gram evidence bucket
+        self.ngram = NgramTable()                               # set by the training loop / load_for_eval
         self._fused_loss_ok = True
         cos, sin = self._precompute_rotary_embeddings(config.sequence_len, config.n_embd // config.n_head)
         self.register_buffer("cos", cos, persistent=False)
@@ -2899,10 +3188,12 @@ class GPT(nn.Module):
         self.block_scalars["x0"].fill_(0.05)
         self.block_scalars["ve"].fill_(0.5)
         self.block_scalars["sink"].fill_(SINK_INIT)
+        self.attn_gate.zero_()                  # g = 2 * sigmoid(0) == 1.0 at step 0
         self.skip_lambdas.fill_(1.0)
         self.bigram_lambda.fill_(0.2)
         self.softcap_pos.fill_(LOGIT_SOFTCAP)
         self.softcap_neg.fill_(LOGIT_SOFTCAP)
+        self.ngram_theta.zero_()[1] = -2.0
         cos, sin = self._precompute_rotary_embeddings(self.config.sequence_len, self.config.n_embd // self.config.n_head)
         self.cos.copy_(cos)
         self.sin.copy_(sin)
@@ -2925,9 +3216,10 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         dmodel_lr_scale = (self.config.n_embd / 768) ** -0.5
         param_groups = [
-            dict(kind="adamw", params=embedding_params, lr=EMBEDDING_LR * dmodel_lr_scale, betas=(0.8, 0.99), eps=1e-10, weight_decay=0.001),
+            dict(kind="adamw", params=embedding_params, lr=EMBEDDING_LR * dmodel_lr_scale * 1.12, betas=(0.8, 0.99), eps=1e-10, weight_decay=0.001),
             dict(kind="adamw", params=lm_head_params, lr=UNEMBEDDING_LR * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
-            dict(kind="adamw", params=scalar_params, lr=SCALAR_LR, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind="adamw", params=scalar_params + [self.attn_gate, self.ngram_theta], lr=SCALAR_LR, betas=(0.9, 0.95), eps=1e-10,
+                 weight_decay=0.0, lr_mul=[1.0] * len(scalar_params) + [ATTN_GATE_LR / SCALAR_LR, NG_LR_MUL]),
         ]
         for key in sorted(self.stacks.keys()):
             param_groups.append(dict(kind="muon", params=[self.stacks[key]], lr=MATRIX_LR, momentum=_EFF_MUON_MOMENTUM, beta2=_EFF_MUON_BETA2, ns_steps=NS_STEPS, weight_decay=WEIGHT_DECAY))
@@ -2935,6 +3227,8 @@ class GPT(nn.Module):
         if canon_params:
             param_groups.append(dict(kind="adamw", params=canon_params, lr=CANON_LR, betas=(0.9, 0.95),
                                      eps=1e-10, weight_decay=0.0))
+        print0(f"ATTN_GATE: k={ATTN_GATE} W_g={tuple(self.attn_gate.shape)} lr={ATTN_GATE_LR:.5f} (scalar AdamW group, "
+               f"x{ATTN_GATE_LR / SCALAR_LR:.5f}) wd=0 init=0")
         opt = MuonAdamW(param_groups)
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
@@ -2949,32 +3243,50 @@ class GPT(nn.Module):
                    f"ema_start={_EFF_EMA_START} ema_decay={_EFF_EMA_DECAY})")
         return opt
 
-    def head_logits(self, x: torch.Tensor) -> torch.Tensor:
-        """The model's output logits: final RMSNorm, lm_head, asymmetric learned softcap. This is what the scorer
-        evaluates (forward with targets=None) and the reference the fused training loss is checked against."""
+    def head_logits(self, x: torch.Tensor, tau: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+        """The model's output logits: final RMSNorm, lm_head, asymmetric learned softcap, plus the n-gram term `bias`
+        added to the one column `tau` of each position. This is what the scorer evaluates (forward with targets=None)
+        and the reference the fused training loss is checked against."""
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         sp = self.softcap_pos.clamp_min(1.0).float()
         sn = self.softcap_neg.clamp_min(1.0).float()
-        return torch.where(logits >= 0, sp * torch.tanh(logits / sp), sn * torch.tanh(logits / sn))
+        z = torch.where(logits >= 0, sp * torch.tanh(logits / sp), sn * torch.tanh(logits / sn))
+        oh = torch.arange(z.size(-1), device=z.device) == tau.unsqueeze(-1)
+        b = ng_logit(bias.float(), (z * oh).sum(-1) - torch.logsumexp(z, -1))
+        return z + b.unsqueeze(-1) * oh
 
-    def fused_linear_cross_entropy(self, x: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def ngram_bias(self, bucket: torch.Tensor) -> torch.Tensor:
+        """(t1, t2)[bucket] as a one-hot product (no gather in the compiled graph); bucket -1 (no match) gives (0, -1e4),
+        whose n-gram logit is exactly 0."""
+        b = (bucket.unsqueeze(-1) == torch.arange(NG_NB, device=bucket.device, dtype=bucket.dtype)).float() @ self.ngram_theta.float().t()
+        return torch.stack([b[..., 0], b[..., 1] - 1e4 * (bucket < 0)], -1)
+
+    def fused_linear_cross_entropy(self, x: torch.Tensor, targets: torch.Tensor, tau: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
         """cross_entropy(self.head_logits(x), targets) with ignore_index=-1 and mean reduction, computed by one NKI kernel
         without materializing the (T, V) logits: per 128-token tile the kernel forms the softcapped logits 512 columns at a
         time and folds them into an online log-sum-exp (same math as `head_logits` followed by F.cross_entropy). The lm_head
-        weight enters transposed; the softcap parameters enter through `scal` and receive gradients."""
+        weight enters transposed; the softcap parameters enter through `scal` and receive gradients. The kernel also
+        returns z at column tau, which makes the n-gram term exact: logsumexp(z + bias * e_tau) = lse + log1p(p_tau *
+        expm1(bias)), and the target logit gains bias where tau == target; the kernel's backward takes all three grads."""
         b, t, D = x.shape
         x2 = x.reshape(b * t, D).to(torch.bfloat16).contiguous()
         wT = self.lm_head.weight.to(torch.bfloat16).t().contiguous()
         tgt = targets.reshape(b * t, 1).to(torch.int32).contiguous()
         scal = torch.stack([self.softcap_pos.clamp_min(1.0).reshape(()), self.softcap_neg.clamp_min(1.0).reshape(()),
                             torch.zeros((), device=x.device), torch.zeros((), device=x.device)]).float().view(1, 4).expand(128, 4).contiguous()
-        loss_rows, _lse, _h, _rstd = torch.ops.tf_nki.head_fwd(x2, wT, tgt, scal)
-        valid = targets.reshape(-1) != -1
-        return loss_rows.sum() / valid.sum().clamp_min(1).float()
+        tau = tau.reshape(b * t, 1).to(torch.int32).contiguous()
+        loss_rows, lse, _h, _rstd, zt = torch.ops.tf_nki.head_fwd(x2, wT, tgt, scal, tau)
+        bias = ng_logit(bias.reshape(b * t, 2).float(), zt[:, 0] - lse.reshape(-1)).unsqueeze(-1)
+        corr = torch.log1p(torch.exp(zt - lse) * torch.expm1(bias)) - bias * (tau == tgt)
+        valid = targets.reshape(-1, 1) != -1
+        return (loss_rows + corr * valid).sum() / valid.sum().clamp_min(1).float()
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None, loss_reduction: str = "mean", emb=None):
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None, loss_reduction: str = "mean", emb=None, ng=None):
         _b, t = idx.shape
+        if ng is None:      # n-gram features of these rows, a function of idx alone (training passes the same call's result)
+            ng = torch.from_numpy(self.ngram.features(idx.detach().cpu().numpy())).to(idx.device)
+        tau, bias = ng[0], self.ngram_bias(ng[1])
         assert t <= self.config.sequence_len
         cos, sin = self.cos[:, :t], self.sin[:, :t]
 
@@ -2991,7 +3303,9 @@ class GPT(nn.Module):
         else:
             x = self.transformer.wte(idx).to(COMPUTE_DTYPE)
             x = x + self.bigram_lambda * self.transformer.bte(bh).to(COMPUTE_DTYPE)
-        x = norm(x)
+        # the input RMSNorm uses the fp32 epsilon (x is fp32 here: bigram_lambda is an fp32 Parameter). This one line
+        # serves training and evaluation alike; the other norm() sites keep the kernels' bf16 epsilon
+        x = F.rms_norm(x, (x.size(-1),), eps=1.1920928955078125e-07)
         x0 = x.clone()
         if emb is not None:
             ve1, ve_mid, ve2 = emb["vte"], emb["vte_mid"], emb["vte2"]
@@ -3024,20 +3338,21 @@ class GPT(nn.Module):
         n_dec_start = self.config.n_layer - n_enc
         skips: list[torch.Tensor] = []
         bs = self.block_scalars
+        gws = torch.unbind(self.attn_gate)      # ATTN_GATE: (k, n_head) per layer
         for i, block in enumerate(self.transformer.h):
             if i >= n_dec_start:
                 x = x + self.skip_lambdas[i - n_dec_start] * skips.pop()
             ve_i = ve1 if i < t1 else (ve_mid if i < t2 else ve2)
-            x = block(x, x0, ve_i, cos, sin, bs["resid"][i], bs["x0"][i], bs["ve"][i], bs["sink"][i], dense_mask, bounds,
-                      doc_start=doc_start, rope_tabs=rope_tabs, wviews=wviews)
+            x = block(x, x0, ve_i, cos, sin, bs["resid"][i], bs["x0"][i], bs["ve"][i], bs["sink"][i], gws[i], dense_mask,
+                      bounds, doc_start=doc_start, rope_tabs=rope_tabs, wviews=wviews)
             if i < n_enc:
                 skips.append(x)
         if targets is None:
-            return self.head_logits(x)
+            return self.head_logits(x, tau, bias)
         if (self._fused_loss_ok and _HEAD_OPS is not None and loss_reduction == "mean" and x.device.type == "neuron"
                 and x.shape[1] % 128 == 0):
-            return self.fused_linear_cross_entropy(x, targets)
-        logits = self.head_logits(x)
+            return self.fused_linear_cross_entropy(x, targets, tau, bias)
+        logits = self.head_logits(x, tau, bias)
         flat_t = targets.reshape(-1)
         valid = flat_t != -1
         logp = F.log_softmax(logits.reshape(-1, logits.size(-1)), dim=-1)
@@ -3196,8 +3511,9 @@ def scatter_plan_check(idx, rows, dense_ids, chunks):
 def scatter_rounds(idx):
     """Host plan for embed_scatter_add: slots grouped into rounds of distinct indices (the r-th occurrence of every
     distinct index), each round padded to a multiple of 128; padding slots carry -1 (replaced per table by the distinct
-    dummy rows R + j of the gradient buffer's 128-row tail). Returns (perm, sidx); ~150 rounds for token ids, ~30 for
-    bigram hashes."""
+    dummy rows R + j of the gradient buffer's 128-row tail). Returns a list of (perm, sidx) chunks. The round count is
+    the largest multiplicity of any one id - measured 403-573 rounds for token ids (78.7% padding) at the production
+    shape - which is why scatter_packed replaced it; this planner runs only if SCATTER_BINS is 0, and it is 128."""
     import numpy as np
     idx = np.asarray(idx, dtype=np.int64).reshape(-1)
     order = np.argsort(idx, kind="stable")
@@ -3392,6 +3708,9 @@ class MuonAdamW(torch.optim.Optimizer):
         if st is None:
             flat = torch.cat([p.detach().reshape(-1).float() for p in params])
             st = dict(sizes=[p.numel() for p in params], p=flat, m=torch.zeros_like(flat), v=torch.zeros_like(flat), step=0)
+            if group.get("lr_mul") is not None:     # per-element lr multiplier (1.0 on every scalar, ATTN_GATE_LR / SCALAR_LR on W_g)
+                _mul = {id(q): m for q, m in zip(group["params"], group["lr_mul"])}
+                st["mul"] = torch.cat([torch.full((p.numel(),), float(_mul[id(p)]), dtype=flat.dtype) for p in params]).to(flat.device)
             self._flat[id(group)] = st
         g = torch.cat([p.grad.reshape(-1).float() for p in params])
         if self.world_size > 1:
@@ -3403,7 +3722,10 @@ class MuonAdamW(torch.optim.Optimizer):
         st["step"] += 1
         bias1 = 1 - beta1 ** st["step"]
         bias2 = 1 - beta2 ** st["step"]
-        flat.sub_(lr_t * (m / bias1 / ((v / bias2).sqrt() + group["eps"])))
+        if "mul" in st:
+            flat.sub_((lr_t * st["mul"]) * (m / bias1 / ((v / bias2).sqrt() + group["eps"])))
+        else:
+            flat.sub_(lr_t * (m / bias1 / ((v / bias2).sqrt() + group["eps"])))
         off = 0
         for p, sz in zip(params, st["sizes"]):
             p.copy_(flat[off:off + sz].view_as(p).to(p.dtype))
@@ -3414,8 +3736,8 @@ class MuonAdamW(torch.optim.Optimizer):
         """Sharded optimizer (ZeRO-1 style): every parameter whose leading dim splits evenly over the workers is updated by
         one worker only, on a persistent shard with its own momentum state; its gradient arrives by reduce_scatter and the
         updated shard goes back into the replicated parameter by all_gather (the same bytes the all_reduce moves).
-        A Muon stack whose n is not a multiple of the world (the two MLP stacks, n=12 over 8 workers) is padded with zero
-        rows to the next multiple (16 -> 2 matrices per worker, the last workers own none) instead of a replicated Muon
+        A Muon stack whose n is not a multiple of the world (the two MLP stacks, n=14 over 8 workers) is padded with zero
+        rows to the next multiple (16 -> 2 matrices per worker, the last worker owns none) instead of a replicated Muon
         step on every worker (2026-09-16: +1.1% throughput, same math)."""
         self.world_size = world_size
         if world_size == 1:
@@ -3691,7 +4013,7 @@ def sync_gradients(model: nn.Module, optimizer: MuonAdamW) -> None:
 
 
 def hold_bigram_bf16(model: GPT) -> None:
-    """Hold the 2^18 x 512 hashed bigram table in bf16 for training (it is 134.2M of the model's parameters). Must run
+    """Hold the 2^19 x 512 hashed bigram table in bf16 for training (it is 268.4M of the model's parameters). Must run
     before setup_sharding, which clones each worker's fp32 master shard from p.data, and before EmbedSidecar, whose
     gradient buffers take the table's dtype. Where the optimizer shards it (the 8-worker launch does) each worker
     updates its fp32 shard and all_gathers it back into this replica as bf16; otherwise (a single process, say) the
@@ -3711,6 +4033,7 @@ def save_checkpoint(path: Path, model: GPT, meta: dict) -> None:
         "model_state": {k: (v.detach().cpu().float() if v.dtype == torch.bfloat16 else v.detach().cpu())
                         for k, v in model.state_dict().items()},
         "model_config": asdict(model.config),
+        "ngram": model.ngram.state(),
         "meta": meta,
     }
     torch.save(payload, path)
@@ -3720,8 +4043,8 @@ def load_for_eval(checkpoint_path: str, device: torch.device) -> nn.Module:
     """The scorer's entry point: rebuild the model from the checkpoint and return it.
 
     The returned module is a plain, consolidated, single-device replica. Its forward is the same function of the
-    same weights that training used - `GPT.forward(idx)` returns `GPT.head_logits(x)` and nothing here alters it.
-    The one thing this function does beyond loading is call `build_layer_ops`, exactly as the training path does,
+    same weights that training used - `GPT.forward(idx)` returns `GPT.head_logits(x, tau, bias)` and nothing here alters it.
+    The one thing this function does beyond loading (weights and n-gram table) is call `build_layer_ops`, as training does,
     so the layer kernels used for evaluation are the ones used for training; if they cannot be built, both paths
     fall back to the same explicit PyTorch layers.
     """
@@ -3732,6 +4055,7 @@ def load_for_eval(checkpoint_path: str, device: torch.device) -> nn.Module:
     model = GPT(config)
     model.init_weights()
     model.load_state_dict(payload["model_state"], strict=True)
+    model.ngram = NgramTable.from_state(payload.get("ngram"))
     model.to(device)
     model.eval()
     if LAYER_IMPL == "op" and device.type == "neuron" and NKI_AVAILABLE:
@@ -3784,6 +4108,14 @@ def main() -> None:
     parser.add_argument("--eval-tokens", type=int, default=int(os.environ.get("NEURON_COMPETITION_R1_EVAL_TOKENS", str(4 * 524288))))
     parser.add_argument("--compile-only", action="store_true", help="run one synthetic optimizer step, then exit")
     args = parser.parse_args()
+    # the n-gram counter is forked before the accelerator runtime starts; it needs an even number of workers (see notes)
+    _ddp0, rank0, _lr0, world0 = get_dist_info()
+    ng_dir = Path(args.out_dir) / f"ngram_{os.getppid()}"
+    ng_proc = None
+    if _ddp0 and world0 % 2 == 0 and not args.compile_only:
+        ng_dir.mkdir(parents=True, exist_ok=True)
+        ng_proc = multiprocessing.get_context("fork").Process(target=ngram_build, args=(rank0, world0, ng_dir), daemon=True)
+        ng_proc.start()
 
     torch.set_float32_matmul_precision("high")
     device_type = detect_device_type(args.device_type)
@@ -3837,8 +4169,9 @@ def main() -> None:
         optimizer = model.setup_optimizer()
         hold_bigram_bf16(orig_model)
         model.zero_grad(set_to_none=True)
+        ng0 = torch.from_numpy(NgramTable().features(np.zeros((device_batch_size, SEQ_LEN)))).to(device)
         for _ in range(grad_accum_steps):
-            loss = model(synthetic_x, synthetic_y)
+            loss = model(synthetic_x, synthetic_y, ng=ng0)
             (loss / grad_accum_steps).backward()
         optimizer.setup_sharding(world_size, rank)
         sync_gradients(model, optimizer)
@@ -3877,14 +4210,19 @@ def main() -> None:
             if BOS_IGNORE:
                 _yr = torch.where(_yr == BOS_ID, -1, _yr)
             _xr = _x.reshape(-1, SEQ_LEN)
-            if _remap:
+            if _remap:      # n-gram features on a host thread while this upload waits for the device queue
+                _ngf[0] = _ngpool.submit(ng_train.features, _xr.numpy().copy())
                 _xr = _xr.to(device)
                 _yr = _yr.to(device)
             yield _xr, _yr, _st
 
     _prefix_table = build_prefix_table(tokenizer, _loader_dev) if PREFIX_AUX_W > 0 else None
+    ng_train = NgramTable()     # this worker's n-gram table: the OTHER parity's row groups; no matches until it is built
+    _ngpool, _ngf = ThreadPoolExecutor(1), [None]
+    ng_feats = lambda xb: torch.from_numpy(_ngf[0].result() if _ngf[0] else ng_train.features(xb.cpu().numpy())).to(device)
     train_loader = _packed()
     x, y, loader_state = next(train_loader)
+    ng = ng_feats(x)
     optimizer = model.setup_optimizer()
     hold_bigram_bf16(orig_model)
     optimizer.setup_sharding(world_size, rank)
@@ -3906,6 +4244,15 @@ def main() -> None:
 
     while step < args.num_steps:
         synchronize(device)
+        if ng_proc is not None and not ng_train.parts:
+            if (ng_dir / "error").exists():
+                print0(f"!!! n-gram counter failed: {(ng_dir / 'error').read_text()[:200]}")
+                ng_proc = None
+            elif all((ng_dir / f"done{p}").exists() for p in range(NG_PARTS)):
+                ng_train = NgramTable.load(ng_dir, 1 - rank % 2)
+                print0(f"n-gram tables ready at step {step}, {time.monotonic() - _PROCESS_STARTED:.0f}s after launch; "
+                       f"rank 0 reads the odd workers' table, match rate on its next rows "
+                       f"{(ng_train.features(x.cpu().numpy())[1] >= 0).mean():.3f}")
         if step == FUSED_HEAD_CHECK_STEP:
             try:
                 check_fused_head(orig_model, device_batch_size, SEQ_LEN, device)
@@ -3924,20 +4271,21 @@ def main() -> None:
                     emb, plans = sidecar.gather(x, next_plans)
                     if step == 0 and micro == 0:
                         try:
-                            check_fused_loss(orig_model, x, y, emb)
+                            check_fused_loss(orig_model, x, y, emb, ng)
                         except Exception as _diag_exc:
                             print0(f"!!! fused-loss check could not run ({str(_diag_exc)[:160]}); "
                                    f"the fused path is unchanged (see check_fused_head at step "
                                    f"{FUSED_HEAD_CHECK_STEP})")
-                    loss = model(x, y, emb=emb)
+                    loss = model(x, y, emb=emb, ng=ng)
                     last_loss = loss.detach()
                     (loss / grad_accum_steps).backward()
                     x, y, loader_state = next(train_loader)
                     next_plans = sidecar.prepare(x)
+                    ng = ng_feats(x)
                     sidecar.scatter(emb, plans)
                     plan_ring = (plan_ring[1], (emb, plans))
                     continue
-                loss = model(x, y)
+                loss = model(x, y, ng=ng)
                 last_loss = loss.detach()
                 (loss / grad_accum_steps).backward()
             except Exception as exc:
@@ -3946,10 +4294,11 @@ def main() -> None:
                     print0(f"embedding sidecar failed at step 0 ({str(exc)[:200]}); tables in the graph")
                     sidecar = None
                     optimizer.zero_grad(set_to_none=True)
-                    loss = model(x, y)
+                    loss = model(x, y, ng=ng)
                     last_loss = loss.detach()
                     (loss / grad_accum_steps).backward()
                     x, y, loader_state = next(train_loader)
+                    ng = ng_feats(x)
                     continue
                 if step != 0 or model is orig_model:
                     raise
@@ -3959,10 +4308,11 @@ def main() -> None:
                 USE_STACK_FUNCTION = True
                 optimizer.zero_grad(set_to_none=True)
                 gc.collect()
-                loss = model(x, y)
+                loss = model(x, y, ng=ng)
                 last_loss = loss.detach()
                 (loss / grad_accum_steps).backward()
             x, y, loader_state = next(train_loader)
+            ng = ng_feats(x)
         if sidecar is not None:
             sidecar.attach()
         sync_gradients(model, optimizer)
@@ -4084,6 +4434,11 @@ def main() -> None:
                 p.lerp_(e, EMA_TABLE_BLEND)
         print0(f"tail-EMA blended into the weights for the checkpoint and the evaluation "
                f"({len(ema_params)} tensors at {EMA_BLEND}, {len(ema_tab_params)} tables at {EMA_TABLE_BLEND})")
+    if ng_proc is not None and all((ng_dir / f"done{p}").exists() for p in range(NG_PARTS)):
+        orig_model.ngram = NgramTable.load(ng_dir, 2)
+    _nt = orig_model.ngram_theta.detach().float()
+    print0(f"n-gram checkpoint table: {sum(len(q[1]) for o in orig_model.ngram.parts for q in o) if orig_model.ngram.parts else 0:,} "
+           f"contexts from all train row groups; theta min {_nt.min().item():.3f} max {_nt.max().item():.3f}")
     checkpoint_path = Path(args.out_dir) / "final.pt"
     budget_elapsed_before_save = time.monotonic() - budget_started
     if rank == 0:
@@ -4132,6 +4487,10 @@ def main() -> None:
         if public_eval is not None:
             print(f"public_val_bpb:    {public_eval['val_bpb']:.6f}")
             print(f"eval_seconds:      {public_eval['eval_seconds']:.1f}")
+    if rank == 0 and ng_proc is not None:
+        for f in ng_dir.iterdir():
+            os.remove(f)
+        ng_dir.rmdir()
 
     cleanup_runtime()
 

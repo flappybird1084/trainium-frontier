@@ -23,13 +23,16 @@ Those two facts together reorder everything.
 corpus**. Repeating it can never exceed **16.387 x 316 M = 5.18 B effective tokens** no matter how much compute
 you throw at it. Run the Phase-1 model unchanged for the whole Phase 2 budget and it reaches **96% of that
 ceiling in the first 22% of the clock**; the remaining 78% of the compute buys 4% more effective data. So the
-compute has to go into **capacity** — the dense body grows from 54.5 M to **0.4-0.9 B**, an optimum three
-independent parameterisations agree on and which is **the same in both shard branches** (§1.6).
+compute has to go into **capacity** — the model-FLOP size grows from 54.5 M dense to **0.4-0.9 B**, an optimum
+three independent parameterisations agree on, which survives an 8x range of the one imported constant (§1.5b),
+and which is **the same in both shard branches** (§1.6).
 
 **The one thing this session measured rather than derived**, on the local GPU at 1/160th the parameter scale:
-weight decay 0.4 against 0.1, at fixed tokens and fixed steps, is **+0.0122 at 1 epoch, −0.0196 at 8 epochs and
-−0.4042 at 32 epochs.** The regularisation verdict flips sign between 1 and 8 epochs. `ideas.md`'s "do not
-re-litigate WD or input masking below ~3 epochs" was correct, and its converse is now measured.
+at fixed tokens and fixed steps, the weight-decay optimum moves from **exactly the box's 0.1 at 1 epoch** (a
+clean interior optimum, both neighbours ~0.011 worse) to **beyond 0.4 and still falling at 8 and 32 epochs**
+(−0.0196 and −0.4042 for 0.4 over 0.1). The regularisation verdict flips sign between 1 and 8 epochs.
+`ideas.md`'s "do not re-litigate WD or input masking below ~3 epochs" was correct, and its converse is now
+measured.
 
 **And the thing nobody has priced, which changes the recommendation inside that band.** At ~3.6 bits per
 parameter, **Phase 1's 205 M-parameter model cannot memorise its 154 MB of training-set content (0.60x), and
@@ -54,7 +57,7 @@ critical path, and both are buildable today without any device time.
 | dense optimum 0.4-0.9 B, i.e. 8-16x today | **medium-high** | three parameterisations agree, and the answer survives an 8x range of `R_D*` (§1.5b) |
 | ridge tilts ~2.2 e-folds and stays flat | **medium-high** | same |
 | Phase 2 crosses the memorisation threshold | **medium-high** | two independent routes (bits/parameter, and §6's measured knee) agree |
-| **regularisation inverts with epoch count** | **high on the sign, medium on the size** | §6 measures a clean sign flip on our own corpus: wd 0.4 vs 0.1 is **+0.0122 at 1 epoch, −0.0196 at 8, −0.4042 at 32** |
+| **regularisation inverts with epoch count** | **high on the sign, medium on the size** | §6: the wd argmin is 0.1 at 1 epoch (interior) and past 0.4 at 8 and 32 epochs; wd 0.4 vs 0.1 is **+0.0122 / −0.0196 / −0.4042** |
 | the published repetition law breaks past ~8-16 epochs | **medium** | measured at 1/160th the parameter scale, one seed per point |
 | the specific (width, depth) point inside the band | **low** | our data cannot resolve aspect ratio; resolve with a throughput screen |
 | looped depth is the right way to spend surplus compute | **low, highest value** | one ledger wash (+0.0011) plus a derivation; never tested in this regime |
@@ -195,6 +198,12 @@ Expected total: **Δ ≈ −0.062 bpb**, i.e. local `val_bpb` around **0.90**. T
 not a number: it is a 2.2-e-fold extrapolation from a 1.8-epoch operating point, and the parametric fit's own
 verdict is that our surface is much flatter than the law it borrows its exponents from.
 
+**One systematic bias in this table, and it matters for the choice.** Every row assumes the effective-data law
+holds, so loss can only *saturate* with more epochs. §6 measures that past ~8-16 epochs it **rises** instead. So
+**the low-`m`, high-epoch rows are optimistic and the high-`m`, low-epoch rows are not** — which shifts the true
+optimum to the right of `m = 8-12` and reinforces §1.5d's conclusion that the epoch count should be pushed down
+by spending compute per *token*. Read the table as a lower bound on how far right to go.
+
 ### 1.5b Sensitivity to `R_D*` — the direction is robust, the magnitude is not
 
 `R_D* = 15.387` is the one imported constant the optimum depends on. Re-solving parameterisation (c) across an
@@ -210,8 +219,10 @@ verdict is that our surface is much flatter than the law it borrows its exponent
 > **The direction is invariant and the sign of every recommendation in §3 survives: a *smaller* `R_D*` makes
 > repetition saturate sooner, which makes capacity worth even more and pushes the model BIGGER and the epoch
 > count LOWER.** The whole 8x range keeps the answer inside **0.4-1.7 B dense**, against today's 54.5 M. What
-> `R_D*` actually sets is where in that band to sit — which is why §6 spends local GPU time measuring it on our
-> own corpus rather than importing it.
+> `R_D*` actually sets is where in that band to sit. §6 spent local GPU time trying to pin it on our own corpus
+> and **could not identify it from seven points** — but it did establish the more useful thing: that past ~8-16
+> epochs the law's *functional form* stops applying at all, because loss rises rather than saturating. Read the
+> table above as "the answer is 0.4-1.7 B and the epoch count should be at the low end of whatever that implies".
 >
 > A smaller `R_D*` would also *weaken* §5.1 and §5.2 (fewer epochs ⇒ less data pressure ⇒ auxiliary objectives
 > and regularisation invert less) while *strengthening* §3.1 (shape) and §5.3-5.4. The engineering is robust;
@@ -230,23 +241,25 @@ point is computable.
 | | total params | capacity | / corpus content |
 |---|---|---|---|
 | **Phase 1 (ships)** | 205 M | 92 MB | **0.60x** — below the threshold |
-| Phase 2, conservative (436 M dense, table at 2^18) | 633 M | 285 MB | **1.9x** |
-| **Phase 2, recommended (755 M dense, table at 2^19)** | **1.09 B** | **490 MB** | **3.2x** |
+| shape **C** (201 M unique dense, looped; table at 2^19) | 512 M | 230 MB | **1.50x** |
+| shape **A** (403 M dense distinct; table at 2^19) | 713 M | 321 MB | **2.1x** |
+| shape **B** (755 M dense distinct; table at 2^19) | **1.09 B** | **490 MB** | **3.2x** |
 
 > **Phase 1 physically cannot memorise its training set. Every Phase 2 configuration in §1.5's flat band can,
-> three times over.** That is a regime the entire 698-row ledger was measured *outside*, and it is the
-> mechanism behind both the §5.2 regularisation inversion and the caution below.
+> 1.5 to 3.2 times over.** That is a regime the entire 698-row ledger was measured *outside*, and it is the
+> mechanism behind both the §5.2 regularisation inversion and the caution below. (§3.2 defines shapes A/B/C;
+> only *unique* parameters count toward capacity, which is the whole point of the looped variant.)
 
 This is the strongest argument for **not** taking the very top of the capacity band, and for treating
 regularisation as a first-class part of the Phase 2 recipe rather than an afterthought. It also explains why
 §6's small-scale arms blow up the way they do: at 4 M unique tokens against 8.9 M parameters they sit at 0.45
-unique tokens per parameter, which is *deeper* into this regime than the Phase 2 recommendation (0.29).
+unique tokens per parameter, which is *deeper* into this regime than shape C (0.62) and close to shape A (0.44).
 
 ### 1.5d Where surplus compute should go once parameters become dangerous
 
 §1.5c changes the shape of the problem. The naive reading of §1.5 is "spend the 128x on parameters"; §1.5c says
-parameters past ~600 M total start buying *memorisation capacity we cannot feed*. The resolution is to
-distinguish two ways of spending compute:
+total parameters past ~360 M start buying *memorisation capacity we cannot feed* (that is the 154 MB / 3.6 bits
+crossing point). The resolution is to distinguish two ways of spending compute:
 
 - **Compute per *parameter*** — a bigger model. Adds memorisation capacity. Priced at −0.0132/e-fold at fixed
   steps and dangerous past §1.5c's threshold.
@@ -468,13 +481,15 @@ because §1.5's ridge is flat across all four rows above and cannot tell them ap
 **Phase 2 does NOT need tensor or pipeline parallelism, and reaching for it would be a mistake.** The reason
 to add model parallelism is that data parallelism forces the batch too high — and here it does not, because
 the batch floor is exactly where we already are. The scaling is absorbed by the **model**, not the batch.
-Memory confirms it: at ~1.09 B params, bf16 replicated weights are 2.2 GB/core against the ~10.8 GB/core
-measured on the Phase 1 chip, and ZeRO-1 optimizer state (fp32 master + two moments) sharded 128 ways is
-102 MB/core.
+Memory confirms it: even at the largest candidate (~1.09 B params) bf16 replicated weights are 2.2 GB/core
+against the ~10.8 GB/core measured on the Phase 1 chip, and ZeRO-1 optimizer state (fp32 master + two moments)
+sharded 128 ways is 102 MB/core. Shape C is half that.
 
 **The one thing that does force a design choice is the bigram table's share of the collective.** At Phase 1 it
-is 62% of the sharded parameter set; at 2^19 rows and 755 M dense it is 26%, at 2^20 rows 42%. Growing the
-table is therefore *also* a collective decision, and it trades directly against the accumulation rule below.
+is 62% of the sharded parameter set; at 2^19 rows it is 26% of shape B and **52% of shape C** (whose unique
+dense body is only 201 M), and at 2^20 rows it dominates both. **So the looped shape and the bigger table pull
+against each other through the collective**, and the table's rows should be gated *after* the shape is settled,
+not before.
 
 **The one genuine unknown is the 16-chip collective.** Phase 1 measures grad_sync + optimizer at 97 ms of a
 424 ms step (23%), of which 58% of the optimizer phase is the parameter `all_gather`, and `F_PROBE` established
@@ -501,7 +516,7 @@ stating plainly because it is where a re-tune would otherwise burn Phase 2 gates
 | `FINAL_LR_FRAC` | 0.034 (B2) | **0.034, unchanged** | same; and the B2 derivation that set it is a *temperature* argument, which §5.2 shows is horizon-invariant | medium |
 | momentum ramp | 0.85→0.97 over 300 steps | **0.85→0.97 over 300 steps** | 300 of ~11 500 is 2.6%; the ramp is a stability device, not a schedule | medium |
 | momentum peak | 0.97 | **0.97, with 0.94 as one arm** | at 4x batch, a fixed β quadruples the effective averaging horizon `batch/(1−β)`. Holding that horizon fixed would need β=0.88 — but `G_MOMON` at β=0.93 **lost** at Phase 1, so the measured direction is up, not down. Genuinely two-sided; worth exactly one arm | low |
-| `EMA_START` | 0.75 | **0.70** | 0.85→0.75 paid −0.00044, 0.75→0.65 was flat (+0.00002), so the plateau is 0.65-0.75 and its centre is the safe pick | medium-high |
+| `EMA_START` | **0.60** (the shipped B2 value; 0.75 on the pre-B2 canon line) | **0.60, unchanged** | it is a *fraction*, and the 0.85→0.75→0.65 sweep on the pre-B2 line showed a plateau (−0.00044 then +0.00002) rather than a sharp optimum. Unlike the decay and the blend, the window is **not** offline-sweepable — it decides what gets accumulated — so leave it where it was measured and spend the run elsewhere | medium |
 | **EMA `tau`** | 556 steps (decay 0.9982) | **~1050 steps (decay 0.99905)** at shape C's ~11 500 steps | see below | medium-high |
 | `EMA_BLEND` / per-group blends | 0.65 / 0.65 | **sweep offline, do not guess** | see below | **high** |
 | `WEIGHT_DECAY` (Muon) | 0.10 | **0.10 first; sweep it second if the embedding sweep is flat** | §5.2 — its Phase-1 outcome is predicted by the LR curve, so it reads as a temperature knob; but §6 shows regularisation of *some* kind inverts hard, and if the group that should carry it does not, this is the next place to look | medium |
@@ -512,8 +527,8 @@ stating plainly because it is where a re-tune would otherwise burn Phase 2 gates
 
 | averaging window | window length at 4390 steps | measured optimal tau | tau / window |
 |---|---|---|---|
-| 0.75 (start at 75%) | 1098 steps | 333 | **30.3%** |
-| 0.60 (start at 60%) | 1756 steps | 556 | **31.7%** |
+| 0.75 (pre-B2 canon line) | 1098 steps | 333 | **30.3%** |
+| **0.60 (the shipped B2 line)** | 1756 steps | 556 | **31.7%** |
 
 **tau ≈ 0.31 x the averaging window**, with a mechanism: the stated reason short horizons win is that the
 terminal rampdown makes late weights improve fast, so a fixed *fraction* of the window is the horizon-invariant
@@ -681,7 +696,9 @@ because §5.2 now has a direct measurement behind it and this does not.
 WD 0.2/0.3 lost +0.0045/+0.0109 and MIR lost +0.0050/+0.0096/+0.0139, with the explicit note *"do not
 re-litigate WD or input masking below ~3 epochs."* Phase 2 is well past that, so the note's own condition is met
 — and §6 now measures the sign flip directly on our own corpus: at a fixed total token budget,
-**weight decay 0.4 vs 0.1 costs +0.0122 at 1 epoch, gains −0.0196 at 8 epochs and gains −0.4042 at 32 epochs.**
+**the weight-decay argmin is 0.1 at 1 epoch (interior, both neighbours ~0.011 worse) and beyond 0.4 at both 8
+and 32 epochs, where the curve is monotone decreasing across the whole grid; 0.4 vs 0.1 is +0.0122 / −0.0196 /
+−0.4042.**
 Same code, same data, same 3906 steps, same 64 M tokens; only the epoch count differs. That is the clearest
 single piece of evidence in this file, and it is ours rather than imported — which is why this is ranked #1
 despite MTP having the larger headline number at Phase 1.
@@ -810,8 +827,14 @@ is literally "not enough steps". Low expected size (−0.001?) but it is now a l
 ## 6. OUR OWN MEASUREMENT OF THE REPETITION CURVE (local GPU)
 
 Everything above leans on `R_D* = 15.387`, a constant fitted on C4 by someone else. This session measured the
-same curve on **our** corpus and **our** tokenizer, at small scale, on the local RTX 4080 — which costs no
-device time and is the one thing in this file that replaces an imported constant with a measurement.
+same curve on **our** corpus and **our** tokenizer, at small scale, on the local RTX 4080, at no device cost.
+
+**What it set out to do and what it actually did.** It did *not* pin down `R_D*` — the fit is not identified from
+seven points (RESULT 1 reading 1), and §1.5b already shows the recommendation survives the whole plausible range
+anyway. What it did do is more useful: it **bounded where the published law stops applying** (somewhere between 8
+and 16 epochs at this data-to-parameter ratio, and past that the behaviour is overfitting rather than diminishing
+returns — an object the law cannot represent), and it **measured the regularisation inversion directly**, which
+is the single most actionable result in this file.
 
 **Design.** A 4.7 M-dense / 8.9 M-total GPT (width 256, depth 6, 4 heads, ReLU² MLP ratio 4, RMSNorm, RoPE,
 QK-norm, logit softcap, seq 512), AdamW, **64 M training tokens and 3906 optimizer steps in every arm**, with
@@ -828,7 +851,7 @@ weight-decay arms show *that* regularisation inverts, not *which* parameter grou
 (c) `R_D*` is fitted as scale-independent in the source, but that is exactly the assumption under test here.
 (d) Single seed per point except where noted.
 
-**RESULT — the published law tracks us to ~8 epochs and under-predicts by 3-6x beyond 16.**
+**RESULT 1 — the published law agrees within ~2x up to 8 epochs and under-predicts by 3-6x beyond 16.**
 
 | epochs | unique pool | unique / total params | val_bpb | Δ vs 1 epoch | law's prediction* | ratio |
 |---|---|---|---|---|---|---|
@@ -878,23 +901,41 @@ weight-decay arms below measure, and it is the direct small-scale test of §5.2.
 **RESULT 2 — the regularisation inversion, measured, with a sign flip.** Same code, same data, same 3906 steps,
 same 64 M tokens; only the epoch count and the AdamW `weight_decay` differ.
 
-| epochs | wd = 0.1 | wd = 0.4 | **wd 0.4 − wd 0.1** |
-|---|---|---|---|
-| 1 | 1.363721 | 1.375889 | **+0.0122 — regularisation HURTS** |
-| 8 | 1.421128 | 1.401558 | **−0.0196 — regularisation HELPS** |
-| 32 | 2.451879 | 2.047710 | **−0.4042 — regularisation helps enormously** |
+| epochs | wd = 0.0 | wd = 0.1 | wd = 0.4 | argmin | wd 0.4 − wd 0.1 |
+|---|---|---|---|---|---|
+| **1** | 1.374465 | **1.363721** | 1.375889 | **0.1** — a clean interior optimum | +0.0122 (hurts) |
+| **8** | 1.448341 | 1.421128 | **1.401558** | **≥0.4** — monotone decreasing in wd | −0.0196 (helps) |
+| **32** | 2.658279 | 2.451879 | **2.047710** | **≥0.4** — monotone, steeply | −0.4042 (helps a lot) |
 
-> **This is the clearest result in the file and it is ours, not imported: the sign of the weight-decay verdict
-> flips between 1 and 8 epochs and the magnitude grows by 20x by 32 epochs.** `ideas.md`'s "do not re-litigate
-> WD or input masking below ~3 epochs" was right, and its converse is now measured rather than argued.
+> **This is the clearest result in the file and it is ours, not imported.** At 1 epoch the decay curve has an
+> interior optimum at exactly the value the box ships (0.1) and both neighbours are worse by ~0.011-0.012. At 8
+> and 32 epochs the curve is **monotone decreasing over the whole grid** — the optimum has left the grid
+> upward. `ideas.md`'s "do not re-litigate WD or input masking below ~3 epochs" was right, and **its converse is
+> now measured rather than argued: above ~4 epochs the regularisation optimum is several times the Phase 1
+> value and rising.**
 
 Two further readings:
 
 - **Regularisation recovers a large fraction of the collapse but not all of it.** At 32 epochs the unadapted
-  recipe costs +1.088; with wd 0.4 the penalty against *its own* 1-epoch arm is +0.672, so raising one knob
-  recovered 38% of it — and 0.4 is the largest value tested, so the optimum is higher still. **Deep repetition
+  recipe costs +1.088; with wd 0.4 the penalty against *its own* 1-epoch arm is +0.672, so raising one knob by
+  4x recovered 38% of it — and the optimum is off the top of the grid, so more is available. **Deep repetition
   is expensive even with an adapted recipe.** That is a second, independent argument for not choosing a shape
   that forces 30+ epochs (§1.5d, §3.2).
+- **Sweep coarsely.** The optimum moves from 0.1 to beyond 0.4 over one and a half orders of magnitude in epoch
+  count, so the Phase 2 search should be x3/x10 steps from the Phase 1 value, not x1.5 steps. A x1.5 sweep would
+  read as "flat and slightly worse" and close the axis incorrectly.
+
+**Noise floor, measured.** Seed-2 replicates of the wd 0.1 arms:
+
+| epochs | seed 1 | seed 2 | spread |
+|---|---|---|---|
+| 1 | 1.363721 | 1.366163 | **0.0024** |
+| 8 | 1.421128 | 1.419976 | **0.0012** |
+
+Every delta quoted above clears that floor: the 1-epoch weight-decay deltas by ~5x, the 8-epoch one by 16x, the
+32-epoch one by >100x. **The one number I would not lean on hard is the 1-epoch +0.0122** — real but only ~5σ at
+n=1 per arm; happily it is also the one the box has independently confirmed (+0.0045 for wd 0.2 at full length,
+same sign).
 - **Conversely, the Phase-1 verdicts are vindicated, not overturned.** At 1 epoch extra decay costs +0.0122 here
   and +0.0045 on the box — same sign, same order. The ledger was not wrong; it was measured in the regime where
   it was right.
@@ -910,8 +951,8 @@ Branch B (more than 5 shards) moves surprisingly little on `val_bpb` and a great
 | | branch A (316 M unique) | branch B (unlimited) |
 |---|---|---|
 | `N_dense` | 400-650 M | **492 M** (Chinchilla for `C = 2.9e19`) — *the same answer* |
-| nominal tokens | 5.5-8.3 B | 9.8 B |
-| epochs | 17-26 | ~1 |
+| nominal tokens | 4.8-8.3 B (shape-dependent) | 9.8 B |
+| epochs | 15-26 | ~1 |
 | Δ bpb (parametric) | −0.063 | −0.075 |
 | **§5.1 MTP / auxiliary objectives** | **invert (data binds)** | **stay dead** (data is free again) |
 | **§5.2 embedding-group weight decay** | **invert** | stay dead |
@@ -944,17 +985,21 @@ if that upload does not happen.
 **Day one of Phase 2:**
 4. **Score `/tmp/v76_final.pt` on the pinned CORE bundle.** Most valuable missing number in the project.
 5. **Measure the 16-chip parameter all-reduce** and set gradient accumulation from it (§3.2).
-6. **One throughput screen over {1024 x 24 distinct, 1024 x 12 looped 2x, 2048 x 12}** at fixed steps (§3.1,
-   §5.7). This decides the shape, it is a step-time question, and step-time screens are the one class
-   `session-2026-09-27.md` §12 leaves valid. The looped arm is the one that could surprise: it multiplies the
-   serial dependency chain on a latency-bound device.
+6. **One throughput screen over the four candidate shapes** — A (1024 x 24 distinct), B (1536 x 20 distinct),
+   C (1024 x 12 **looped 4x**) and a wide control (2048 x 12) — at fixed steps (§3.1-§3.2, §5.7). This decides
+   the shape, it is a step-time question, and step-time screens are the one class `session-2026-09-27.md` §12
+   leaves valid. **C is the arm that could surprise**: it multiplies the serial dependency chain 4x on a
+   latency-bound device, and if its FLOPs do not land, its whole case collapses.
 
 **First Phase 2 quality gates, in order:**
-1. **AdamW embedding-group weight decay** 0.001 → 0.01 / 0.05 (§5.2). The cheapest of the inversions and the one
-   with a measurement error behind it rather than a judgement call.
+1. **AdamW embedding-group weight decay** 0.001 → 0.01 → 0.05 (§5.2). The cheapest of the inversions, the one
+   with a measurement *gap* behind it rather than a judgement call, and the one §6 measured a sign flip for.
+   **Sweep coarsely (x10, x50), not in x1.5 steps** — §6's argmin moved by more than 4x over the epoch range.
 2. **Exact (non-stochastic) MTP** (§5.1). Largest expected size; needs head-kernel work, so start it early.
 3. **Bigram rows 2^19 / 2^20 crossed with the embedding decay** (§4.2, §4.3 item 5) — one 2-D pair, not two
-   1-D sweeps, because more rows without more decay is the configuration §1.5c warns about.
+   1-D sweeps, because more rows without more decay is the configuration §1.5c warns about. **Run it after the
+   shape is settled**: at 2^19 rows the table is 26% of shape B's sharded parameters but 52% of shape C's, so
+   its collective cost depends on which shape won.
 4. **Seq 2048 + windowed odd layers** (§5.4).
 5. **The offline EMA decay x blend x group sweep** (§3.3) — costs no gate at all; run it on the first
    checkpoint that exists.
@@ -968,11 +1013,21 @@ if that upload does not happen.
 - **Every extrapolation is labelled.** The §1.5 optimum extrapolates our measured slopes ~2.2 e-folds; all
   three parameterisations bracket it and I report the spread rather than one number. The absolute Phase 2
   `val_bpb` is the *least* trustworthy number here and is given only as an order of magnitude.
+- **§6 is a 1/160th-scale experiment and its absolute numbers do not transfer.** Its slope is ~10x ours because
+  a 4.7 M-parameter model at 64 M tokens is far from converged. What transfers is a **sign** (the weight-decay
+  argmin moves with epoch count) and a **shape** (the law's validity ends between 8 and 16 epochs at ~1 unique
+  token per parameter). Neither claim needs the magnitudes to carry.
+- **What I did NOT establish, stated so nobody quotes it as settled:** (i) `R_D*` for our corpus — the fit is not
+  identified; (ii) which parameter group's decay carries the regularisation (§6's toy has one group); (iii)
+  whether the looped stack's FLOPs actually land on this device; (iv) any CORE number at all, for any of our
+  models; (v) the 16-chip collective cost. Items (iii)-(v) are the first three measurements of Phase 2.
 - **Direction of every imported conversion.** `R_D* = 15.387` is imported from a C4 fit; a *smaller* `R_D*`
   would strengthen the capacity argument, so importing it is the conservative direction for §1. The
   Chinchilla exponents in §1.5(b)/(c) are used only to *decay* our own measured slopes, never to set them.
-- **No short quality screen is proposed as a decision procedure anywhere.** The two screens recommended (§7.6,
+- **No short quality screen is proposed as a decision procedure anywhere.** The screens recommended (§7 item 6,
   and the throughput half of §3.1) measure step time, which `session-2026-09-27.md` §12 explicitly leaves valid.
+  §6 is not a screen for a Phase 2 decision — it is a *regime* measurement whose arms differ by 0.02-1.1 bpb,
+  three orders of magnitude above any noise floor, and it is used only for the sign of an effect.
 - **Prior-test-of-the-wrong-version checks**, as the brief requires: (a) the bigram **rows** verdict rests on a
   full-length gate at 2194 visits/row, and Phase 2 has 3.5x that — the knob has already flipped sign once with
   horizon (§4.2); (b) the **WD** verdict swept the group whose outcome the LR curve already predicts out of
@@ -985,4 +1040,18 @@ if that upload does not happen.
 `data-axis-2026-09-27.md`, `quality-levers-2026-09-26.md`, `session-2026-09-27.md`, `repeat-regime.md`,
 `ideas.md`, `step-budget-2026-09-22b.md`, `engine-profile-512.md`, `nki-kernel-playbook-2.md`,
 `submission_raw/train3_canon.py`;
-[Scaling Data-Constrained Language Models](https://arxiv.org/abs/2305.16264).
+[Scaling Data-Constrained Language Models](https://arxiv.org/abs/2305.16264);
+Morris et al., *How much do language models memorize?* (the ~3.6 bits/parameter figure used in §1.5c).
+
+**Reproducing or extending §6:** the experiment is `experimental/repeat_law.py` (a dev tool, never part of a
+submission), run from the repo root as
+
+```bash
+.venv/bin/python experimental/repeat_law.py --total 64000000 --epochs 1,2,4,8,16,32,64 --wd 0.1 --seed 1
+```
+
+~3.2 min per arm on the local 4080; it tokenises its own pools into `~/.cache/repeat_law` on first use and never
+opens the val shard. **The two extensions worth running next, both free:** (a) a second model size (`--d 384
+--L 8`) to test whether the knee really tracks unique-tokens-per-parameter rather than epoch count — that is the
+assumption the whole transfer argument rests on; (b) `--wd 1.0` and `--wd 2.0` at 8 and 32 epochs, to find the
+high-epoch argmin this grid did not contain.
